@@ -426,6 +426,51 @@ export const GG_STYLES = `
   overflow: visible !important;
   padding-left: 8px !important;
 }
+.gg-col-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  overflow: visible !important;
+}
+.gg-col-head > span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gg-column-resize {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 6px;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 0 !important;
+  background: transparent !important;
+  cursor: col-resize;
+  z-index: 2;
+}
+.gg-column-resize::after {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 2px;
+  width: 1px;
+  background: var(--color-border, #444);
+  opacity: 0;
+}
+.gg-column-resize:hover::after {
+  opacity: 1;
+}
+/* The commit handle is the last column. Inset its hit area so the panel's
+   overflow clip cannot swallow the centre of the handle (and the header never
+   adds 3px to the panel scroll width). */
+.gg-col-head-commit .gg-column-resize {
+  right: 0;
+}
 .gg-graph-resize {
   position: absolute;
   top: 0;
@@ -490,6 +535,66 @@ export const GG_STYLES = `
 .gg-history-spacer {
   position: relative;
   width: 100%;
+}
+.gg-row-slot {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: row;
+  min-width: 0;
+  overflow: hidden;
+  border-bottom: 1px solid var(--color-border, #3a3a3a);
+  background: color-mix(in srgb, var(--color-surface, #242424) 60%, transparent);
+}
+.gg-row-slot-graph {
+  position: relative;
+  align-self: stretch;
+  flex: 0 0 auto;
+  min-width: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--color-border, #3a3a3a);
+  background: rgba(0, 0, 0, 0.06);
+}
+.gg-row-slot-graph-inner {
+  position: absolute;
+  inset: 0;
+  transform: translateX(var(--gg-graph-shift, 0px));
+  will-change: transform;
+}
+.gg-row-slot-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.gg-row-slot-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--color-border, #3a3a3a);
+  color: var(--color-textSecondary, #b0b0b0);
+  font-size: 10.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.gg-row-slot-title {
+  font-weight: 600;
+}
+.gg-row-slot-tree {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  padding: 2px 6px 4px;
+}
+.gg-graph-row.gg-expanded {
+  background: rgba(90, 130, 220, 0.18) !important;
 }
 .gg-graph-row {
   position: absolute;

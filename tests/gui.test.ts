@@ -9,6 +9,16 @@ import {
 import { computeVirtualRange } from "../src/gui/virtual.js"
 import { mergeCommits } from "../src/gui/pagination.js"
 import {
+  AUTO_LOAD_THRESHOLD_ROWS,
+  INITIAL_AUTO_LOAD_STATE,
+  beginAutoLoad,
+  completeAutoLoad,
+  isNearBottom,
+  rearmAutoLoad,
+  resolveScrollMetrics,
+  shouldAutoLoad,
+} from "../src/gui/pagination.js"
+import {
   BoundedSelectionCache,
   SelectionGeneration,
   selectionKey,
@@ -191,6 +201,164 @@ describe("mergeCommits", () => {
     const a = { hash: "a" }
     const merged = mergeCommits([a], [{ hash: "a" }])
     expect(merged[0]).toBe(a)
+  })
+})
+
+describe("automatic load more", () => {
+  const armed = { ...INITIAL_AUTO_LOAD_STATE }
+  const base = {
+    state: armed,
+    nearBottom: true,
+    hasMore: true,
+    busy: false,
+    loadingMore: false,
+    graphError: false,
+    historyActive: true,
+  }
+
+  it("allows one page when the viewport reaches the bottom", () => {
+    expect(shouldAutoLoad(base)).toBe(true)
+    expect(AUTO_LOAD_THRESHOLD_ROWS).toBeGreaterThanOrEqual(2)
+    expect(AUTO_LOAD_THRESHOLD_ROWS).toBeLessThanOrEqual(4)
+  })
+
+  it("does not trigger while busy, loading, exhausted, failing or inactive", () => {
+    expect(shouldAutoLoad({ ...base, hasMore: false })).toBe(false)
+    expect(shouldAutoLoad({ ...base, busy: true })).toBe(false)
+    expect(shouldAutoLoad({ ...base, loadingMore: true })).toBe(false)
+    expect(shouldAutoLoad({ ...base, graphError: true })).toBe(false)
+    expect(shouldAutoLoad({ ...base, historyActive: false })).toBe(false)
+    expect(shouldAutoLoad({ ...base, nearBottom: false })).toBe(false)
+  })
+
+  it("does not start twice in the same bottom visit", () => {
+    const started = beginAutoLoad(armed)
+    expect(shouldAutoLoad({ ...base, state: started })).toBe(false)
+
+    // A successful page keeps the visit armed, so an under-filled viewport
+    // cannot pull the whole repository in a tight loop.
+    const loaded = completeAutoLoad(started, { added: 100, failed: false, cancelled: false })
+    expect(shouldAutoLoad({ ...base, state: loaded })).toBe(false)
+
+    // Leaving the bottom (or Retry) re-arms the guard.
+    const rearmed = rearmAutoLoad(loaded)
+    expect(shouldAutoLoad({ ...base, state: rearmed })).toBe(true)
+  })
+
+  it("locks after an automatic failure until the viewport leaves the bottom", () => {
+    const started = beginAutoLoad(armed)
+    const failed = completeAutoLoad(started, { added: 0, failed: true, cancelled: false })
+    expect(failed.failed).toBe(true)
+    expect(shouldAutoLoad({ ...base, state: failed })).toBe(false)
+
+    // A manual retry re-arms everything.
+    expect(rearmAutoLoad(failed)).toEqual(INITIAL_AUTO_LOAD_STATE)
+  })
+
+  it("stops automatic loading when a page adds no new commits", () => {
+    const started = beginAutoLoad(armed)
+    const duplicate = completeAutoLoad(started, {
+      added: 0,
+      failed: false,
+      cancelled: false,
+    })
+    expect(duplicate.stalled).toBe(true)
+    expect(shouldAutoLoad({ ...base, state: duplicate })).toBe(false)
+
+    const empty = completeAutoLoad(started, { added: 0, failed: false, cancelled: false })
+    expect(empty.stalled).toBe(true)
+    expect(shouldAutoLoad({ ...base, state: empty })).toBe(false)
+  })
+
+  it("ignores a cancelled response so a stale request cannot overwrite newer state", () => {
+    const started = beginAutoLoad(armed)
+    expect(completeAutoLoad(started, { added: 0, failed: true, cancelled: true })).toBe(
+      started,
+    )
+  })
+
+  it("uses live container measurements when the viewport signal is stale", () => {
+    // Background host tabs can freeze ResizeObserver, leaving the signal at its
+    // default while the real DOM scroller already has its final size.
+    const fallback = {
+      scrollTop: 0,
+      viewportHeight: 320,
+      contentHeight: 2800,
+    }
+    const metrics = resolveScrollMetrics(
+      { scrollTop: 2296, clientHeight: 504, scrollHeight: 2800 },
+      fallback,
+    )
+    expect(metrics).toEqual({
+      scrollTop: 2296,
+      viewportHeight: 504,
+      contentHeight: 2800,
+    })
+    expect(
+      isNearBottom({
+        ...metrics,
+        threshold: AUTO_LOAD_THRESHOLD_ROWS * 28,
+      }),
+    ).toBe(true)
+    // The stale signal alone would have missed the bottom.
+    expect(
+      isNearBottom({
+        ...fallback,
+        threshold: AUTO_LOAD_THRESHOLD_ROWS * 28,
+      }),
+    ).toBe(false)
+  })
+
+  it("falls back field by field when the scroller is detached or unsized", () => {
+    const fallback = { scrollTop: 140, viewportHeight: 400, contentHeight: 1400 }
+    expect(resolveScrollMetrics(undefined, fallback)).toEqual(fallback)
+    expect(
+      resolveScrollMetrics({ scrollTop: 0, clientHeight: 0, scrollHeight: 0 }, fallback),
+    ).toEqual({ scrollTop: 0, viewportHeight: 400, contentHeight: 1400 })
+    expect(
+      resolveScrollMetrics(
+        { scrollTop: Number.NaN, clientHeight: Number.NaN, scrollHeight: Number.NaN },
+        fallback,
+      ),
+    ).toEqual(fallback)
+    // A live scrollHeight smaller than the derived layout height cannot shrink
+    // the content used for the bottom test.
+    expect(
+      resolveScrollMetrics({ scrollTop: -5, clientHeight: 300, scrollHeight: 100 }, fallback),
+    ).toEqual({ scrollTop: 0, viewportHeight: 300, contentHeight: 1400 })
+  })
+
+  it("counts the real content height (including an expanded slot) for near-bottom", () => {
+    const threshold = AUTO_LOAD_THRESHOLD_ROWS * 28
+    expect(
+      isNearBottom({
+        scrollTop: 1_000,
+        viewportHeight: 400,
+        contentHeight: 1_400,
+        threshold,
+      }),
+    ).toBe(true)
+    expect(
+      isNearBottom({
+        scrollTop: 1_000,
+        viewportHeight: 400,
+        contentHeight: 1_400 + threshold + 1,
+        threshold,
+      }),
+    ).toBe(false)
+    // Content shorter than the viewport still counts as near the bottom.
+    expect(
+      isNearBottom({ scrollTop: 0, viewportHeight: 500, contentHeight: 100, threshold }),
+    ).toBe(true)
+    // Raw/negative measurements never produce a false trigger from NaN.
+    expect(
+      isNearBottom({
+        scrollTop: Number.NaN,
+        viewportHeight: Number.NaN,
+        contentHeight: Number.NaN,
+        threshold,
+      }),
+    ).toBe(true)
   })
 })
 

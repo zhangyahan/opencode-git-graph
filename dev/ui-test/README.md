@@ -17,7 +17,7 @@ result; no repository, commit or diff data is mocked.
    This keeps `package.json` / `package-lock.json` untouched:
 
    ```powershell
-   $dir = "C:/Users/$env:USERNAME/AppData/Local/Temp/opencode/gg-ui-test"
+   $dir = "$env:LOCALAPPDATA/Temp/opencode/gg-ui-test"
    New-Item -ItemType Directory -Force $dir | Out-Null
    Set-Content "$dir/package.json" '{"name":"gg-ui-test","private":true}'
    Push-Location $dir
@@ -36,6 +36,30 @@ From the repository root:
 node dev/ui-test/acceptance.mjs
 ```
 
+### Integrated interactions acceptance
+
+`interactions.mjs` is the current new-feature acceptance script: automatic
+pagination, inline commit files, full-page commit diff, merge parent switching,
+search jumps, root commits, all five column resizers, persistence and isolated
+route-fault diagnostics. It uses the same real harness/FR data path and does not
+mock normal repository data.
+
+```powershell
+node dev/ui-test/interactions.mjs
+```
+
+Optional isolated settings:
+
+| variable | purpose |
+| --- | --- |
+| `GG_UI_INTERACTIONS_ARTIFACTS` | interactions screenshots/result directory |
+| `GG_REPO_A` / `GG_REPO_B` / `GG_REPO_ROOT` | fixture aliases |
+| `GG_AUTO_LOAD_TIMEOUT` | automatic-pagination wait budget (ms) |
+
+`acceptance.mjs` remains the historical 79-check baseline for the earlier
+graph-scroll fix. It uses fixed 28px row geometry and manual pagination, so it is
+not the regression truth for the new row-layout/inline interactions.
+
 Optional environment variables:
 
 | variable | purpose |
@@ -51,7 +75,7 @@ It does not attach to the user's browser, read a profile, or read cookies.
 ## Output
 
 - Screenshots and `result.json` go to
-  `C:\Users\<user>\AppData\Local\Temp\opencode\gg-ui-artifacts` by default.
+  `%LOCALAPPDATA%\Temp\opencode\gg-ui-artifacts` by default.
 - `result.json` contains every named check, measured layout numbers, console /
   page / request errors (normal aborts are separated), RPC request metadata and
   absolute screenshot paths.
@@ -59,4 +83,4 @@ It does not attach to the user's browser, read a profile, or read cookies.
 
 The script only reads: `ping`, `listRepositories`, `getStatus`, `getLog`,
 `getRefs`, `getCommitFiles`, `getDiff`. It does not stage, commit, checkout,
-pull, push or write to `D:\Workspace\FR`.
+pull, push or write to the fixture repository.

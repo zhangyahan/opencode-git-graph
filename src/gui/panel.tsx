@@ -18,14 +18,13 @@ import type {
 import { GitGraphRpc } from "../rpc.js"
 import { buildCommitGraph } from "./graph.js"
 import {
-  DEFAULT_GRAPH_COLUMN_WIDTH,
   DEFAULT_LANE_PADDING,
   DEFAULT_LANE_SPACING,
-  clampGraphColumnWidth,
   graphContentWidth,
   graphLaneX,
   graphLinePath,
   graphRowLines,
+  type GraphLine,
 } from "./graph-geometry.js"
 import {
   createGraphRowViews,
@@ -33,8 +32,29 @@ import {
   type GraphRowView,
 } from "./graph-view.js"
 import { classifyDiff, type DiffLine } from "./diff.js"
-import { mergeCommits } from "./pagination.js"
-import { computeVirtualRange } from "./virtual.js"
+import {
+  AUTO_LOAD_THRESHOLD_ROWS,
+  INITIAL_AUTO_LOAD_STATE,
+  beginAutoLoad,
+  completeAutoLoad,
+  isNearBottom,
+  mergeCommits,
+  rearmAutoLoad,
+  resolveScrollMetrics,
+  shouldAutoLoad,
+  type AutoLoadState,
+  type ScrollViewportLike,
+} from "./pagination.js"
+import { createRowLayout } from "./row-layout.js"
+import {
+  readColumnPreferences,
+  resizeColumnPreferences,
+  resolveColumnLayout,
+  writeColumnPreferences,
+  type ColumnId,
+  type ColumnPreferences,
+} from "./column-layout.js"
+import { CommitDiffView } from "./commit-diff-view.js"
 import { LatestRequest } from "./requests.js"
 import { buildFileTree, collectDirectoryPaths, type FileTreeNode } from "./tree.js"
 import {
@@ -55,8 +75,6 @@ import { sessionRoute } from "./routing.js"
 import { GG_STYLES } from "./styles.js"
 import {
   detailsLayout,
-  historyColumnTemplate,
-  historyColumns,
   visibleRefCount,
 } from "./history-columns.js"
 import { formatCommitDate, formatRefLabel, refHue, shortHash } from "./format.js"
@@ -65,7 +83,6 @@ import { repositoryOptionLabel } from "./repository-label.js"
 import {
   clampScrollOffset,
   maxScrollOffset,
-  scrollTopForRow,
 } from "./scroll.js"
 
 const PAGE_SIZE = 100
@@ -75,6 +92,27 @@ const LANE_SPACING = DEFAULT_LANE_SPACING
 const LANE_PADDING = DEFAULT_LANE_PADDING
 const MAX_DIFF_DISPLAY_LINES = 4_000
 const SELECTION_CACHE_LIMIT = 16
+const MIN_SLOT_HEIGHT = 96
+const MAX_SLOT_HEIGHT = 260
+const SLOT_TREE_ROW_HEIGHT = 22
+const SLOT_TREE_HEADER = 30
+/** Bound for the post-reinsert restore loop: one or two layout frames only. */
+const RESTORE_MAX_FRAMES = 2
+
+/**
+ * Scroll position captured before the history list is replaced by the
+ * full-panel commit diff. Restoring waits for the reinserted spacer/slot to be
+ * laid out, then applies a clamped value and mirrors the real DOM value back.
+ */
+interface PendingViewRestore {
+  readonly key: string
+  readonly repositoryId: string | undefined
+  readonly commitHash: string | undefined
+  /** Generation captured at Back (or at open), so a later selection aborts. */
+  generation: number
+  readonly scrollTop: number
+  readonly graphScrollLeft: number
+}
 
 /** One bounded cache per window, shared by every mount of this panel. */
 const SELECTION_CACHE = new BoundedSelectionCache<SelectionSnapshot>(SELECTION_CACHE_LIMIT)
@@ -98,6 +136,21 @@ function colourOf(colour: number): string {
 
 function statusClass(status: ChangedFile["status"]): string {
   return `gg-status-letter gg-status-${status}`
+}
+
+function columnLabel(column: ColumnId): string {
+  switch (column) {
+    case "graph":
+      return "Graph"
+    case "description":
+      return "Description"
+    case "date":
+      return "Date"
+    case "author":
+      return "Author"
+    case "commit":
+      return "Commit"
+  }
 }
 
 type SearchState = "none" | "match" | "dim"
@@ -173,7 +226,9 @@ interface GraphRowProps {
   readonly laneSpacing: number
   readonly graphWidth: number
   readonly rowHeight: number
+  readonly top: number
   readonly selected: boolean
+  readonly expanded: boolean
   readonly disabled: boolean
   readonly searchState: SearchState
   readonly showDate: boolean
@@ -192,16 +247,21 @@ function GraphRow(props: GraphRowProps) {
       class={[
         "gg-graph-row",
         props.selected ? "gg-selected" : "",
+        props.expanded ? "gg-expanded" : "",
         props.searchState === "dim" ? "gg-search-dim" : "",
         props.searchState === "match" ? "gg-search-match" : "",
       ]
         .filter(Boolean)
         .join(" ")}
-      style={{ top: `${props.view.index * props.rowHeight}px`, height: `${props.rowHeight}px` }}
+      style={{ top: `${props.top}px`, height: `${props.rowHeight}px` }}
       disabled={props.disabled}
       onClick={() => props.onSelect()}
       title={props.view.commit.subject}
       data-commit={props.view.commit.hash}
+      data-index={props.view.index}
+      data-row-top={props.top}
+      aria-expanded={props.expanded}
+      aria-selected={props.selected}
     >
       <div class="gg-row-graph" aria-hidden="true">
         <div class="gg-row-graph-inner">
@@ -275,6 +335,132 @@ function GraphRow(props: GraphRowProps) {
         <span class="gg-hash">{shortHash(props.view.commit.hash)}</span>
       </div>
     </button>
+  )
+}
+
+/* ---------- inline commit file slot ---------- */
+
+interface CommitFilesSlotProps {
+  readonly top: number
+  readonly height: number
+  readonly row: GraphRowView["row"]
+  readonly graphWidth: number
+  readonly columnWidth: number
+  readonly laneSpacing: number
+  readonly nodes: readonly FileTreeNode[]
+  readonly fileCount: number
+  readonly expanded: ReadonlySet<string>
+  readonly selectedPath: string | undefined
+  readonly loading: boolean
+  readonly error: string | undefined
+  readonly disabled: boolean
+  readonly onToggle: (path: string) => void
+  readonly onSelect: (file: ChangedFile) => void
+  readonly onRetry: () => void
+}
+
+/**
+ * One controlled expansion slot, rendered as a sibling of the row buttons so
+ * the graph svg can keep its fixed 28px row height. The slot carries the graph
+ * tracks that continue below the expanded commit and a fixed-height, internally
+ * scrolling file tree.
+ */
+function CommitFilesSlot(props: CommitFilesSlotProps) {
+  const lines = (): GraphLine[] =>
+    props.row.segments.map((segment) => ({
+      kind: "through",
+      from: { lane: segment.to, y: 0 },
+      to: { lane: segment.to, y: 1 },
+      colour: segment.colour,
+    }))
+
+  return (
+    <div
+      class="gg-row-slot"
+      style={{ top: `${props.top}px`, height: `${props.height}px` }}
+      data-slot-height={props.height}
+      data-testid="inline-slot"
+    >
+      <div
+        class="gg-row-slot-graph"
+        style={{ width: `${props.columnWidth}px` }}
+        data-testid="inline-graph"
+        aria-hidden="true"
+      >
+        <div class="gg-row-slot-graph-inner">
+          <svg
+            class="gg-graph-svg"
+            width={props.graphWidth}
+            height={Math.max(1, props.height)}
+            viewBox={`0 0 ${props.graphWidth} ${Math.max(1, props.height)}`}
+            aria-hidden="true"
+          >
+            <For each={lines()}>
+              {(line) => (
+                <path
+                  d={graphLinePath(line, {
+                    laneSpacing: props.laneSpacing,
+                    rowHeight: Math.max(1, props.height),
+                    padding: LANE_PADDING,
+                  })}
+                  fill="none"
+                  stroke={colourOf(line.colour)}
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  opacity="0.9"
+                />
+              )}
+            </For>
+          </svg>
+        </div>
+      </div>
+
+      <div class="gg-row-slot-body">
+        <div class="gg-row-slot-head">
+          <span class="gg-row-slot-title">Files changed</span>
+          <span class="gg-muted">
+            {props.loading ? "loading…" : `${props.fileCount} file${props.fileCount === 1 ? "" : "s"}`}
+          </span>
+        </div>
+        <div class="gg-row-slot-tree inline-files" data-testid="inline-files">
+          <Show when={props.loading}>
+            <div class="gg-status">Loading files…</div>
+          </Show>
+          <Show when={props.error}>
+            {(message) => (
+              <div class="gg-error">
+                <span>{message()}</span>
+                <button
+                  type="button"
+                  disabled={props.disabled}
+                  onClick={() => props.onRetry()}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+          </Show>
+          <Show when={!props.loading && !props.error}>
+            <Show
+              when={props.fileCount > 0}
+              fallback={<div class="gg-empty">No files changed relative to this parent.</div>}
+            >
+              <div class="gg-tree">
+                <FileTree
+                  nodes={props.nodes}
+                  depth={0}
+                  expanded={props.expanded}
+                  selectedPath={props.selectedPath}
+                  disabled={props.disabled}
+                  onToggle={props.onToggle}
+                  onSelect={props.onSelect}
+                />
+              </div>
+            </Show>
+          </Show>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -441,12 +627,17 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const [diff, setDiff] = createSignal<FileDiff | undefined>()
   const [diffLoading, setDiffLoading] = createSignal(false)
   const [diffError, setDiffError] = createSignal<string | undefined>()
+  /** Full-panel commit diff view; the history list stays mounted state, not DOM. */
+  const [commitDiffOpen, setCommitDiffOpen] = createSignal(false)
 
   const [viewportHeight, setViewportHeight] = createSignal(320)
   const [scrollTop, setScrollTop] = createSignal(0)
   const [panelWidth, setPanelWidth] = createSignal(520)
-  const [graphColumnWidth, setGraphColumnWidth] = createSignal(DEFAULT_GRAPH_COLUMN_WIDTH)
+  const [columnPreferences, setColumnPreferences] =
+    createSignal<ColumnPreferences>(readColumnPreferences())
   const [graphScrollLeft, setGraphScrollLeft] = createSignal(0)
+  const [autoLoadState, setAutoLoadState] =
+    createSignal<AutoLoadState>(INITIAL_AUTO_LOAD_STATE)
 
   const [searchQuery, setSearchQuery] = createSignal("")
   const [changesExpanded, setChangesExpanded] = createSignal(true)
@@ -466,6 +657,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   let resizeObserver: ResizeObserver | undefined
   let panelObserver: ResizeObserver | undefined
   let resizeDragCleanup: (() => void) | undefined
+  let loadMoreInFlight = false
+  /** Pending two-axis restore across full-panel diff in/out. */
+  let pendingViewRestore: PendingViewRestore | undefined
+  let restoreFrame: { readonly id: number; readonly timeout: boolean } | undefined
+  let restoreAttempt = 0
+  let autoSettleFrame: { readonly id: number; readonly timeout: boolean } | undefined
 
   const currentDirectory = () => props.panel.session.directory
 
@@ -488,6 +685,130 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     }
   }
 
+  function postFrame(callback: () => void): { readonly id: number; readonly timeout: boolean } {
+    if (typeof requestAnimationFrame === "function") {
+      return { id: requestAnimationFrame(callback), timeout: false }
+    }
+    return { id: Number(globalThis.setTimeout(callback, 0)), timeout: true }
+  }
+
+  function cancelFrame(frame: { readonly id: number; readonly timeout: boolean } | undefined): void {
+    if (!frame) return
+    if (frame.timeout) globalThis.clearTimeout(frame.id)
+    else if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(frame.id)
+  }
+
+  function cancelRestoreFrame(): void {
+    cancelFrame(restoreFrame)
+    restoreFrame = undefined
+    restoreAttempt = 0
+  }
+
+  function clearPendingViewRestore(): void {
+    pendingViewRestore = undefined
+    cancelRestoreFrame()
+  }
+
+  function cancelAutoLoadSettle(): void {
+    cancelFrame(autoSettleFrame)
+    autoSettleFrame = undefined
+  }
+
+  function viewRestoreContextCurrent(pending: PendingViewRestore): boolean {
+    if (pending.key !== activeKey) return false
+    if (selectedRepositoryId() !== pending.repositoryId) return false
+    if (pending.commitHash && selectedCommit()?.hash !== pending.commitHash) return false
+    return selectionGeneration.isCurrent(pending.generation)
+  }
+
+  /**
+   * Wait until the reinserted list has real layout: the spacer must match its
+   * derived height and, when a commit is expanded, its slot must be mounted.
+   * Ref callbacks alone run before that, so reading scrollHeight there would
+   * consume the pending restore against zeros.
+   */
+  function canApplyViewRestore(): boolean {
+    if (!scroller || !graphScroller) return false
+    if (scroller.clientHeight <= 0 || scroller.scrollHeight <= 0) return false
+    if (graphScroller.clientWidth <= 0 || graphScroller.scrollWidth <= 0) return false
+    const spacer = scroller.querySelector(".gg-history-spacer")
+    if (!(spacer instanceof HTMLElement)) return false
+    const layout = rowLayout()
+    if (layout.totalHeight <= 0) return false
+    const spacerHeight = spacer.getBoundingClientRect().height
+    if (Math.abs(spacerHeight - layout.totalHeight) > 1) return false
+    if (scroller.scrollHeight + 1 < layout.totalHeight) return false
+    if (expandedRowIndex() !== undefined) {
+      // The slot height is derived from the file list; applying at the loading
+      // placeholder height and then growing would shift the restored rows.
+      if (filesLoading()) return false
+      const slot = scroller.querySelector(".gg-row-slot")
+      if (!(slot instanceof HTMLElement)) return false
+      if (Math.abs(slot.getBoundingClientRect().height - layout.slotHeight) > 1) return false
+    }
+    return true
+  }
+
+  function applyViewRestore(pending: PendingViewRestore): void {
+    if (!scroller || !graphScroller) return
+    // Set the DOM first, then mirror what the browser actually accepted.
+    const top = clampScrollOffset(
+      pending.scrollTop,
+      scroller.scrollHeight,
+      scroller.clientHeight,
+    )
+    scroller.scrollTop = top
+    setScrollTop(scroller.scrollTop)
+    if (scroller.clientHeight > 0) setViewportHeight(scroller.clientHeight)
+
+    const left = clampScrollOffset(
+      pending.graphScrollLeft,
+      graphScroller.scrollWidth,
+      graphScroller.clientWidth,
+    )
+    graphScroller.scrollLeft = left
+    setGraphScrollLeft(graphScroller.scrollLeft)
+  }
+
+  function restoreViewStep(): void {
+    restoreFrame = undefined
+    const pending = pendingViewRestore
+    if (!pending) {
+      restoreAttempt = 0
+      return
+    }
+    if (!commitDiffOpen() && viewRestoreContextCurrent(pending) && canApplyViewRestore()) {
+      applyViewRestore(pending)
+      pendingViewRestore = undefined
+      restoreAttempt = 0
+      return
+    }
+    restoreAttempt += 1
+    if (restoreAttempt >= RESTORE_MAX_FRAMES) {
+      // Do not consume an invalid measurement. A later attach/resize event may
+      // start another bounded batch; never loop here.
+      restoreAttempt = 0
+      return
+    }
+    restoreFrame = postFrame(restoreViewStep)
+  }
+
+  function scheduleViewRestore(): void {
+    if (!pendingViewRestore || commitDiffOpen()) return
+    if (restoreFrame !== undefined) return
+    restoreAttempt = 0
+    restoreFrame = postFrame(restoreViewStep)
+  }
+
+  /** Re-check near-bottom once the appended page's DOM has settled. */
+  function scheduleAutoLoadSettle(): void {
+    if (autoSettleFrame !== undefined) return
+    autoSettleFrame = postFrame(() => {
+      autoSettleFrame = undefined
+      maybeAutoLoad()
+    })
+  }
+
   function clearCommitSelection(): void {
     filesRequest.cancel()
     setSelectedCommit(undefined)
@@ -496,6 +817,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setFilesLoading(false)
     setFilesError(undefined)
     setExpandedDirectories(new Set<string>())
+    setCommitDiffOpen(false)
+    clearPendingViewRestore()
   }
 
   function resetRepositoryState(): void {
@@ -509,6 +832,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setNextSkip(0)
     setLoadingMore(false)
     setHistoryError(undefined)
+    setAutoLoadState(INITIAL_AUTO_LOAD_STATE)
+    loadMoreInFlight = false
     setGraphScrollLeft(0)
     if (graphScroller) graphScroller.scrollLeft = 0
     setRepositoryLoading(false)
@@ -520,11 +845,14 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setFilesLoading(false)
     setFilesError(undefined)
     setExpandedDirectories(new Set<string>())
+    setCommitDiffOpen(false)
 
     setSelectedFile(undefined)
     setDiff(undefined)
     setDiffLoading(false)
     setDiffError(undefined)
+    clearPendingViewRestore()
+    cancelAutoLoadSettle()
 
     setScrollTop(0)
     if (scroller) scroller.scrollTop = 0
@@ -641,6 +969,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setHasMore(nextLog.hasMore)
 
     if (restore) applyRestore(restore, nextStatus, nextCommits)
+    // A first screen shorter than the viewport may fetch exactly one
+    // supplement; the auto guard prevents it from looping the whole repo.
+    maybeAutoLoad()
   }
 
   function applyRestore(
@@ -719,6 +1050,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     selectionGeneration.bump()
     const maxIndex = Math.max(0, commit.parents.length - 1)
     const parentIndex = Math.min(Math.max(0, requestedParentIndex), maxIndex)
+    setCommitDiffOpen(false)
+    clearPendingViewRestore()
     setSelectedCommit(commit)
     setSelectedParentIndex(parentIndex)
     setSelectedFile(undefined)
@@ -727,10 +1060,38 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     void loadCommitFiles(commit, parentIndex, restoreFilePath)
   }
 
+  /** Same-row click collapses the inline slot; switching rows replaces it. */
+  function toggleCommit(commit: GitCommit): void {
+    if (selectedCommit()?.hash === commit.hash) {
+      collapseCommit()
+      return
+    }
+    selectCommit(commit)
+  }
+
+  function collapseCommit(): void {
+    selectionGeneration.bump()
+    filesRequest.cancel()
+    diffRequest.cancel()
+    setSelectedCommit(undefined)
+    setSelectedParentIndex(0)
+    setCommitFiles([])
+    setFilesLoading(false)
+    setFilesError(undefined)
+    setExpandedDirectories(new Set<string>())
+    setSelectedFile(undefined)
+    setDiff(undefined)
+    setDiffLoading(false)
+    setDiffError(undefined)
+    setCommitDiffOpen(false)
+    clearPendingViewRestore()
+  }
+
   async function loadCommitFiles(
     commit: GitCommit,
     parentIndex: number,
     restoreFilePath?: string,
+    options?: { readonly keepFile?: boolean },
   ): Promise<void> {
     const repositoryId = selectedRepositoryId()
     if (!repositoryId) return
@@ -739,13 +1100,16 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const key = selectionKey(route.serverId, route.directory)
 
     filesRequest.cancel()
-    diffRequest.cancel()
+    if (!options?.keepFile) diffRequest.cancel()
     setCommitFiles([])
     setFilesLoading(true)
     setFilesError(undefined)
-    setSelectedFile(undefined)
-    setDiff(undefined)
-    setDiffError(undefined)
+    if (!options?.keepFile) {
+      setSelectedFile(undefined)
+      setDiff(undefined)
+      setDiffLoading(false)
+      setDiffError(undefined)
+    }
 
     const result = await filesRequest.run((signal) =>
       rpc.getCommitFiles(
@@ -758,6 +1122,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       if (!result.aborted) {
         setFilesLoading(false)
         setFilesError(formatError(result.error))
+        if (pendingViewRestore && !commitDiffOpen()) scheduleViewRestore()
       }
       return
     }
@@ -774,6 +1139,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const files = result.value.files
     setCommitFiles(files)
     setExpandedDirectories(new Set(collectDirectoryPaths(buildFileTree(files))))
+    if (pendingViewRestore && !commitDiffOpen()) scheduleViewRestore()
 
     if (restoreFilePath) {
       const file = files.find((candidate) => candidate.path === restoreFilePath)
@@ -788,73 +1154,183 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       target: { type: "commit", hash: commit.hash, parentIndex },
       source: "commit",
     }
+    if (!commitDiffOpen()) {
+      const { route } = currentRpc()
+      pendingViewRestore = {
+        key: selectionKey(route.serverId, route.directory),
+        repositoryId: selectedRepositoryId(),
+        commitHash: commit.hash,
+        generation: selectionGeneration.current(),
+        scrollTop: scroller ? scroller.scrollTop : scrollTop(),
+        graphScrollLeft: graphScroller ? graphScroller.scrollLeft : graphScrollLeft(),
+      }
+      cancelRestoreFrame()
+    }
     setSelectedFile(selection)
+    setCommitDiffOpen(true)
     void loadDiff(selection)
   }
 
-  function changeParent(parentIndex: number): void {
+  /** Leave the full-panel diff, keeping the expanded commit and scroll state. */
+  function closeCommitDiff(): void {
+    if (!commitDiffOpen()) return
+    if (pendingViewRestore) {
+      pendingViewRestore.generation = selectionGeneration.current()
+    }
+    setCommitDiffOpen(false)
+    scheduleViewRestore()
+  }
+
+  /**
+   * Switching the diff parent inside the full-panel view reloads both the diff
+   * and the inline file tree, so Back lands on the matching parent.
+   */
+  function changeDiffParent(requestedParentIndex: number): void {
     const commit = selectedCommit()
     if (!commit) return
     const maxIndex = Math.max(0, commit.parents.length - 1)
-    const nextIndex = Math.min(Math.max(0, parentIndex), maxIndex)
-    if (nextIndex === selectedParentIndex() && commitFiles().length > 0) return
+    const nextIndex = Math.min(Math.max(0, requestedParentIndex), maxIndex)
+    if (nextIndex === selectedParentIndex()) return
     selectionGeneration.bump()
     setSelectedParentIndex(nextIndex)
-    setSelectedFile(undefined)
-    setDiff(undefined)
-    setDiffError(undefined)
-    void loadCommitFiles(commit, nextIndex)
+    const file = selectedFile()
+    void loadCommitFiles(commit, nextIndex, undefined, { keepFile: true })
+    if (file?.source === "commit") {
+      const selection: FileSelection = {
+        path: file.path,
+        target: { type: "commit", hash: commit.hash, parentIndex: nextIndex },
+        source: "commit",
+      }
+      setSelectedFile(selection)
+      void loadDiff(selection)
+    }
   }
 
   function closeDetails(): void {
     selectionGeneration.bump()
-    filesRequest.cancel()
     diffRequest.cancel()
-    setSelectedCommit(undefined)
-    setSelectedParentIndex(0)
-    setCommitFiles([])
-    setFilesLoading(false)
-    setFilesError(undefined)
-    setExpandedDirectories(new Set<string>())
     setSelectedFile(undefined)
     setDiff(undefined)
     setDiffLoading(false)
     setDiffError(undefined)
   }
 
-  async function loadMore(): Promise<void> {
+  async function loadMore(auto = false): Promise<void> {
     const repositoryId = selectedRepositoryId()
-    if (!repositoryId || loadingMore() || !hasMore()) return
+    if (!repositoryId || loadMoreInFlight || loadingMore() || !hasMore()) return
     const { route, rpc } = currentRpc()
     const { directory } = route
     const key = selectionKey(route.serverId, route.directory)
     const skip = nextSkip()
 
+    loadMoreInFlight = true
     setLoadingMore(true)
     setHistoryError(undefined)
 
-    const result = await graphRequest.run((signal) =>
-      rpc.getLog(
-        { repositoryId, limit: PAGE_SIZE, skip },
-        requestOptions(directory, signal),
-      ),
-    )
+    try {
+      const result = await graphRequest.run((signal) =>
+        rpc.getLog(
+          { repositoryId, limit: PAGE_SIZE, skip },
+          requestOptions(directory, signal),
+        ),
+      )
 
-    if (!result.accepted) {
-      if (!result.aborted) {
-        setLoadingMore(false)
-        setHistoryError(formatError(result.error))
+      if (!result.accepted) {
+        if (!result.aborted) {
+          setLoadingMore(false)
+          setHistoryError(formatError(result.error))
+          if (auto) {
+            setAutoLoadState((state) =>
+              completeAutoLoad(state, { added: 0, failed: true, cancelled: false }),
+            )
+          }
+        }
+        return
       }
+      if (key !== activeKey || selectedRepositoryId() !== repositoryId) {
+        setLoadingMore(false)
+        return
+      }
+
+      setLoadingMore(false)
+      const page = result.value
+      const before = commits().length
+      const merged = mergeCommits(commits(), page.commits)
+      const added = merged.length - before
+      setCommits(merged)
+      // nextSkip always advances by the page the server returned, even when
+      // every commit was a duplicate, so retrying cannot loop forever.
+      setNextSkip(skip + page.commits.length)
+      setHasMore(page.hasMore && page.commits.length > 0)
+      if (auto) {
+        setAutoLoadState((state) =>
+          completeAutoLoad(state, { added, failed: false, cancelled: false }),
+        )
+        // The spacer grows after this commit; re-check once the DOM settles so
+        // a user pressing End again does not stay locked on an old bottom.
+        scheduleAutoLoadSettle()
+      }
+      maybeAutoLoad()
+    } finally {
+      loadMoreInFlight = false
+    }
+  }
+
+  /**
+   * One automatic page per bottom visit. Called from scroll, resize and after a
+   * page lands; all guards are synchronous so a burst cannot double-fetch.
+   *
+   * Measurements come from the live scroll container whenever one is attached.
+   * The `viewportHeight` signal is updated by an asynchronous `ResizeObserver`,
+   * which a background host tab can freeze, so using it alone would miss a
+   * bottom that the DOM already reports.
+   */
+  function maybeAutoLoad(viewport?: ScrollViewportLike): void {
+    const layout = rowLayout()
+    const metrics = resolveScrollMetrics(viewport ?? scroller, {
+      scrollTop: scrollTop(),
+      viewportHeight: viewportHeight(),
+      contentHeight: layout.totalHeight,
+    })
+    if (metrics.viewportHeight > 0 && metrics.viewportHeight !== viewportHeight()) {
+      setViewportHeight(metrics.viewportHeight)
+    }
+
+    const nearBottom = isNearBottom({
+      ...metrics,
+      threshold: ROW_HEIGHT * AUTO_LOAD_THRESHOLD_ROWS,
+    })
+    if (!nearBottom) {
+      setAutoLoadState((state) => rearmAutoLoad(state))
       return
     }
-    if (key !== activeKey || selectedRepositoryId() !== repositoryId) return
 
-    setLoadingMore(false)
-    const page = result.value
-    const merged = mergeCommits(commits(), page.commits)
-    setCommits(merged)
-    setNextSkip(skip + page.commits.length)
-    setHasMore(page.hasMore && page.commits.length > 0)
+    const state = untrack(() => autoLoadState())
+    if (
+      !shouldAutoLoad({
+        state,
+        nearBottom,
+        hasMore: hasMore(),
+        busy: busy(),
+        loadingMore: loadingMore() || loadMoreInFlight,
+        graphError: graphError() !== undefined,
+        historyActive: selectedRepositoryId() !== undefined && !commitDiffOpen(),
+      })
+    ) {
+      return
+    }
+
+    setAutoLoadState(beginAutoLoad(state))
+    void loadMore(true)
+  }
+
+  function retryAutoLoad(): void {
+    setAutoLoadState((state) => rearmAutoLoad(state))
+    setHistoryError(undefined)
+    const repositoryId = selectedRepositoryId()
+    if (!repositoryId || loadingMore() || loadMoreInFlight || !hasMore()) return
+    setAutoLoadState((state) => beginAutoLoad(state))
+    void loadMore(true)
   }
 
   function refreshAll(): void {
@@ -869,6 +1345,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setLoadingMore(false)
     setFilesLoading(false)
     setDiffLoading(false)
+    setAutoLoadState(INITIAL_AUTO_LOAD_STATE)
+    loadMoreInFlight = false
     void refreshRepositories(true, snapshot, restoreToken)
   }
 
@@ -878,6 +1356,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     pendingRestore = undefined
     setSearchQuery("")
     setGraphScrollLeft(0)
+    setAutoLoadState(INITIAL_AUTO_LOAD_STATE)
     if (graphScroller) graphScroller.scrollLeft = 0
     void loadRepository(repositoryId)
   }
@@ -909,10 +1388,21 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resizeObserver?.disconnect()
     resizeObserver = undefined
     if (element.clientHeight > 0) setViewportHeight(element.clientHeight)
+    // The element can be attached with its final size while a background host
+    // tab never delivers the ResizeObserver callback; evaluate with the live
+    // element so a scroll position captured before mount is not missed.
+    maybeAutoLoad(element)
+    // Ref callbacks run before the spacer/slot children are laid out, so only
+    // remember the element here; restoration happens on the next frame(s).
+    scheduleViewRestore()
     if (typeof ResizeObserver === "undefined") return
     resizeObserver = new ResizeObserver((entries) => {
       const height = entries[0]?.contentRect.height
-      if (typeof height === "number" && height > 0) setViewportHeight(height)
+      if (typeof height === "number" && height > 0) {
+        setViewportHeight(height)
+        maybeAutoLoad(entries[0]?.target as HTMLDivElement | undefined)
+        if (pendingViewRestore) scheduleViewRestore()
+      }
     })
     resizeObserver.observe(element)
   }
@@ -929,24 +1419,41 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     panelObserver.observe(element)
   }
 
-  function startGraphResize(event: PointerEvent & { currentTarget: HTMLButtonElement }): void {
+  function startColumnResize(
+    column: ColumnId,
+    event: PointerEvent & { currentTarget: HTMLButtonElement },
+  ): void {
     event.preventDefault()
     const startX = event.clientX
-    const startWidth = graphColumnWidth()
+    const base = untrack(() => columnPreferences())
     const move = (moveEvent: PointerEvent) => {
-      setGraphColumnWidth(clampGraphColumnWidth(startWidth + moveEvent.clientX - startX))
+      // `resizeColumnPreferences` uses positive delta = wider for this column,
+      // which matches dragging the handle to the right for every column.
+      setColumnPreferences(
+        resizeColumnPreferences(
+          base,
+          column,
+          moveEvent.clientX - startX,
+          panelWidth(),
+        ),
+      )
     }
-    const stop = () => {
+    const stop = (persist: boolean) => {
       window.removeEventListener("pointermove", move)
-      window.removeEventListener("pointerup", stop)
-      window.removeEventListener("pointercancel", stop)
+      window.removeEventListener("pointerup", up)
+      window.removeEventListener("pointercancel", cancel)
       resizeDragCleanup = undefined
+      // Persist once after the drag; storage failures are swallowed by the
+      // helper and must never break the panel.
+      if (persist) writeColumnPreferences(untrack(() => columnPreferences()))
     }
+    const up = () => stop(true)
+    const cancel = () => stop(false)
     resizeDragCleanup?.()
-    resizeDragCleanup = stop
+    resizeDragCleanup = () => stop(false)
     window.addEventListener("pointermove", move)
-    window.addEventListener("pointerup", stop)
-    window.addEventListener("pointercancel", stop)
+    window.addEventListener("pointerup", up)
+    window.addEventListener("pointercancel", cancel)
   }
 
   const selectedRepository = createMemo(() =>
@@ -964,42 +1471,74 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const rows = createMemo(() => graph().rows)
   const graphError = createMemo(() => graph().error)
 
+  const expandedRowIndex = createMemo(() => {
+    const commit = selectedCommit()
+    if (!commit) return undefined
+    const index = rows().findIndex((row) => row.commit.hash === commit.hash)
+    return index >= 0 ? index : undefined
+  })
+  const expandedRow = createMemo(() => {
+    const index = expandedRowIndex()
+    return index === undefined ? undefined : rows()[index]
+  })
+  const slotHeight = createMemo(() => {
+    if (expandedRowIndex() === undefined) return 0
+    const rowsNeeded = commitFiles().length
+    return Math.min(
+      MAX_SLOT_HEIGHT,
+      Math.max(MIN_SLOT_HEIGHT, SLOT_TREE_HEADER + rowsNeeded * SLOT_TREE_ROW_HEIGHT),
+    )
+  })
+  const rowLayout = createMemo(() =>
+    createRowLayout({
+      count: rows().length,
+      rowHeight: ROW_HEIGHT,
+      expandedIndex: expandedRowIndex(),
+      expandedHeight: slotHeight(),
+    }),
+  )
+
   const maxLanes = createMemo(() =>
     rows().reduce((maximum, row) => Math.max(maximum, row.lanes), 1),
   )
   const graphWidth = createMemo(() => graphContentWidth(maxLanes(), LANE_SPACING, LANE_PADDING))
-  const columns = createMemo(() => historyColumns(panelWidth()))
+  const resolvedColumns = createMemo(() =>
+    resolveColumnLayout(panelWidth(), columnPreferences()),
+  )
+  const graphColumnWidth = createMemo(() => resolvedColumns().widths.graph)
   const maxRefs = createMemo(() => visibleRefCount(panelWidth()))
   const detailsOrientation = createMemo(() => detailsLayout(panelWidth()))
-  const historyTemplate = createMemo(() =>
-    historyColumnTemplate({
-      graphWidth: graphColumnWidth(),
-      date: columns().date,
-      author: columns().author,
-    }),
-  )
   const historyStyle = createMemo(
     () =>
-      `--gg-history-cols:${historyTemplate()};--gg-graph-column:${graphColumnWidth()}px;--gg-graph-shift:${-graphScrollLeft()}px;`,
+      `--gg-history-cols:${resolvedColumns().gridTemplate};--gg-graph-column:${graphColumnWidth()}px;--gg-graph-shift:${-graphScrollLeft()}px;`,
   )
   const detailsBodyClass = createMemo(
     () =>
       `gg-details-body ${
         detailsOrientation() === "columns" ? "gg-layout-columns" : "gg-layout-rows"
-      }${selectedCommit() ? "" : " gg-single"}`,
+      } gg-single`,
   )
-  const detailsVisible = createMemo(() => selectedCommit() !== undefined || selectedFile() !== undefined)
+  const detailsVisible = createMemo(() => {
+    if (commitDiffOpen()) return false
+    const file = selectedFile()
+    return file !== undefined && file.source !== "commit"
+  })
+  const commitDiffSelection = createMemo(() => {
+    if (!commitDiffOpen()) return undefined
+    const commit = selectedCommit()
+    const file = selectedFile()
+    if (!commit || !file || file.source !== "commit") return undefined
+    return { commit, path: file.path }
+  })
   const range = createMemo(() =>
-    computeVirtualRange({
-      scrollTop: scrollTop(),
-      viewportHeight: viewportHeight(),
-      rowHeight: ROW_HEIGHT,
-      total: rows().length,
-      overscan: OVERSCAN,
-    }),
+    rowLayout().range(scrollTop(), viewportHeight(), OVERSCAN),
   )
   const rowViews = createMemo(() => createGraphRowViews(rows(), commits()))
   const visibleRows = createMemo(() => visibleGraphRowViews(rowViews(), range()))
+  const inlineSelectedPath = createMemo(() => {
+    const file = selectedFile()
+    return file?.source === "commit" ? file.path : undefined
+  })
   const matches = createMemo(() => searchMatches(commits(), searchQuery()))
   const matchCount = createMemo(() => matches()?.size ?? 0)
   const searchActive = createMemo(() => searchQuery().trim().length > 0)
@@ -1036,9 +1575,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   })
 
   createEffect(() => {
-    // Read the column signal so resizing re-runs this clamp, but use the real
-    // element width when it is available: the viewport must never be wider
-    // than the graph column, and its scroll range is defined by the browser.
+    // Read the resolved graph width so resizing re-runs this clamp, but use the
+    // real element width when available: the viewport must never be wider than
+    // the graph column, and its scroll range is defined by the browser.
     const column = graphColumnWidth()
     const viewport =
       graphScroller && graphScroller.clientWidth > 0
@@ -1061,28 +1600,25 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     if (!set) return
     const index = commits().findIndex((commit) => set.has(commit.hash))
     if (index < 0) return
+    const layout = rowLayout()
+    const rowTop = layout.rowTop(index)
     if (!scroller) {
-      const top = scrollTopForRow(
-        index,
-        ROW_HEIGHT,
-        rows().length * ROW_HEIGHT,
-        viewportHeight(),
+      setScrollTop(
+        clampScrollOffset(rowTop, layout.totalHeight, viewportHeight()),
       )
-      setScrollTop(top)
+      maybeAutoLoad()
       return
     }
     // A row near the end maps past the maximum scrollTop. The browser clamps
     // the DOM value and may not emit a scroll event when the value did not
     // actually change, so mirror the real DOM value into the signal or the
     // virtual window can point past the end and render no rows.
-    const top = scrollTopForRow(
-      index,
-      ROW_HEIGHT,
-      scroller.scrollHeight,
-      scroller.clientHeight,
-    )
+    const top = clampScrollOffset(rowTop, scroller.scrollHeight, scroller.clientHeight)
     scroller.scrollTop = top
     setScrollTop(scroller.scrollTop)
+    // Search can programmatically park the viewport at the bottom; the auto
+    // guard keeps that from turning into an unbounded fetch loop.
+    maybeAutoLoad()
   }
 
   const selectedFileForStatus = (file: ChangedFile): boolean => {
@@ -1114,6 +1650,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resizeObserver?.disconnect()
     panelObserver?.disconnect()
     resizeDragCleanup?.()
+    cancelRestoreFrame()
+    cancelAutoLoadSettle()
     if (activeKey) selectionCache.set(activeKey, untrack(() => captureSelection()))
     repositoriesRequest.dispose()
     graphRequest.dispose()
@@ -1232,7 +1770,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
         </div>
       </Show>
 
-      <Show when={selectedRepositoryId()}>
+      <Show when={selectedRepositoryId() && !commitDiffOpen()}>
         <section class="gg-changes-section" data-testid="changes" aria-label="Working tree changes">
           <Show
             when={status()}
@@ -1330,24 +1868,31 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           style={historyStyle()}
         >
           <div class="gg-history-head">
-            <div class="gg-col-graph-head">
-              <span>Graph</span>
-              <button
-                type="button"
-                class="gg-graph-resize"
-                aria-label="Resize graph column"
-                title="Drag to resize graph column"
-                onPointerDown={(event) => startGraphResize(event)}
-              />
-            </div>
-            <div>Description</div>
-            <Show when={columns().date}>
-              <div>Date</div>
-            </Show>
-            <Show when={columns().author}>
-              <div>Author</div>
-            </Show>
-            <div>Commit</div>
+            <For each={resolvedColumns().visible}>
+              {(column) => (
+                <div
+                  class={
+                    column === "graph"
+                      ? "gg-col-head gg-col-graph-head"
+                      : `gg-col-head gg-col-head-${column}`
+                  }
+                >
+                  <span>{columnLabel(column)}</span>
+                  <button
+                    type="button"
+                    class={
+                      column === "graph"
+                        ? "gg-graph-resize gg-column-resize"
+                        : "gg-column-resize"
+                    }
+                    data-testid={`resize-column-${column}`}
+                    aria-label={`Resize ${column} column`}
+                    title={`Drag to resize ${column} column`}
+                    onPointerDown={(event) => startColumnResize(column, event)}
+                  />
+                </div>
+              )}
+            </For>
           </div>
 
           <div class="gg-graph-hscroll-row">
@@ -1359,6 +1904,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
               tabIndex={0}
               ref={(element) => {
                 graphScroller = element
+                scheduleViewRestore()
               }}
               onScroll={(event) =>
                 setGraphScrollLeft(
@@ -1378,7 +1924,16 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
             class="gg-history-scroll"
             data-testid="history-scroll"
             ref={(element) => attachScroller(element)}
-            onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+            onScroll={(event) => {
+              const element = event.currentTarget
+              setScrollTop(element.scrollTop)
+              // Keep the virtual window honest even when ResizeObserver is
+              // frozen in a background host tab.
+              if (element.clientHeight > 0 && element.clientHeight !== viewportHeight()) {
+                setViewportHeight(element.clientHeight)
+              }
+              maybeAutoLoad(element)
+            }}
           >
             <Show
               when={rows().length > 0}
@@ -1396,7 +1951,11 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
             >
               <div
                 class="gg-history-spacer"
-                style={{ height: `${rows().length * ROW_HEIGHT}px` }}
+                style={{ height: `${rowLayout().totalHeight}px` }}
+                data-slot-height={rowLayout().slotHeight}
+                data-expanded-index={
+                  expandedRowIndex() === undefined ? undefined : expandedRowIndex()
+                }
               >
                 <For each={visibleRows()}>
                   {(view) => (
@@ -1405,16 +1964,50 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                       laneSpacing={LANE_SPACING}
                       graphWidth={graphWidth()}
                       rowHeight={ROW_HEIGHT}
+                      top={rowLayout().rowTop(view.index)}
                       selected={selectedCommit()?.hash === view.commit.hash}
+                      expanded={
+                        selectedCommit()?.hash === view.commit.hash &&
+                        expandedRowIndex() !== undefined
+                      }
                       disabled={busy()}
                       searchState={searchState(view.commit.hash)}
-                      showDate={columns().date}
-                      showAuthor={columns().author}
+                      showDate={resolvedColumns().visibility.date}
+                      showAuthor={resolvedColumns().visibility.author}
                       maxRefs={maxRefs()}
-                      onSelect={() => selectCommit(view.commit)}
+                      onSelect={() => toggleCommit(view.commit)}
                     />
                   )}
                 </For>
+
+                <Show when={expandedRow()}>
+                  {(row) => (
+                    <CommitFilesSlot
+                      top={rowLayout().slotTop ?? 0}
+                      height={rowLayout().slotHeight}
+                      row={row()}
+                      graphWidth={graphWidth()}
+                      columnWidth={graphColumnWidth()}
+                      laneSpacing={LANE_SPACING}
+                      nodes={commitTree()}
+                      fileCount={commitFiles().length}
+                      expanded={expandedDirectories()}
+                      selectedPath={inlineSelectedPath()}
+                      loading={filesLoading()}
+                      error={filesError()}
+                      disabled={busy()}
+                      onToggle={toggleDirectory}
+                      onSelect={(file) => {
+                        const commit = selectedCommit()
+                        if (commit) selectCommitFile(file, commit, selectedParentIndex())
+                      }}
+                      onRetry={() => {
+                        const commit = selectedCommit()
+                        if (commit) void loadCommitFiles(commit, selectedParentIndex())
+                      }}
+                    />
+                  )}
+                </Show>
               </div>
             </Show>
           </div>
@@ -1426,14 +2019,28 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                 type="button"
                 data-testid="load-more"
                 disabled={loadingMore() || busy()}
-                onClick={() => void loadMore()}
+                onClick={() => void loadMore(false)}
               >
                 {loadingMore() ? "Loading…" : "Load more"}
               </button>
             </Show>
           </div>
           <Show when={historyError() || graphError()}>
-            {(message) => <div class="gg-error">{message()}</div>}
+            {(message) => (
+              <div class="gg-error">
+                <span>{message()}</span>
+                <Show when={!graphError()}>
+                  <button
+                    type="button"
+                    data-testid="retry-load-more"
+                    disabled={loadingMore() || busy() || !hasMore()}
+                    onClick={() => retryAutoLoad()}
+                  >
+                    Retry
+                  </button>
+                </Show>
+              </div>
+            )}
           </Show>
         </section>
       </Show>
@@ -1442,61 +2049,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
         <section class="gg-details" data-testid="commit-details" aria-label="Commit details">
           <div class="gg-details-head">
             <div class="gg-details-title">
-              <Show
-                when={selectedCommit()}
-                fallback={
-                  <>
-                    <span class="gg-details-subject" title={selectedFile()?.path}>
-                      {selectedFile()?.path}
-                    </span>
-                    <span class="gg-details-hash">{selectedFile()?.source}</span>
-                  </>
-                }
-              >
-                {(commit) => (
-                  <>
-                    <span class="gg-details-subject" title={commit().subject}>
-                      {commit().subject || "(no subject)"}
-                    </span>
-                    <span class="gg-details-hash" title={commit().hash}>
-                      {shortHash(commit().hash)}
-                    </span>
-                    <span class="gg-details-parents" title={commit().parents.join(" ")}>
-                      {commit().parents.length === 0
-                        ? "root commit"
-                        : `parents ${commit().parents.map((parent) => shortHash(parent)).join(", ")}`}
-                    </span>
-                    <span class="gg-details-meta" title={`${commit().author} · ${commit().authorDate}`}>
-                      {commit().author}
-                    </span>
-                  </>
-                )}
-              </Show>
+              <span class="gg-details-subject" title={selectedFile()?.path}>
+                {selectedFile()?.path}
+              </span>
+              <span class="gg-details-hash">{selectedFile()?.source}</span>
             </div>
             <div class="gg-details-actions">
-              <Show when={selectedCommit()}>
-                {(commit) => (
-                  <Show when={commit().parents.length > 1}>
-                    <label class="gg-parent-select">
-                      <span class="gg-sr-only">Diff parent</span>
-                      <select
-                        aria-label="Diff parent"
-                        value={String(selectedParentIndex())}
-                        disabled={busy()}
-                        onChange={(event) => changeParent(Number(event.currentTarget.value))}
-                      >
-                        <For each={commit().parents}>
-                          {(parent, index) => (
-                            <option value={String(index())}>
-                              Parent {index() + 1} · {shortHash(parent)}
-                            </option>
-                          )}
-                        </For>
-                      </select>
-                    </label>
-                  </Show>
-                )}
-              </Show>
               <button
                 type="button"
                 class="gg-icon-button"
@@ -1511,62 +2069,11 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           </div>
 
           <div class={detailsBodyClass()}>
-            <Show when={selectedCommit()}>
-              <div class="gg-details-files" aria-label="Changed files">
-                <Show when={filesLoading()}>
-                  <div class="gg-status">Loading files…</div>
-                </Show>
-                <Show when={filesError()}>
-                  {(message) => (
-                    <div class="gg-error">
-                      <span>{message()}</span>
-                      <button
-                        type="button"
-                        disabled={busy()}
-                        onClick={() =>
-                          void loadCommitFiles(selectedCommit()!, selectedParentIndex())
-                        }
-                      >
-                        Retry
-                      </button>
-                    </div>
-                  )}
-                </Show>
-                <Show when={!filesLoading() && !filesError()}>
-                  <Show
-                    when={commitFiles().length > 0}
-                    fallback={<div class="gg-empty">No files changed relative to this parent.</div>}
-                  >
-                    <div class="gg-tree">
-                      <FileTree
-                        nodes={commitTree()}
-                        depth={0}
-                        expanded={expandedDirectories()}
-                        selectedPath={
-                          selectedFile()?.source === "commit" ? selectedFile()?.path : undefined
-                        }
-                        disabled={busy()}
-                        onToggle={toggleDirectory}
-                        onSelect={(file) => {
-                          const commit = selectedCommit()
-                          if (commit) selectCommitFile(file, commit, selectedParentIndex())
-                        }}
-                      />
-                    </div>
-                  </Show>
-                </Show>
-              </div>
-            </Show>
-
             <div class="gg-details-diff" data-testid="diff" aria-label="Diff">
               <Show
                 when={selectedFile()}
                 fallback={
-                  <div class="gg-diff-placeholder">
-                    {selectedCommit()
-                      ? "Select a changed file to view its diff."
-                      : "Select a file to view its diff."}
-                  </div>
+                  <div class="gg-diff-placeholder">Select a file to view its diff.</div>
                 }
               >
                 {(selection) => (
@@ -1651,6 +2158,25 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
             </div>
           </div>
         </section>
+      </Show>
+
+      <Show when={commitDiffSelection()}>
+        {(selection) => (
+          <CommitDiffView
+            commit={selection().commit}
+            parentIndex={selectedParentIndex()}
+            path={selection().path}
+            diff={diff()}
+            loading={diffLoading()}
+            error={diffError()}
+            onBack={() => closeCommitDiff()}
+            onRetry={() => {
+              const file = selectedFile()
+              if (file) void loadDiff(file)
+            }}
+            onParentChange={(index) => changeDiffParent(index)}
+          />
+        )}
       </Show>
     </div>
   )
