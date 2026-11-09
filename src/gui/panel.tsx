@@ -12,13 +12,21 @@ import type {
   ChangedFile,
   FileDiff,
   GitCommit,
-  GitRef,
   GitRepository,
   GitStatus,
 } from "../shared/types.js"
 import { GitGraphRpc } from "../rpc.js"
 import { buildCommitGraph } from "./graph.js"
-import { graphRowLines } from "./graph-geometry.js"
+import {
+  DEFAULT_GRAPH_COLUMN_WIDTH,
+  DEFAULT_LANE_PADDING,
+  DEFAULT_LANE_SPACING,
+  clampGraphColumnWidth,
+  graphContentWidth,
+  graphLaneX,
+  graphLinePath,
+  graphRowLines,
+} from "./graph-geometry.js"
 import {
   createGraphRowViews,
   visibleGraphRowViews,
@@ -44,16 +52,27 @@ import {
 } from "./selection.js"
 import { formatError } from "./errors.js"
 import { sessionRoute } from "./routing.js"
-import type { GraphRow } from "../server/graph/layout.js"
 import { GG_STYLES } from "./styles.js"
+import {
+  detailsLayout,
+  historyColumnTemplate,
+  historyColumns,
+  visibleRefCount,
+} from "./history-columns.js"
+import { formatCommitDate, formatRefLabel, refHue, shortHash } from "./format.js"
+import { searchMatches } from "./search.js"
+import { repositoryOptionLabel } from "./repository-label.js"
+import {
+  clampScrollOffset,
+  maxScrollOffset,
+  scrollTopForRow,
+} from "./scroll.js"
 
 const PAGE_SIZE = 100
-const ROW_HEIGHT = 32
+const ROW_HEIGHT = 28
 const OVERSCAN = 6
-const MAX_GRAPH_WIDTH = 220
-const LANE_PADDING = 8
-const MIN_LANE_SPACING = 2
-const MAX_LANE_SPACING = 14
+const LANE_SPACING = DEFAULT_LANE_SPACING
+const LANE_PADDING = DEFAULT_LANE_PADDING
 const MAX_DIFF_DISPLAY_LINES = 4_000
 const SELECTION_CACHE_LIMIT = 16
 
@@ -73,135 +92,247 @@ const PALETTE = [
   "#b4f9f8",
 ] as const
 
-function shortHash(hash: string | null | undefined): string {
-  return hash ? hash.slice(0, 7) : ""
-}
-
 function colourOf(colour: number): string {
   return PALETTE[colour % PALETTE.length]
-}
-
-function refLabel(ref: string): string {
-  return ref.replace(/^HEAD -> /, "HEAD → ")
-}
-
-function laneX(lane: number, spacing: number): number {
-  return LANE_PADDING + lane * spacing + spacing / 2
 }
 
 function statusClass(status: ChangedFile["status"]): string {
   return `gg-status-letter gg-status-${status}`
 }
 
+type SearchState = "none" | "match" | "dim"
+
+/* ---------- icons ---------- */
+
+function RefreshIcon() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <polyline points="23 4 23 10 17 10" />
+      <polyline points="1 20 1 14 7 14" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </svg>
+  )
+}
+
+function BranchIcon() {
+  return (
+    <svg
+      class="gg-branch-icon"
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <line x1="6" y1="3" x2="6" y2="15" />
+      <circle cx="18" cy="6" r="3" />
+      <circle cx="6" cy="18" r="3" />
+      <path d="M18 9a9 9 0 0 1-9 9" />
+    </svg>
+  )
+}
+
+function SearchIcon() {
+  return (
+    <svg
+      class="gg-search-icon"
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="11" cy="11" r="7" />
+      <line x1="21" y1="21" x2="16.65" y2="16.65" />
+    </svg>
+  )
+}
+
+/* ---------- graph row ---------- */
+
 interface GraphRowProps {
   readonly view: GraphRowView
   readonly laneSpacing: number
   readonly graphWidth: number
+  readonly rowHeight: number
   readonly selected: boolean
   readonly disabled: boolean
+  readonly searchState: SearchState
+  readonly showDate: boolean
+  readonly showAuthor: boolean
+  readonly maxRefs: number
   readonly onSelect: () => void
 }
 
-function GraphRowView(props: GraphRowProps) {
-  const x = (lane: number) => laneX(lane, props.laneSpacing)
-  const nodeRadius = () => Math.max(2, Math.min(4, props.laneSpacing / 3))
+function GraphRow(props: GraphRowProps) {
   const lines = () => graphRowLines(props.view.row, props.view.previous)
+  const nodeX = () => graphLaneX(props.view.row.lane, props.laneSpacing, LANE_PADDING)
 
   return (
     <button
       type="button"
-      class={props.selected ? "gg-graph-row gg-selected" : "gg-graph-row"}
-      style={{ top: `${props.view.index * ROW_HEIGHT}px`, height: `${ROW_HEIGHT}px` }}
+      class={[
+        "gg-graph-row",
+        props.selected ? "gg-selected" : "",
+        props.searchState === "dim" ? "gg-search-dim" : "",
+        props.searchState === "match" ? "gg-search-match" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      style={{ top: `${props.view.index * props.rowHeight}px`, height: `${props.rowHeight}px` }}
       disabled={props.disabled}
       onClick={() => props.onSelect()}
       title={props.view.commit.subject}
+      data-commit={props.view.commit.hash}
     >
-      <svg
-        class="gg-graph-svg"
-        width={props.graphWidth}
-        height={ROW_HEIGHT}
-        viewBox={`0 0 ${props.graphWidth} ${ROW_HEIGHT}`}
-        aria-hidden="true"
-      >
-        <For each={lines()}>
-          {(line) => (
-            <line
-              x1={x(line.from.lane)}
-              y1={line.from.y * ROW_HEIGHT}
-              x2={x(line.to.lane)}
-              y2={line.to.y * ROW_HEIGHT}
-              stroke={colourOf(line.colour)}
+      <div class="gg-row-graph" aria-hidden="true">
+        <div class="gg-row-graph-inner">
+          <svg
+            class="gg-graph-svg"
+            width={props.graphWidth}
+            height={props.rowHeight}
+            viewBox={`0 0 ${props.graphWidth} ${props.rowHeight}`}
+            aria-hidden="true"
+          >
+            <For each={lines()}>
+              {(line) => (
+                <path
+                  d={graphLinePath(line, {
+                    laneSpacing: props.laneSpacing,
+                    rowHeight: props.rowHeight,
+                    padding: LANE_PADDING,
+                  })}
+                  fill="none"
+                  stroke={colourOf(line.colour)}
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  opacity="0.9"
+                />
+              )}
+            </For>
+            <circle
+              cx={nodeX()}
+              cy={props.rowHeight / 2}
+              r={3.5}
+              fill={colourOf(props.view.row.colour)}
+              stroke="var(--color-background, #1e1e1e)"
               stroke-width="1.5"
-              stroke-linecap="round"
             />
+          </svg>
+        </div>
+      </div>
+
+      <div class="gg-col-desc">
+        <For each={props.view.commit.refs.slice(0, props.maxRefs)}>
+          {(ref) => (
+            <span
+              class="gg-ref-badge"
+              style={`--gg-ref-hue:${refHue(ref)}`}
+              title={ref}
+            >
+              {formatRefLabel(ref)}
+            </span>
           )}
         </For>
-        <circle
-          cx={x(props.view.row.lane)}
-          cy={ROW_HEIGHT / 2}
-          r={nodeRadius()}
-          fill={colourOf(props.view.row.colour)}
-          stroke="var(--color-background, #111)"
-          stroke-width="1"
-        />
-      </svg>
-      <span class="gg-graph-text">
+        <Show when={props.view.commit.refs.length > props.maxRefs}>
+          <span
+            class="gg-ref-badge gg-ref-more"
+            title={props.view.commit.refs.slice(props.maxRefs).join(", ")}
+          >
+            +{props.view.commit.refs.length - props.maxRefs}
+          </span>
+        </Show>
         <span class="gg-subject">{props.view.commit.subject || "(no subject)"}</span>
-        <span class="gg-row-meta">
-          <span class="gg-hash">{shortHash(props.view.commit.hash)}</span>
-          <For each={props.view.commit.refs.slice(0, 3)}>
-            {(ref) => (
-              <span class="gg-ref" title={ref}>
-                {refLabel(ref)}
-              </span>
-            )}
-          </For>
-          <Show when={props.view.commit.refs.length > 3}>
-            <span class="gg-ref">+{props.view.commit.refs.length - 3}</span>
-          </Show>
-        </span>
-      </span>
+      </div>
+
+      <Show when={props.showDate}>
+        <div class="gg-col-date">{formatCommitDate(props.view.commit.authorDate)}</div>
+      </Show>
+      <Show when={props.showAuthor}>
+        <div class="gg-col-author" title={props.view.commit.author}>
+          {props.view.commit.author}
+        </div>
+      </Show>
+      <div class="gg-col-commit" title={props.view.commit.hash}>
+        <span class="gg-hash">{shortHash(props.view.commit.hash)}</span>
+      </div>
     </button>
   )
 }
+
+/* ---------- working-tree groups ---------- */
 
 interface StatusGroupSectionProps {
   readonly title: string
   readonly files: readonly ChangedFile[]
   readonly disabled: boolean
+  readonly expanded: boolean
+  readonly onToggle: () => void
   readonly isSelected: (file: ChangedFile) => boolean
   readonly onSelect: (file: ChangedFile) => void
 }
 
 function StatusGroupSection(props: StatusGroupSectionProps) {
   return (
-    <div>
-      <div class="gg-group-title">
-        <span>{props.title}</span>
-        <span class="gg-group-count">{props.files.length}</span>
+    <Show when={props.files.length > 0}>
+      <div class="gg-status-group">
+        <button
+          type="button"
+          class="gg-group-head"
+          aria-expanded={props.expanded}
+          onClick={() => props.onToggle()}
+        >
+          <span class="gg-caret" aria-hidden="true">
+            {props.expanded ? "▾" : "▸"}
+          </span>
+          <span>{props.title}</span>
+          <span class="gg-count-badge">{props.files.length}</span>
+        </button>
+        <Show when={props.expanded}>
+          <div class="gg-group-body">
+            <For each={props.files}>
+              {(file) => (
+                <button
+                  type="button"
+                  class={props.isSelected(file) ? "gg-file-row gg-selected" : "gg-file-row"}
+                  title={file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}
+                  disabled={props.disabled}
+                  onClick={() => props.onSelect(file)}
+                >
+                  <span class={statusClass(file.status)}>{statusLetter(file.status)}</span>
+                  <span class="gg-file-name">{file.path}</span>
+                  <Show when={file.oldPath}>
+                    <span class="gg-file-old">← {file.oldPath}</span>
+                  </Show>
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
       </div>
-      <Show when={props.files.length > 0} fallback={<div class="gg-muted">None</div>}>
-        <For each={props.files}>
-          {(file) => (
-            <button
-              type="button"
-              class={props.isSelected(file) ? "gg-file-row gg-selected" : "gg-file-row"}
-              title={file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}
-              disabled={props.disabled}
-              onClick={() => props.onSelect(file)}
-            >
-              <span class={statusClass(file.status)}>{statusLetter(file.status)}</span>
-              <span class="gg-file-name">{file.path}</span>
-              <Show when={file.oldPath}>
-                <span class="gg-file-old">← {file.oldPath}</span>
-              </Show>
-            </button>
-          )}
-        </For>
-      </Show>
-    </div>
+    </Show>
   )
 }
+
+/* ---------- commit file tree ---------- */
 
 interface FileTreeProps {
   readonly nodes: readonly FileTreeNode[]
@@ -224,12 +355,15 @@ function FileTree(props: FileTreeProps) {
               <button
                 type="button"
                 class="gg-dir-row"
-                style={{ "padding-left": `${props.depth * 12 + 4}px` }}
+                style={`--gg-indent:${props.depth * 12 + 4}px`}
                 title={node.path}
                 disabled={props.disabled}
+                aria-expanded={open()}
                 onClick={() => props.onToggle(node.path)}
               >
-                <span class="gg-dir-caret">{open() ? "▾" : "▸"}</span>
+                <span class="gg-dir-caret" aria-hidden="true">
+                  {open() ? "▾" : "▸"}
+                </span>
                 <span class="gg-dir-name">{node.name}</span>
                 <span class="gg-muted">{node.fileCount}</span>
               </button>
@@ -254,7 +388,7 @@ function FileTree(props: FileTreeProps) {
           <button
             type="button"
             class={props.selectedPath === node.path ? "gg-file-row gg-selected" : "gg-file-row"}
-            style={{ "padding-left": `${props.depth * 12 + 4}px` }}
+            style={`--gg-indent:${props.depth * 12 + 4}px`}
             title={node.file.oldPath ? `${node.file.oldPath} → ${node.path}` : node.path}
             disabled={props.disabled}
             onClick={() => props.onSelect(node.file)}
@@ -271,6 +405,8 @@ function FileTree(props: FileTreeProps) {
   )
 }
 
+/* ---------- panel ---------- */
+
 /**
  * Read-only Git Graph side panel.
  *
@@ -285,16 +421,14 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
 
   const [selectedRepositoryId, setSelectedRepositoryId] = createSignal<string | undefined>()
   const [status, setStatus] = createSignal<GitStatus | undefined>()
-  const [refs, setRefs] = createSignal<GitRef[]>([])
   const [repositoryLoading, setRepositoryLoading] = createSignal(false)
   const [repositoryError, setRepositoryError] = createSignal<string | undefined>()
 
   const [commits, setCommits] = createSignal<GitCommit[]>([])
-  const [rows, setRows] = createSignal<GraphRow[]>([])
   const [hasMore, setHasMore] = createSignal(false)
   const [nextSkip, setNextSkip] = createSignal(0)
   const [loadingMore, setLoadingMore] = createSignal(false)
-  const [graphError, setGraphError] = createSignal<string | undefined>()
+  const [historyError, setHistoryError] = createSignal<string | undefined>()
 
   const [selectedCommit, setSelectedCommit] = createSignal<GitCommit | undefined>()
   const [selectedParentIndex, setSelectedParentIndex] = createSignal(0)
@@ -310,6 +444,13 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
 
   const [viewportHeight, setViewportHeight] = createSignal(320)
   const [scrollTop, setScrollTop] = createSignal(0)
+  const [panelWidth, setPanelWidth] = createSignal(520)
+  const [graphColumnWidth, setGraphColumnWidth] = createSignal(DEFAULT_GRAPH_COLUMN_WIDTH)
+  const [graphScrollLeft, setGraphScrollLeft] = createSignal(0)
+
+  const [searchQuery, setSearchQuery] = createSignal("")
+  const [changesExpanded, setChangesExpanded] = createSignal(true)
+  const [collapsedGroups, setCollapsedGroups] = createSignal<ReadonlySet<string>>(new Set<string>())
 
   const repositoriesRequest = new LatestRequest()
   const graphRequest = new LatestRequest()
@@ -321,7 +462,10 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   let activeKey = ""
   let pendingRestore: SelectionSnapshot | undefined
   let scroller: HTMLDivElement | undefined
+  let graphScroller: HTMLDivElement | undefined
   let resizeObserver: ResizeObserver | undefined
+  let panelObserver: ResizeObserver | undefined
+  let resizeDragCleanup: (() => void) | undefined
 
   const currentDirectory = () => props.panel.session.directory
 
@@ -360,13 +504,13 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     diffRequest.cancel()
 
     setStatus(undefined)
-    setRefs([])
     setCommits([])
-    setRows([])
     setHasMore(false)
     setNextSkip(0)
     setLoadingMore(false)
-    setGraphError(undefined)
+    setHistoryError(undefined)
+    setGraphScrollLeft(0)
+    if (graphScroller) graphScroller.scrollLeft = 0
     setRepositoryLoading(false)
     setRepositoryError(undefined)
 
@@ -393,6 +537,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setRepositoriesLoading(false)
     setRepositoriesError(undefined)
     setSelectedRepositoryId(undefined)
+    setSearchQuery("")
+    setChangesExpanded(true)
+    setCollapsedGroups(new Set<string>())
     setScrollTop(0)
     if (scroller) scroller.scrollTop = 0
   }
@@ -467,12 +614,11 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
 
     const result = await graphRequest.run(async (signal) => {
       const options = requestOptions(directory, signal)
-      const [nextStatus, log, nextRefs] = await Promise.all([
+      const [nextStatus, log] = await Promise.all([
         rpc.getStatus({ repositoryId }, options),
         rpc.getLog({ repositoryId, limit: PAGE_SIZE }, options),
-        rpc.getRefs({ repositoryId }, options),
       ])
-      return { status: nextStatus, log, refs: nextRefs.refs }
+      return { status: nextStatus, log }
     })
 
     if (!result.accepted) {
@@ -490,13 +636,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const nextCommits = mergeCommits([], nextLog.commits)
 
     setStatus(nextStatus)
-    setRefs(result.value.refs)
     setCommits(nextCommits)
     setNextSkip(nextLog.commits.length)
     setHasMore(nextLog.hasMore)
-    const graph = buildCommitGraph(nextCommits)
-    setRows(graph.rows)
-    setGraphError(graph.error)
 
     if (restore) applyRestore(restore, nextStatus, nextCommits)
   }
@@ -664,6 +806,22 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     void loadCommitFiles(commit, nextIndex)
   }
 
+  function closeDetails(): void {
+    selectionGeneration.bump()
+    filesRequest.cancel()
+    diffRequest.cancel()
+    setSelectedCommit(undefined)
+    setSelectedParentIndex(0)
+    setCommitFiles([])
+    setFilesLoading(false)
+    setFilesError(undefined)
+    setExpandedDirectories(new Set<string>())
+    setSelectedFile(undefined)
+    setDiff(undefined)
+    setDiffLoading(false)
+    setDiffError(undefined)
+  }
+
   async function loadMore(): Promise<void> {
     const repositoryId = selectedRepositoryId()
     if (!repositoryId || loadingMore() || !hasMore()) return
@@ -673,7 +831,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const skip = nextSkip()
 
     setLoadingMore(true)
-    setGraphError(undefined)
+    setHistoryError(undefined)
 
     const result = await graphRequest.run((signal) =>
       rpc.getLog(
@@ -685,7 +843,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     if (!result.accepted) {
       if (!result.aborted) {
         setLoadingMore(false)
-        setGraphError(formatError(result.error))
+        setHistoryError(formatError(result.error))
       }
       return
     }
@@ -697,10 +855,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setCommits(merged)
     setNextSkip(skip + page.commits.length)
     setHasMore(page.hasMore && page.commits.length > 0)
-
-    const graph = buildCommitGraph(merged)
-    setRows(graph.rows)
-    setGraphError(graph.error)
   }
 
   function refreshAll(): void {
@@ -722,6 +876,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     if (!repositoryId || repositoryId === selectedRepositoryId()) return
     selectionGeneration.bump()
     pendingRestore = undefined
+    setSearchQuery("")
+    setGraphScrollLeft(0)
+    if (graphScroller) graphScroller.scrollLeft = 0
     void loadRepository(repositoryId)
   }
 
@@ -732,6 +889,19 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       else next.add(path)
       return next
     })
+  }
+
+  function toggleGroup(key: string): void {
+    setCollapsedGroups((previous) => {
+      const next = new Set(previous)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }
+
+  function groupExpanded(key: string): boolean {
+    return !collapsedGroups().has(key)
   }
 
   function attachScroller(element: HTMLDivElement): void {
@@ -747,6 +917,38 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resizeObserver.observe(element)
   }
 
+  function attachPanel(element: HTMLDivElement): void {
+    panelObserver?.disconnect()
+    panelObserver = undefined
+    if (element.clientWidth > 0) setPanelWidth(element.clientWidth)
+    if (typeof ResizeObserver === "undefined") return
+    panelObserver = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width
+      if (typeof width === "number" && width > 0) setPanelWidth(width)
+    })
+    panelObserver.observe(element)
+  }
+
+  function startGraphResize(event: PointerEvent & { currentTarget: HTMLButtonElement }): void {
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = graphColumnWidth()
+    const move = (moveEvent: PointerEvent) => {
+      setGraphColumnWidth(clampGraphColumnWidth(startWidth + moveEvent.clientX - startX))
+    }
+    const stop = () => {
+      window.removeEventListener("pointermove", move)
+      window.removeEventListener("pointerup", stop)
+      window.removeEventListener("pointercancel", stop)
+      resizeDragCleanup = undefined
+    }
+    resizeDragCleanup?.()
+    resizeDragCleanup = stop
+    window.addEventListener("pointermove", move)
+    window.addEventListener("pointerup", stop)
+    window.addEventListener("pointercancel", stop)
+  }
+
   const selectedRepository = createMemo(() =>
     repositories().find((repository) => repository.id === selectedRepositoryId()),
   )
@@ -756,19 +958,37 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const commitTree = createMemo(() => buildFileTree(commitFiles()))
   const diffLines = createMemo(() => classifyDiff(diff()?.text ?? ""))
   const visibleDiffLines = createMemo(() => diffLines().slice(0, MAX_DIFF_DISPLAY_LINES))
+
+  /** Layout is derived from the loaded commits; search never rewrites it. */
+  const graph = createMemo(() => buildCommitGraph(commits()))
+  const rows = createMemo(() => graph().rows)
+  const graphError = createMemo(() => graph().error)
+
   const maxLanes = createMemo(() =>
     rows().reduce((maximum, row) => Math.max(maximum, row.lanes), 1),
   )
-  const laneSpacing = createMemo(() =>
-    Math.max(
-      MIN_LANE_SPACING,
-      Math.min(
-        MAX_LANE_SPACING,
-        Math.floor((MAX_GRAPH_WIDTH - LANE_PADDING * 2) / Math.max(1, maxLanes())),
-      ),
-    ),
+  const graphWidth = createMemo(() => graphContentWidth(maxLanes(), LANE_SPACING, LANE_PADDING))
+  const columns = createMemo(() => historyColumns(panelWidth()))
+  const maxRefs = createMemo(() => visibleRefCount(panelWidth()))
+  const detailsOrientation = createMemo(() => detailsLayout(panelWidth()))
+  const historyTemplate = createMemo(() =>
+    historyColumnTemplate({
+      graphWidth: graphColumnWidth(),
+      date: columns().date,
+      author: columns().author,
+    }),
   )
-  const graphWidth = createMemo(() => maxLanes() * laneSpacing() + LANE_PADDING * 2)
+  const historyStyle = createMemo(
+    () =>
+      `--gg-history-cols:${historyTemplate()};--gg-graph-column:${graphColumnWidth()}px;--gg-graph-shift:${-graphScrollLeft()}px;`,
+  )
+  const detailsBodyClass = createMemo(
+    () =>
+      `gg-details-body ${
+        detailsOrientation() === "columns" ? "gg-layout-columns" : "gg-layout-rows"
+      }${selectedCommit() ? "" : " gg-single"}`,
+  )
+  const detailsVisible = createMemo(() => selectedCommit() !== undefined || selectedFile() !== undefined)
   const range = createMemo(() =>
     computeVirtualRange({
       scrollTop: scrollTop(),
@@ -780,12 +1000,91 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   )
   const rowViews = createMemo(() => createGraphRowViews(rows(), commits()))
   const visibleRows = createMemo(() => visibleGraphRowViews(rowViews(), range()))
+  const matches = createMemo(() => searchMatches(commits(), searchQuery()))
+  const matchCount = createMemo(() => matches()?.size ?? 0)
+  const searchActive = createMemo(() => searchQuery().trim().length > 0)
+  const footerText = createMemo(() =>
+    searchActive()
+      ? `${matchCount()} matches · ${commits().length} loaded${hasMore() ? "+" : ""}`
+      : `${commits().length} loaded${hasMore() ? "+" : ""}`,
+  )
   const branchLabel = createMemo(() => {
     const current = status()
-    if (!current) return ""
-    if (current.detached) return `detached @ ${shortHash(current.head)}`
-    return current.branch ?? "(no branch)"
+    if (current) {
+      if (current.detached) {
+        return current.head ? `detached @ ${shortHash(current.head)}` : "detached HEAD"
+      }
+      return current.branch ?? "(no branch)"
+    }
+    const repository = selectedRepository()
+    if (repository) {
+      if (repository.detached) {
+        return repository.head ? `detached @ ${shortHash(repository.head)}` : "detached HEAD"
+      }
+      return repository.branch ?? "(no branch)"
+    }
+    return ""
   })
+  const detached = createMemo(() => status()?.detached ?? selectedRepository()?.detached ?? false)
+  const repositoryOptions = createMemo(() => {
+    const directory = currentDirectory()
+    const list = repositories()
+    return list.map((repository) => ({
+      repository,
+      label: repositoryOptionLabel(repository, list, directory),
+    }))
+  })
+
+  createEffect(() => {
+    // Read the column signal so resizing re-runs this clamp, but use the real
+    // element width when it is available: the viewport must never be wider
+    // than the graph column, and its scroll range is defined by the browser.
+    const column = graphColumnWidth()
+    const viewport =
+      graphScroller && graphScroller.clientWidth > 0
+        ? graphScroller.clientWidth
+        : column
+    const maxScroll = maxScrollOffset(graphWidth(), viewport)
+    if (graphScrollLeft() <= maxScroll) return
+    setGraphScrollLeft(maxScroll)
+    if (graphScroller) graphScroller.scrollLeft = maxScroll
+  })
+
+  function searchState(hash: string): SearchState {
+    const set = matches()
+    if (!set) return "none"
+    return set.has(hash) ? "match" : "dim"
+  }
+
+  function jumpToFirstMatch(): void {
+    const set = matches()
+    if (!set) return
+    const index = commits().findIndex((commit) => set.has(commit.hash))
+    if (index < 0) return
+    if (!scroller) {
+      const top = scrollTopForRow(
+        index,
+        ROW_HEIGHT,
+        rows().length * ROW_HEIGHT,
+        viewportHeight(),
+      )
+      setScrollTop(top)
+      return
+    }
+    // A row near the end maps past the maximum scrollTop. The browser clamps
+    // the DOM value and may not emit a scroll event when the value did not
+    // actually change, so mirror the real DOM value into the signal or the
+    // virtual window can point past the end and render no rows.
+    const top = scrollTopForRow(
+      index,
+      ROW_HEIGHT,
+      scroller.scrollHeight,
+      scroller.clientHeight,
+    )
+    scroller.scrollTop = top
+    setScrollTop(scroller.scrollTop)
+  }
+
   const selectedFileForStatus = (file: ChangedFile): boolean => {
     const selection = selectedFile()
     if (!selection) return false
@@ -813,6 +1112,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
 
   onCleanup(() => {
     resizeObserver?.disconnect()
+    panelObserver?.disconnect()
+    resizeDragCleanup?.()
     if (activeKey) selectionCache.set(activeKey, untrack(() => captureSelection()))
     repositoriesRequest.dispose()
     graphRequest.dispose()
@@ -821,52 +1122,87 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   })
 
   return (
-    <div class="git-graph-panel">
+    <div class="git-graph-panel" ref={(element) => attachPanel(element)}>
       <style>{GG_STYLES}</style>
 
-      <div class="gg-header">
-        <div class="gg-repo-row">
-          <select
-            aria-label="Repository"
-            value={selectedRepositoryId() ?? ""}
-            disabled={busy()}
-            onChange={(event) => chooseRepository(event.currentTarget.value)}
-          >
-            <Show when={repositories().length === 0}>
-              <option value="">No repositories</option>
-            </Show>
-            <For each={repositories()}>
-              {(repository) => (
-                <option value={repository.id}>
-                  {repository.name}
-                  {repository.branch ? ` — ${repository.branch}` : ""}
-                </option>
-              )}
-            </For>
-          </select>
-          <button
-            type="button"
-            disabled={busy()}
-            onClick={() => refreshAll()}
-          >
-            {busy() ? "Refreshing…" : "Refresh"}
-          </button>
-        </div>
+      <header class="gg-toolbar">
+        <select
+          class="gg-repo-select"
+          aria-label="Repository"
+          data-testid="repository-select"
+          title={selectedRepository()?.rootPath ?? "Repository"}
+          value={selectedRepositoryId() ?? ""}
+          disabled={busy()}
+          onChange={(event) => chooseRepository(event.currentTarget.value)}
+        >
+          <Show when={repositories().length === 0}>
+            <option value="">No repositories</option>
+          </Show>
+          <For each={repositoryOptions()}>
+            {(option) => <option value={option.repository.id}>{option.label}</option>}
+          </For>
+        </select>
+
+        <button
+          type="button"
+          class={busy() ? "gg-icon-button gg-spin" : "gg-icon-button"}
+          data-testid="refresh"
+          aria-label="Refresh"
+          title="Refresh"
+          disabled={busy()}
+          onClick={() => refreshAll()}
+        >
+          <RefreshIcon />
+        </button>
+
         <Show when={selectedRepository()}>
-          {(repository) => (
-            <div class="gg-repo-meta" title={repository().rootPath}>
-              {repository().type}
-              {repository().detached ? " · detached" : ""}
-              <Show when={status()}>
-                <span> · {branchLabel()}</span>
-              </Show>
-              <Show when={refs().length > 0}>
-                <span> · {refs().length} refs</span>
-              </Show>
-            </div>
-          )}
+          <div
+            class={detached() ? "gg-branch gg-branch-detached" : "gg-branch"}
+            data-testid="current-branch"
+            aria-label={`Current branch: ${branchLabel()}`}
+            title={`Current branch: ${branchLabel()}`}
+          >
+            <BranchIcon />
+            <span class="gg-branch-name">{branchLabel()}</span>
+            <Show when={detached()}>
+              <span class="gg-badge-detached">detached</span>
+            </Show>
+          </div>
         </Show>
-      </div>
+
+        <div class="gg-search">
+          <SearchIcon />
+          <input
+            type="search"
+            data-testid="search-commits"
+            aria-label="Search commits"
+            placeholder="Search loaded commits"
+            value={searchQuery()}
+            disabled={!selectedRepositoryId()}
+            title="Search loaded commits (Enter jumps to the first match)"
+            onInput={(event) => setSearchQuery(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault()
+                jumpToFirstMatch()
+              } else if (event.key === "Escape") {
+                setSearchQuery("")
+              }
+            }}
+          />
+          <Show when={searchQuery().length > 0}>
+            <button
+              type="button"
+              class="gg-search-clear"
+              aria-label="Clear search"
+              title="Clear search"
+              onClick={() => setSearchQuery("")}
+            >
+              ×
+            </button>
+          </Show>
+        </div>
+      </header>
 
       <Show when={repositoriesLoading()}>
         <div class="gg-status">Loading repositories…</div>
@@ -897,21 +1233,83 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       </Show>
 
       <Show when={selectedRepositoryId()}>
-        <section class="gg-section">
-          <div class="gg-section-title">
-            <span>Changes</span>
-            <Show when={status()}>
-              {(current) => (
-                <span class="gg-muted">
-                  {current().counts.staged} staged · {current().counts.unstaged} unstaged ·{" "}
-                  {current().counts.untracked} untracked · {current().counts.conflicted} conflicted
-                </span>
-              )}
-            </Show>
-          </div>
-
-          <Show when={repositoryLoading()}>
-            <div class="gg-status">Loading repository…</div>
+        <section class="gg-changes-section" data-testid="changes" aria-label="Working tree changes">
+          <Show
+            when={status()}
+            fallback={
+              <Show when={repositoryLoading()}>
+                <div class="gg-status">Loading repository…</div>
+              </Show>
+            }
+          >
+            {(current) => (
+              <Show
+                when={current().files.length > 0}
+                fallback={
+                  <div class="gg-working-tree-clean">
+                    <span class="gg-clean-dot" aria-hidden="true" />
+                    <span>Working tree clean</span>
+                  </div>
+                }
+              >
+                <button
+                  type="button"
+                  class="gg-changes-head"
+                  aria-expanded={changesExpanded()}
+                  onClick={() => setChangesExpanded((value) => !value)}
+                >
+                  <span class="gg-caret" aria-hidden="true">
+                    {changesExpanded() ? "▾" : "▸"}
+                  </span>
+                  <span>Changes</span>
+                  <span class="gg-count-badge">{current().files.length}</span>
+                  <span class="gg-changes-summary">
+                    {current().counts.staged} staged · {current().counts.unstaged} unstaged ·{" "}
+                    {current().counts.untracked} untracked · {current().counts.conflicted} conflicted
+                  </span>
+                </button>
+                <Show when={changesExpanded()}>
+                  <div class="gg-changes-body">
+                    <StatusGroupSection
+                      title="Staged"
+                      files={groups().staged}
+                      disabled={busy()}
+                      expanded={groupExpanded("staged")}
+                      onToggle={() => toggleGroup("staged")}
+                      isSelected={selectedFileForStatus}
+                      onSelect={selectStatusFile}
+                    />
+                    <StatusGroupSection
+                      title="Unstaged"
+                      files={groups().unstaged}
+                      disabled={busy()}
+                      expanded={groupExpanded("unstaged")}
+                      onToggle={() => toggleGroup("unstaged")}
+                      isSelected={selectedFileForStatus}
+                      onSelect={selectStatusFile}
+                    />
+                    <StatusGroupSection
+                      title="Untracked"
+                      files={groups().untracked}
+                      disabled={busy()}
+                      expanded={groupExpanded("untracked")}
+                      onToggle={() => toggleGroup("untracked")}
+                      isSelected={selectedFileForStatus}
+                      onSelect={selectStatusFile}
+                    />
+                    <StatusGroupSection
+                      title="Conflicted"
+                      files={groups().conflicted}
+                      disabled={busy()}
+                      expanded={groupExpanded("conflicted")}
+                      onToggle={() => toggleGroup("conflicted")}
+                      isSelected={selectedFileForStatus}
+                      onSelect={selectStatusFile}
+                    />
+                  </div>
+                </Show>
+              </Show>
+            )}
           </Show>
           <Show when={repositoryError()}>
             {(message) => (
@@ -923,51 +1321,62 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
               </div>
             )}
           </Show>
-
-          <Show when={status()}>
-            <div class="gg-changes">
-              <StatusGroupSection
-                title="Staged"
-                files={groups().staged}
-                disabled={busy()}
-                isSelected={selectedFileForStatus}
-                onSelect={selectStatusFile}
-              />
-              <StatusGroupSection
-                title="Unstaged"
-                files={groups().unstaged}
-                disabled={busy()}
-                isSelected={selectedFileForStatus}
-                onSelect={selectStatusFile}
-              />
-              <StatusGroupSection
-                title="Untracked"
-                files={groups().untracked}
-                disabled={busy()}
-                isSelected={selectedFileForStatus}
-                onSelect={selectStatusFile}
-              />
-              <StatusGroupSection
-                title="Conflicted"
-                files={groups().conflicted}
-                disabled={busy()}
-                isSelected={selectedFileForStatus}
-                onSelect={selectStatusFile}
-              />
-            </div>
-          </Show>
         </section>
 
-        <section class="gg-section gg-graph-section">
-          <div class="gg-section-title">
-            <span>History</span>
-            <span class="gg-muted">
-              {commits().length} loaded{hasMore() ? "+" : ""}
-            </span>
+        <section
+          class="gg-history"
+          data-testid="history"
+          aria-label="History"
+          style={historyStyle()}
+        >
+          <div class="gg-history-head">
+            <div class="gg-col-graph-head">
+              <span>Graph</span>
+              <button
+                type="button"
+                class="gg-graph-resize"
+                aria-label="Resize graph column"
+                title="Drag to resize graph column"
+                onPointerDown={(event) => startGraphResize(event)}
+              />
+            </div>
+            <div>Description</div>
+            <Show when={columns().date}>
+              <div>Date</div>
+            </Show>
+            <Show when={columns().author}>
+              <div>Author</div>
+            </Show>
+            <div>Commit</div>
+          </div>
+
+          <div class="gg-graph-hscroll-row">
+            <div
+              class="gg-graph-hscroll"
+              data-testid="graph-scroll"
+              aria-label="Graph scroll"
+              title="Scroll graph horizontally"
+              tabIndex={0}
+              ref={(element) => {
+                graphScroller = element
+              }}
+              onScroll={(event) =>
+                setGraphScrollLeft(
+                  clampScrollOffset(
+                    event.currentTarget.scrollLeft,
+                    event.currentTarget.scrollWidth,
+                    event.currentTarget.clientWidth,
+                  ),
+                )
+              }
+            >
+              <div class="gg-graph-hspacer" style={{ width: `${graphWidth()}px` }} />
+            </div>
           </div>
 
           <div
-            class="gg-graph-scroll"
+            class="gg-history-scroll"
+            data-testid="history-scroll"
             ref={(element) => attachScroller(element)}
             onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
           >
@@ -985,15 +1394,23 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                 </div>
               }
             >
-              <div class="gg-graph-spacer" style={{ height: `${rows().length * ROW_HEIGHT}px` }}>
+              <div
+                class="gg-history-spacer"
+                style={{ height: `${rows().length * ROW_HEIGHT}px` }}
+              >
                 <For each={visibleRows()}>
                   {(view) => (
-                    <GraphRowView
+                    <GraphRow
                       view={view}
-                      laneSpacing={laneSpacing()}
+                      laneSpacing={LANE_SPACING}
                       graphWidth={graphWidth()}
+                      rowHeight={ROW_HEIGHT}
                       selected={selectedCommit()?.hash === view.commit.hash}
                       disabled={busy()}
+                      searchState={searchState(view.commit.hash)}
+                      showDate={columns().date}
+                      showAuthor={columns().author}
+                      maxRefs={maxRefs()}
                       onSelect={() => selectCommit(view.commit)}
                     />
                   )}
@@ -1002,183 +1419,238 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
             </Show>
           </div>
 
-          <div class="gg-graph-footer">
+          <div class="gg-history-footer">
+            <span>{footerText()}</span>
             <Show when={hasMore()}>
               <button
                 type="button"
+                data-testid="load-more"
                 disabled={loadingMore() || busy()}
                 onClick={() => void loadMore()}
               >
                 {loadingMore() ? "Loading…" : "Load more"}
               </button>
             </Show>
-            <Show when={rows().length > 0}>
-              <span class="gg-muted">
-                rows {range().start + 1}–{range().end} / {rows().length}
-              </span>
-            </Show>
           </div>
-          <Show when={graphError()}>
+          <Show when={historyError() || graphError()}>
             {(message) => <div class="gg-error">{message()}</div>}
           </Show>
         </section>
       </Show>
 
-      <Show when={selectedCommit()}>
-        {(commit) => (
-          <section class="gg-section">
-            <div class="gg-section-title">
-              <span>Commit files</span>
-              <span class="gg-diff-title" title={commit().hash}>
-                {shortHash(commit().hash)}
-              </span>
-            </div>
-
-            <div class="gg-parent-row">
+      <Show when={detailsVisible()}>
+        <section class="gg-details" data-testid="commit-details" aria-label="Commit details">
+          <div class="gg-details-head">
+            <div class="gg-details-title">
               <Show
-                when={commit().parents.length > 1}
+                when={selectedCommit()}
                 fallback={
-                  <span class="gg-muted">
-                    {commit().parents.length === 0
-                      ? "Root commit (empty tree)"
-                      : `First parent ${shortHash(commit().parents[0])}`}
-                  </span>
+                  <>
+                    <span class="gg-details-subject" title={selectedFile()?.path}>
+                      {selectedFile()?.path}
+                    </span>
+                    <span class="gg-details-hash">{selectedFile()?.source}</span>
+                  </>
                 }
               >
-                <span class="gg-muted">Parent</span>
-                <select
-                  aria-label="Diff parent"
-                  value={String(selectedParentIndex())}
-                  disabled={busy()}
-                  onChange={(event) => changeParent(Number(event.currentTarget.value))}
-                >
-                  <For each={commit().parents}>
-                    {(parent, index) => (
-                      <option value={String(index())}>
-                        Parent {index() + 1} · {shortHash(parent)}
-                      </option>
-                    )}
-                  </For>
-                </select>
+                {(commit) => (
+                  <>
+                    <span class="gg-details-subject" title={commit().subject}>
+                      {commit().subject || "(no subject)"}
+                    </span>
+                    <span class="gg-details-hash" title={commit().hash}>
+                      {shortHash(commit().hash)}
+                    </span>
+                    <span class="gg-details-parents" title={commit().parents.join(" ")}>
+                      {commit().parents.length === 0
+                        ? "root commit"
+                        : `parents ${commit().parents.map((parent) => shortHash(parent)).join(", ")}`}
+                    </span>
+                    <span class="gg-details-meta" title={`${commit().author} · ${commit().authorDate}`}>
+                      {commit().author}
+                    </span>
+                  </>
+                )}
               </Show>
             </div>
+            <div class="gg-details-actions">
+              <Show when={selectedCommit()}>
+                {(commit) => (
+                  <Show when={commit().parents.length > 1}>
+                    <label class="gg-parent-select">
+                      <span class="gg-sr-only">Diff parent</span>
+                      <select
+                        aria-label="Diff parent"
+                        value={String(selectedParentIndex())}
+                        disabled={busy()}
+                        onChange={(event) => changeParent(Number(event.currentTarget.value))}
+                      >
+                        <For each={commit().parents}>
+                          {(parent, index) => (
+                            <option value={String(index())}>
+                              Parent {index() + 1} · {shortHash(parent)}
+                            </option>
+                          )}
+                        </For>
+                      </select>
+                    </label>
+                  </Show>
+                )}
+              </Show>
+              <button
+                type="button"
+                class="gg-icon-button"
+                data-testid="close-details"
+                aria-label="Close details"
+                title="Close details"
+                onClick={() => closeDetails()}
+              >
+                ×
+              </button>
+            </div>
+          </div>
 
-            <Show when={filesLoading()}>
-              <div class="gg-status">Loading files…</div>
-            </Show>
-            <Show when={filesError()}>
-              {(message) => (
-                <div class="gg-error">
-                  <span>{message()}</span>
-                  <button
-                    type="button"
-                    disabled={busy()}
-                    onClick={() =>
-                      void loadCommitFiles(commit(), selectedParentIndex())
-                    }
-                  >
-                    Retry
-                  </button>
-                </div>
-              )}
-            </Show>
-
-            <Show
-              when={commitFiles().length > 0}
-              fallback={
-                <Show when={!filesLoading() && !filesError()}>
-                  <div class="gg-empty">No files changed relative to this parent.</div>
+          <div class={detailsBodyClass()}>
+            <Show when={selectedCommit()}>
+              <div class="gg-details-files" aria-label="Changed files">
+                <Show when={filesLoading()}>
+                  <div class="gg-status">Loading files…</div>
                 </Show>
-              }
-            >
-              <div class="gg-tree">
-                <FileTree
-                  nodes={commitTree()}
-                  depth={0}
-                  expanded={expandedDirectories()}
-                  selectedPath={
-                    selectedFile()?.source === "commit" ? selectedFile()?.path : undefined
-                  }
-                  disabled={busy()}
-                  onToggle={toggleDirectory}
-                  onSelect={(file) => selectCommitFile(file, commit(), selectedParentIndex())}
-                />
+                <Show when={filesError()}>
+                  {(message) => (
+                    <div class="gg-error">
+                      <span>{message()}</span>
+                      <button
+                        type="button"
+                        disabled={busy()}
+                        onClick={() =>
+                          void loadCommitFiles(selectedCommit()!, selectedParentIndex())
+                        }
+                      >
+                        Retry
+                      </button>
+                    </div>
+                  )}
+                </Show>
+                <Show when={!filesLoading() && !filesError()}>
+                  <Show
+                    when={commitFiles().length > 0}
+                    fallback={<div class="gg-empty">No files changed relative to this parent.</div>}
+                  >
+                    <div class="gg-tree">
+                      <FileTree
+                        nodes={commitTree()}
+                        depth={0}
+                        expanded={expandedDirectories()}
+                        selectedPath={
+                          selectedFile()?.source === "commit" ? selectedFile()?.path : undefined
+                        }
+                        disabled={busy()}
+                        onToggle={toggleDirectory}
+                        onSelect={(file) => {
+                          const commit = selectedCommit()
+                          if (commit) selectCommitFile(file, commit, selectedParentIndex())
+                        }}
+                      />
+                    </div>
+                  </Show>
+                </Show>
               </div>
             </Show>
-          </section>
-        )}
-      </Show>
 
-      <Show when={selectedFile()}>
-        {(selection) => (
-          <section class="gg-section gg-diff-section">
-            <div class="gg-section-title">
-              <span>Diff</span>
-              <span class="gg-diff-title" title={selection().path}>
-                {selection().path}
-              </span>
-            </div>
-
-            <Show when={diffLoading()}>
-              <div class="gg-status">Loading diff…</div>
-            </Show>
-            <Show when={diffError()}>
-              {(message) => (
-                <div class="gg-error">
-                  <span>{message()}</span>
-                  <button type="button" disabled={busy()} onClick={() => void loadDiff(selection())}>
-                    Retry
-                  </button>
-                </div>
-              )}
-            </Show>
-
-            <Show when={diff()}>
-              {(fileDiff) => (
-                <>
-                  <div class="gg-diff-meta">
-                    {fileDiff().status}
-                    <Show when={fileDiff().oldPath}>
-                      <span> · from {fileDiff().oldPath}</span>
-                    </Show>
-                    <span> · {selection().target.type}</span>
+            <div class="gg-details-diff" data-testid="diff" aria-label="Diff">
+              <Show
+                when={selectedFile()}
+                fallback={
+                  <div class="gg-diff-placeholder">
+                    {selectedCommit()
+                      ? "Select a changed file to view its diff."
+                      : "Select a file to view its diff."}
                   </div>
-                  <Show when={fileDiff().binary}>
-                    <div class="gg-warning">
-                      Binary file. No textual diff is available.
-                    </div>
-                  </Show>
-                  <Show when={fileDiff().truncated}>
-                    <div class="gg-warning">
-                      Diff truncated by the server: this file is larger than the readable
-                      limit. The text below is incomplete.
-                    </div>
-                  </Show>
-                  <Show when={!fileDiff().binary && fileDiff().text.length > 0}>
-                    <div class="gg-diff">
-                      <For each={visibleDiffLines()}>
-                        {(line: DiffLine) => (
-                          <div class={`gg-diff-line gg-diff-${line.kind}`}>
-                            {line.text.length > 0 ? line.text : " "}
-                          </div>
+                }
+              >
+                {(selection) => (
+                  <>
+                    <div class="gg-diff-header">
+                      <span class="gg-diff-path" title={selection().path}>
+                        {selection().path}
+                      </span>
+                      <Show when={diff()}>
+                        {(fileDiff) => (
+                          <>
+                            <span class="gg-diff-tag">{fileDiff().status}</span>
+                            <Show when={fileDiff().oldPath}>
+                              <span class="gg-diff-tag">from {fileDiff().oldPath}</span>
+                            </Show>
+                          </>
                         )}
-                      </For>
+                      </Show>
+                      <span class="gg-diff-tag">{selection().target.type}</span>
                     </div>
-                    <Show when={diffLines().length > MAX_DIFF_DISPLAY_LINES}>
-                      <div class="gg-notice">
-                        Showing the first {MAX_DIFF_DISPLAY_LINES} of {diffLines().length} diff
-                        lines.
-                      </div>
+
+                    <Show when={diffLoading()}>
+                      <div class="gg-status">Loading diff…</div>
                     </Show>
-                  </Show>
-                  <Show when={!fileDiff().binary && fileDiff().text.length === 0}>
-                    <div class="gg-empty">No textual diff.</div>
-                  </Show>
-                </>
-              )}
-            </Show>
-          </section>
-        )}
+                    <Show when={diffError()}>
+                      {(message) => (
+                        <div class="gg-error">
+                          <span>{message()}</span>
+                          <button
+                            type="button"
+                            disabled={busy()}
+                            onClick={() => void loadDiff(selection())}
+                          >
+                            Retry
+                          </button>
+                        </div>
+                      )}
+                    </Show>
+
+                    <Show when={diff()}>
+                      {(fileDiff) => (
+                        <>
+                          <Show when={fileDiff().binary}>
+                            <div class="gg-warning">
+                              Binary file. No textual diff is available.
+                            </div>
+                          </Show>
+                          <Show when={fileDiff().truncated}>
+                            <div class="gg-warning">
+                              Diff truncated by the server: this file is larger than the readable
+                              limit. The text below is incomplete.
+                            </div>
+                          </Show>
+                          <Show when={!fileDiff().binary && fileDiff().text.length > 0}>
+                            <div class="gg-diff-scroll">
+                              <div class="gg-diff">
+                                <For each={visibleDiffLines()}>
+                                  {(line: DiffLine) => (
+                                    <div class={`gg-diff-line gg-diff-${line.kind}`}>
+                                      {line.text.length > 0 ? line.text : " "}
+                                    </div>
+                                  )}
+                                </For>
+                              </div>
+                            </div>
+                            <Show when={diffLines().length > MAX_DIFF_DISPLAY_LINES}>
+                              <div class="gg-notice">
+                                Showing the first {MAX_DIFF_DISPLAY_LINES} of {diffLines().length}{" "}
+                                diff lines.
+                              </div>
+                            </Show>
+                          </Show>
+                          <Show when={!fileDiff().binary && fileDiff().text.length === 0}>
+                            <div class="gg-empty">No textual diff.</div>
+                          </Show>
+                        </>
+                      )}
+                    </Show>
+                  </>
+                )}
+              </Show>
+            </div>
+          </div>
+        </section>
       </Show>
     </div>
   )

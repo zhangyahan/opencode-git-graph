@@ -25,7 +25,13 @@ function parseDecoration(decoration: string): string[] {
 }
 
 /**
- * Read commits across all refs in topological order (newest first).
+ * Read commits across all refs newest first, ordered by commit date.
+ *
+ * `--date-order` still guarantees that every parent is emitted after all of its
+ * children, but it interleaves independent lines by commit timestamp instead of
+ * grouping each branch. On merge-heavy histories `--topo-order` moves side
+ * parents far behind the merge that introduced them, so a bounded window leaves
+ * dozens of tracks open and the layout explodes into a colourful fence.
  *
  * The format is field-delimited by NUL and records are newline separated. `%s`
  * (subject) is a single line, so it is safe to split records on `\n`.
@@ -48,7 +54,7 @@ export async function getLog(
       "log",
       "--no-color",
       "--all",
-      "--topo-order",
+      "--date-order",
       "--parents",
       `--format=${LOG_FORMAT}`,
       "--skip",

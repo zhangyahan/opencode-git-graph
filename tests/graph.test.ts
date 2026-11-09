@@ -334,6 +334,66 @@ describe("layoutGraph", () => {
     expect(() => layoutGraph(commits)).not.toThrow()
   })
 
+  it("keeps every edge of the same DAG but stays compact when merges interleave with side commits", () => {
+    const sideCount = 150
+
+    // One DAG with two valid newest-first topological orders. Each merge m_i
+    // joins the next mainline commit m_{i+1} and side commit s_{i+1}; every side
+    // commit descends straight to the shared root.
+    const mergeFirst: LayoutCommit[] = []
+    for (let i = 0; i < sideCount; i += 1) {
+      mergeFirst.push(c(`m${i}`, [`m${i + 1}`, `s${i + 1}`]))
+    }
+    mergeFirst.push(c(`m${sideCount}`, ["base"]))
+    for (let i = 1; i <= sideCount; i += 1) {
+      mergeFirst.push(c(`s${i}`, ["base"]))
+    }
+    mergeFirst.push(c("base"))
+
+    // Same DAG, but each side commit sits immediately after the merge that
+    // introduced it, so its target track is closed again right away.
+    const interleaved: LayoutCommit[] = []
+    for (let i = 0; i < sideCount; i += 1) {
+      interleaved.push(c(`m${i}`, [`m${i + 1}`, `s${i + 1}`]))
+      interleaved.push(c(`s${i + 1}`, ["base"]))
+    }
+    interleaved.push(c(`m${sideCount}`, ["base"]))
+    interleaved.push(c("base"))
+
+    const snapshot = (commits: LayoutCommit[]) =>
+      commits
+        .map((commit) => ({ hash: commit.hash, parents: [...commit.parents].sort() }))
+        .sort((left, right) => left.hash.localeCompare(right.hash))
+    expect(snapshot(interleaved)).toEqual(snapshot(mergeFirst))
+
+    const wide = layoutGraph(mergeFirst)
+    const narrow = layoutGraph(interleaved)
+    assertLayout(mergeFirst, wide)
+    assertLayout(interleaved, narrow)
+
+    const maxLanes = (rows: GraphRow[]): number =>
+      Math.max(...rows.map((row) => row.lanes))
+    const parentEdges = (commits: LayoutCommit[]): number =>
+      commits.reduce((total, commit) => total + commit.parents.length, 0)
+    const emittedEdges = (rows: GraphRow[]): number =>
+      rows.reduce(
+        (total, row) =>
+          total + row.segments.filter((segment) => segment.from === row.lane).length,
+        0,
+      )
+
+    // No parent edge is dropped in either order: every edge becomes exactly one
+    // outgoing segment, and connectivity is checked by assertLayout.
+    expect(emittedEdges(wide)).toBe(parentEdges(mergeFirst))
+    expect(emittedEdges(narrow)).toBe(parentEdges(interleaved))
+    expect(parentEdges(mergeFirst)).toBe(parentEdges(interleaved))
+
+    // Listing all merges before their side commits keeps ~one lane per merge
+    // open; interleaving closes each side track immediately.
+    expect(maxLanes(wide)).toBe(sideCount + 1)
+    expect(maxLanes(narrow)).toBeLessThanOrEqual(4)
+  })
+
   it("lays out 5000 commits of dense, deterministic history within 3 seconds", () => {
     const count = 5_000
     let seed = 0x9e3779b9

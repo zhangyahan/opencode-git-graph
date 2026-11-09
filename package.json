@@ -15,7 +15,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "build": "vite build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "dev:ui": "vite --config dev/vite.config.ts"
   },
   "dependencies": {
     "@opencode/plugin": "2.2.6",

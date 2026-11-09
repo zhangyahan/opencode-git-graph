@@ -4,8 +4,15 @@
 
 ## 当前状态
 
-只读 MVP 已实现，待 Desktop 加载验证。
+只读 MVP 已实现。真实生产组件已用本地 dev harness 对 FR 真数据完成首轮浏览器交互验收；Desktop 宿主集成仍有未覆盖项，详见下文。
 
+- 紧凑历史表格：固定表头 `Graph / Description / Date / Author / Commit`，提交行固定 28px 高
+- 固定 **14px** 轨道步进；Graph 列宽可在 **96–260px** 间拖动（默认 152px），Graph 列内独立横向滚动，宽轨道不会挤占 Description
+- 窄侧边栏（默认 520px）自动隐藏 Date / Author，优先保证提交描述与 Commit 列；面板加宽后逐级显示
+- working tree clean 时 Changes 区域压缩为一行
+- commit 详情响应式布局：窄宽度文件树与 diff 上下排列，宽宽度改为左右分栏
+- 搜索只针对**已加载**的 commit：高亮匹配行、淡化其余行，不改变提交拓扑、不裁剪行；`Enter` 跳到第一条匹配，`Esc` 清空
+- 后端默认使用 `--date-order`：父提交始终排在子提交之后（拓扑合法），同时避免 merge-heavy 历史中 side parent 被推远造成的轨道膨胀
 - 仓库下拉选择 + 手动 **Refresh** 按钮
 - Staged / Unstaged / Untracked / Conflicted 分组，点击文件查看 index 或 working-tree diff
 - 固定行高 SVG 提交图 + 自实现虚拟滚动；支持 **Load more** 分页追加、按 hash 去重后重新布局
@@ -23,8 +30,8 @@
 
 - **只读**：不提供 stage、unstage、commit、checkout、pull、push 等写操作。
 - **手动刷新**：暂未接入文件 watcher，外部修改 Git 状态后需要点击 Refresh。
-- **仅侧边栏**：`Panel.region` 只有 `"side"`，面板宽度设为 520px；没有使用 `wide` 作为主页面替换。
-- **宿主版本**：本仓库使用 `@opencode/plugin` **2.2.6**。GUI 插件 API 仍是 experimental，`Panel.region`、props 响应式和 RPC 行为在后续版本可能变化；本次改动**未在真实 OpenCode Desktop 中完成端到端验证**，仅通过类型检查、单元测试和构建验证。
+- **仅侧边栏**：`Panel.region` 只有 `"side"`，面板默认宽度为 520px；没有使用 `wide` 作为主页面替换。窄宽度隐藏 Date / Author，Graph 列可拖动 96–260px，但这些响应式行为不改变“仅侧边栏”的定位。
+- **宿主版本**：本仓库使用 `@opencode/plugin` **2.2.6**。GUI 插件 API 仍是 experimental，`Panel.region`、props 响应式和 RPC 行为在后续版本可能变化。**真实验收范围**：真实生产面板组件（`GitGraphPanel`）与真实只读 Git 引擎已通过本地 dev harness 对 `D:\Workspace\FR` 真数据完成浏览器交互验收；**未覆盖** Desktop 菜单注册（`MenuItem` / `session.panel`）、Desktop 窗口与面板 chrome、拖拽/缩放、会话切换、宿主主题注入与宿主事件总线。首轮验收为 67 PASS / 2 FAIL（Graph 列横向滚动视口相关），这两项失败已修复；最终浏览器验收 **79/79 PASS**，结果记录在 `dev/UI-ACCEPTANCE.md`。
 - **仓库范围**：仓库列表来自 Server 端在会话目录及其子目录中的发现结果；不会扫描任意磁盘路径。
 - **非完整复刻**：不承诺 mhutchie.git-graph 的完整交互、设置项、写操作或全部 Git 边界行为。
 
@@ -73,6 +80,14 @@ npm run build   # 构建 dist/gui-experimental.cjs
 npm run build -- --watch
 ```
 
+真实浏览器验收使用独立的 dev harness：
+
+```bash
+npm run dev:ui   # 仅监听 127.0.0.1:5178，仓库根固定为 D:\Workspace\FR
+```
+
+该 harness 渲染真实 `src/gui/panel.tsx` 并通过 loopback bridge 调用真实只读 Git 引擎；没有任何写路由，不会 stage / commit / checkout / pull / push，也不会写入 `D:\Workspace\FR`。它绑定固定回环地址与固定 fixture 根，**只用于本地只读验收，不能发布或复用为通用生产服务**。运行与验收细节见 [`dev/README.md`](dev/README.md) 和 [`dev/ui-test/README.md`](dev/ui-test/README.md)。
+
 在 OpenCode 全局配置（`opencode.jsonc`）中加载本地插件：
 
 ```jsonc
@@ -94,6 +109,8 @@ npm run build -- --watch
 - RPC routing：每次请求读取当前 session 的 server client，server 切换/重启替换 client 不复用旧引用
 - 刷新 generation：刷新期间发生新选择后，旧快照被判定为过期
 - 选择缓存：server + directory key、LRU 上限
+
+真实浏览器验收独立于上述单元测试：先 `npm run dev:ui` 启动 harness，再运行 `node dev/ui-test/acceptance.mjs`。脚本驱动真实生产面板与真实只读 Git 引擎，对 FR fixture 做截图和交互校验，运行说明见 [`dev/ui-test/README.md`](dev/ui-test/README.md)。截图与 `result.json` 默认写入批准的 TEMP 目录（如 `%LOCALAPPDATA%\Temp\opencode\gg-ui-artifacts`）；截图可能包含私有仓库路径、提交信息和 diff 片段，**不得提交到版本库**。该验收不覆盖 Desktop 宿主集成（见“明确限制”），因此不能据此宣称整个插件已端到端通过。
 
 ## 安全与信任边界
 

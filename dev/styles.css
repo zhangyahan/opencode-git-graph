@@ -1,0 +1,134 @@
+/*
+ * Harness shell only. The panel's own styles come from src/gui/styles.ts.
+ * These tokens mirror the host's neutral fallbacks so the production panel
+ * renders with normal colours inside a plain browser page.
+ */
+
+:root {
+  color-scheme: dark;
+  --color-background: #17181c;
+  --color-surface: #202229;
+  --color-surfaceHover: #2a2d36;
+  --color-border: #343742;
+  --color-textPrimary: #d8dae0;
+  --color-textSecondary: #aeb2be;
+  --color-textMuted: #8b909c;
+  --color-danger: #ff8a8a;
+  --color-warning: #ffd479;
+  --font-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: #111318;
+  color: var(--color-textPrimary);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px;
+}
+
+.harness {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  box-sizing: border-box;
+}
+
+.harness-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 12px;
+  border-bottom: 1px solid #2a2d36;
+  background: #1b1d23;
+  white-space: nowrap;
+}
+
+.harness-title {
+  font-weight: 600;
+}
+
+.harness-root {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--color-textMuted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.harness-badge {
+  border: 1px solid #3d5a3d;
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: #8fdc9a;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.harness-spacer {
+  flex: 1 1 auto;
+}
+
+.harness-label {
+  color: var(--color-textMuted);
+  font-size: 11px;
+}
+
+.harness-button {
+  border: 1px solid #3a3e4a;
+  border-radius: 4px;
+  background: #242730;
+  color: inherit;
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.harness-button:hover {
+  background: #2c303b;
+}
+
+.harness-button-active {
+  border-color: #5a82dc;
+  background: rgba(90, 130, 220, 0.24);
+}
+
+.harness-stage {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: stretch;
+  padding: 12px;
+  box-sizing: border-box;
+}
+
+.harness-panel {
+  flex: 0 0 auto;
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid #2a2d36;
+  border-radius: 6px;
+  background: var(--color-background);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+
+.harness-panel > .git-graph-panel {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
