@@ -1,0 +1,32 @@
+{
+  "name": "opencode-git-graph",
+  "version": "0.1.0",
+  "description": "Git Graph workbench plugin for OpenCode Desktop",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs",
+    "./rpc": "./src/rpc.ts"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.6",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "solid-js": "^1.9.9",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.2",
+    "vite-plugin-solid": "^2.11.15",
+    "vitest": "^4.1.12"
+  }
+}
