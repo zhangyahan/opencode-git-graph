@@ -77,3 +77,10 @@ export interface FileDiff {
   binary: boolean
   truncated?: boolean
 }
+
+/** Result shared by every write (mutation) method. */
+export interface GitMutationResult {
+  status: GitStatus
+  changed: boolean
+  warning?: string
+}

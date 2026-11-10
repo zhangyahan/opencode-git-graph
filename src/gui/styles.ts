@@ -73,6 +73,7 @@ export const GG_STYLES = `
 .gg-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   flex: 0 0 auto;
   min-width: 0;
@@ -111,13 +112,60 @@ export const GG_STYLES = `
   gap: 4px;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 170px;
+  max-width: 190px;
   height: 24px;
   padding: 0 7px;
   border-radius: 12px;
   border: 1px solid var(--color-border, #444);
   background: rgba(90, 130, 220, 0.12);
   color: var(--color-textPrimary, #d4d4d4);
+}
+.git-graph-panel button.gg-branch {
+  padding: 0 7px;
+  cursor: pointer;
+}
+.git-graph-panel button.gg-branch:hover:not(:disabled) {
+  background: rgba(90, 130, 220, 0.22);
+}
+.gg-toolbar-spacer {
+  flex: 1 1 auto;
+}
+.gg-toolbar-toggle {
+  flex: 0 0 auto;
+  padding: 2px 7px !important;
+  font-size: 10.5px;
+}
+.gg-toolbar-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid var(--color-border, #444);
+  border-radius: 4px;
+  background: var(--color-surface, #242424);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.gg-toolbar-check input {
+  margin: 0;
+  accent-color: #7aa2f7;
+}
+.gg-toolbar-check:has(input:checked) {
+  border-color: rgba(122, 162, 247, 0.7);
+  background: rgba(90, 130, 220, 0.22);
+}
+.gg-toolbar-check:has(input:disabled) {
+  opacity: 0.5;
+  cursor: default;
+}
+.gg-toolbar-toggle[aria-pressed="true"] {
+  border-color: rgba(122, 162, 247, 0.7) !important;
+  background: rgba(90, 130, 220, 0.22) !important;
+  color: var(--color-textPrimary, #d4d4d4);
+}
+.gg-toolbar-order select {
+  height: 24px;
+  font-size: 10.5px;
 }
 .gg-branch-icon {
   display: block;
@@ -400,7 +448,7 @@ export const GG_STYLES = `
 }
 .gg-history-head {
   display: grid;
-  grid-template-columns: var(--gg-history-cols, 152px minmax(0, 1fr) 96px 118px 74px);
+  grid-template-columns: var(--gg-history-cols, 240px minmax(0, 1fr) 150px 118px 74px);
   align-items: center;
   flex: 0 0 auto;
   height: 26px;
@@ -471,58 +519,12 @@ export const GG_STYLES = `
 .gg-col-head-commit .gg-column-resize {
   right: 0;
 }
-.gg-graph-resize {
-  position: absolute;
-  top: 0;
-  right: -3px;
-  bottom: 0;
-  width: 6px;
-  padding: 0 !important;
-  border: 0 !important;
-  border-radius: 0 !important;
-  background: transparent !important;
-  cursor: col-resize;
-  z-index: 2;
-}
-.gg-graph-resize::after {
-  content: "";
-  position: absolute;
-  top: 6px;
-  bottom: 6px;
-  left: 2px;
-  width: 1px;
-  background: var(--color-border, #444);
-  opacity: 0;
-}
-.gg-graph-resize:hover::after {
-  opacity: 1;
-}
-.gg-graph-hscroll-row {
-  display: flex;
-  flex: 0 0 auto;
-  min-height: 8px;
-  overflow: hidden;
-  border-bottom: 1px solid var(--color-border, #3a3a3a);
-  background: rgba(0, 0, 0, 0.08);
-}
-.gg-graph-hscroll {
-  flex: 0 0 auto;
-  width: var(--gg-graph-column, 152px);
-  min-width: 0;
-  max-width: var(--gg-graph-column, 152px);
-  height: 10px;
-  overflow-x: auto;
-  overflow-y: hidden;
-}
-.gg-graph-hscroll::-webkit-scrollbar {
-  height: 8px;
-}
-.gg-graph-hscroll::-webkit-scrollbar-thumb {
-  border-radius: 4px;
-  background: rgba(140, 140, 140, 0.45);
-}
+/* The graph column has no resize handle: it is application-owned and never
+   participates in persisted widths. */
+.gg-graph-hscroll,
+.gg-graph-hscroll-row,
 .gg-graph-hspacer {
-  height: 1px;
+  display: none !important;
 }
 .gg-history-scroll {
   position: relative;
@@ -559,8 +561,6 @@ export const GG_STYLES = `
 .gg-row-slot-graph-inner {
   position: absolute;
   inset: 0;
-  transform: translateX(var(--gg-graph-shift, 0px));
-  will-change: transform;
 }
 .gg-row-slot-body {
   display: flex;
@@ -601,7 +601,7 @@ export const GG_STYLES = `
   left: 0;
   right: 0;
   display: grid;
-  grid-template-columns: var(--gg-history-cols, 152px minmax(0, 1fr) 96px 118px 74px);
+  grid-template-columns: var(--gg-history-cols, 240px minmax(0, 1fr) 150px 118px 74px);
   align-items: center;
   width: 100%;
   height: 28px;
@@ -612,6 +612,11 @@ export const GG_STYLES = `
   background: transparent !important;
   text-align: left;
   cursor: pointer;
+  user-select: none;
+}
+.gg-graph-row:focus-visible {
+  outline: 2px solid rgba(122, 162, 247, 0.75);
+  outline-offset: -2px;
 }
 .gg-graph-row.gg-search-match {
   background: rgba(120, 200, 140, 0.1) !important;
@@ -648,8 +653,6 @@ export const GG_STYLES = `
 .gg-row-graph-inner {
   position: absolute;
   inset: 0;
-  transform: translateX(var(--gg-graph-shift, 0px));
-  will-change: transform;
 }
 .gg-graph-svg {
   display: block;
@@ -663,16 +666,26 @@ export const GG_STYLES = `
   overflow: hidden;
   padding: 0 8px 0 2px;
 }
+.gg-ref-badges {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+  overflow: hidden;
+}
 .gg-subject {
   flex: 1 1 auto;
-  min-width: 0;
+  min-width: 48px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.gg-ref-badge {
-  flex: 0 0 auto;
-  max-width: 96px;
+.git-graph-panel button.gg-ref-badge {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 72px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -684,10 +697,24 @@ export const GG_STYLES = `
   font-size: 10px;
   line-height: 15px;
 }
-.gg-ref-more {
-  color: var(--color-textMuted, #8a8a8a);
-  border-color: var(--color-border, #444);
+.git-graph-panel button.gg-ref-badge:hover:not(:disabled) {
+  background: hsl(var(--gg-ref-hue, 215) 55% 45% / 0.3);
+}
+.gg-ref-kind-tag {
+  border-style: dashed !important;
+}
+.gg-ref-kind-remote {
+  border-radius: 2px !important;
+}
+.git-graph-panel button.gg-ref-more {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: 3px;
+  border: 1px solid var(--color-border, #444);
   background: transparent;
+  color: var(--color-textMuted, #8a8a8a);
+  font-size: 10px;
+  line-height: 15px;
 }
 .gg-col-date,
 .gg-col-author {
@@ -698,6 +725,9 @@ export const GG_STYLES = `
   padding: 0 7px;
   color: var(--color-textMuted, #8a8a8a);
   font-size: 11px;
+}
+.gg-col-date {
+  font-variant-numeric: tabular-nums;
 }
 .gg-col-commit {
   min-width: 0;
@@ -933,5 +963,355 @@ export const GG_STYLES = `
 .gg-tree .gg-muted {
   flex: 0 0 auto;
   font-size: 10px;
+}
+
+/* ---------- dense graph safety net ---------- */
+.gg-dense-graph {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 3px 8px;
+  border-bottom: 1px solid rgba(230, 193, 90, 0.3);
+  background: rgba(230, 193, 90, 0.08);
+  color: #e6c15a;
+  font-size: 10.5px;
+}
+.gg-dense-graph span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gg-dense-graph button {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  font-size: 10px;
+}
+.gg-mutation-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--color-border, #3a3a3a);
+  font-size: 10.5px;
+}
+.gg-mutation-warning {
+  color: #e6c15a;
+  background: rgba(230, 193, 90, 0.1);
+}
+.gg-mutation-notice {
+  color: var(--color-textSecondary, #b0b0b0);
+  background: rgba(90, 120, 180, 0.12);
+}
+.gg-mutation-status button {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  font-size: 10px;
+}
+
+/* ---------- portal menus ---------- */
+.gg-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 12000;
+}
+.gg-menu {
+  position: fixed;
+  z-index: 12001;
+  display: flex;
+  flex-direction: column;
+  min-width: 168px;
+  max-width: min(320px, calc(100vw - 16px));
+  max-height: min(70vh, 440px);
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--color-border, #444);
+  border-radius: 6px;
+  background: var(--color-surface, #242424);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  color: var(--color-textPrimary, #d4d4d4);
+  font-size: 11.5px;
+}
+.gg-menu-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 3px 7px 5px;
+  color: var(--color-textMuted, #8a8a8a);
+  font-size: 10px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+.gg-menu-item {
+  display: block;
+  width: 100%;
+  padding: 5px 8px !important;
+  border: 0 !important;
+  border-radius: 4px !important;
+  background: transparent !important;
+  text-align: left;
+  white-space: nowrap;
+}
+.gg-menu-item:hover:not(:disabled),
+.gg-menu-item:focus-visible {
+  outline: none;
+  background: rgba(90, 130, 220, 0.26) !important;
+}
+.gg-menu-item-danger {
+  color: #ff9b9b !important;
+}
+.gg-menu-item-danger:hover:not(:disabled),
+.gg-menu-item-danger:focus-visible {
+  background: rgba(190, 50, 50, 0.2) !important;
+}
+
+/* ---------- dialogs and branch selector ---------- */
+.gg-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 13000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.5);
+}
+.gg-dialog-backdrop.gg-branch-selector-backdrop {
+  pointer-events: none;
+  background: rgba(0, 0, 0, 0.32);
+}
+.gg-branch-selector-backdrop .gg-branch-selector {
+  pointer-events: auto;
+}
+.gg-dialog,
+.gg-branch-selector {
+  display: flex;
+  flex-direction: column;
+  width: min(460px, 100%);
+  max-height: min(82vh, 620px);
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-border, #444);
+  border-radius: 8px;
+  background: var(--color-background, #1e1e1e);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  color: var(--color-textPrimary, #d4d4d4);
+  font-size: 12px;
+}
+.gg-dialog {
+  padding: 14px;
+  gap: 10px;
+}
+.gg-branch-selector {
+  width: min(560px, 100%);
+}
+.gg-dialog-title {
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 600;
+}
+.gg-dialog-description {
+  margin: 0;
+  color: var(--color-textSecondary, #b0b0b0);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.gg-dialog-hint {
+  color: var(--color-textMuted, #8a8a8a);
+  font-size: 10.5px;
+}
+.gg-dialog-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--color-border, #3a3a3a);
+  border-radius: 4px;
+  background: var(--color-surface, rgba(128, 128, 128, 0.06));
+  font-size: 11px;
+}
+.gg-dialog-facts dt {
+  color: var(--color-textMuted, #8a8a8a);
+}
+.gg-dialog-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+.gg-dialog-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+}
+.gg-dialog-field input,
+.gg-dialog-field textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--color-border, #444);
+  border-radius: 4px;
+  background: var(--color-surface, #242424);
+  color: inherit;
+  font: inherit;
+}
+.gg-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding-top: 2px;
+}
+.gg-dialog-actions button {
+  padding: 4px 10px !important;
+}
+.gg-primary-button {
+  border-color: rgba(122, 162, 247, 0.7) !important;
+  background: rgba(90, 130, 220, 0.28) !important;
+}
+.gg-danger-button {
+  border-color: rgba(190, 50, 50, 0.6) !important;
+  background: rgba(190, 50, 50, 0.22) !important;
+  color: #ff9b9b !important;
+}
+.gg-dialog .gg-warning,
+.gg-dialog .gg-error,
+.gg-branch-selector .gg-warning,
+.gg-branch-selector .gg-notice {
+  margin: 0;
+}
+.gg-branch-selector-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 12px 14px 8px;
+  border-bottom: 1px solid var(--color-border, #3a3a3a);
+}
+.gg-branch-selector-search {
+  flex: 0 0 auto;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--color-border, #3a3a3a);
+}
+.gg-branch-selector-search input {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--color-border, #444);
+  border-radius: 4px;
+  background: var(--color-surface, #242424);
+  color: inherit;
+  font: inherit;
+}
+.gg-branch-selector-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 8px 14px 12px;
+}
+.gg-selector-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 0 12px;
+}
+.gg-selector-group + .gg-selector-group {
+  border-top: 1px solid var(--color-border, #3a3a3a);
+  padding-top: 10px;
+}
+.gg-selector-heading {
+  color: var(--color-textSecondary, #b0b0b0);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.gg-selector-subheading {
+  margin-top: 5px;
+  color: var(--color-textMuted, #8a8a8a);
+  font-size: 10px;
+}
+.gg-check-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  padding: 2px 3px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.gg-check-row:hover {
+  background: var(--color-surfaceHover, #303030);
+}
+.gg-check-row input {
+  flex: 0 0 auto;
+}
+.gg-check-row-nested {
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-left: 18px;
+}
+.gg-check-row-nested label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.gg-ref-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 10.5px;
+}
+.gg-branch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 4px 6px !important;
+  border: 0 !important;
+  border-radius: 4px !important;
+  background: transparent !important;
+  text-align: left;
+}
+.gg-branch-row:hover:not(:disabled) {
+  background: var(--color-surfaceHover, #303030) !important;
+}
+.gg-selector-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+/* Portals live outside .git-graph-panel, so they cannot rely on a host global
+   reset. State font and colour explicitly for every interactive descendant. */
+.gg-menu,
+.gg-dialog,
+.gg-branch-selector {
+  font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif);
+  color: var(--color-textPrimary, #d4d4d4);
+}
+.gg-menu button,
+.gg-dialog button,
+.gg-dialog input,
+.gg-dialog textarea,
+.gg-branch-selector button,
+.gg-branch-selector input {
+  font: inherit;
+  color: inherit;
 }
 `

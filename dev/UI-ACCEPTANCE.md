@@ -1,96 +1,76 @@
-# Git Graph UI acceptance (real browser)
+# Release UI acceptance (real browser)
 
-**Verdict: PASS — 84/84 interaction checks passed, 0 failed.**
+**Verdict: PASS — 93/93 checks passed, 0 failed.**
 
-This is the final integrated-interactions acceptance run. It drives the real
-production `GitGraphPanel` and the real read-only `RepositoryManager` bridge in
-headless Chrome against the dev harness, with real FR data. Normal repository
-data is not mocked.
+The frozen release build was tested against two real environments:
 
-Fixture aliases only: **Repository A**, **Repository B**, **Root Repository**.
-No commit hashes, commit subjects, repository file paths, diff text or tokens
-are included here. Screenshots and the machine result stay in TEMP.
+- **FR**: read-only fixture, 16 repositories / 4 worktrees.
+- **TEMP**: isolated synthetic mutation fixture under the approved TEMP root.
+- Real production components and the real repository manager/RPC path; normal
+  repository data was not mocked.
+- Fresh real-browser loads at the start of both environments; real pointer and
+  keyboard input.
 
-- Run: 2026-11-10 00:06:25–00:06:36 local (UTC+8)
-- Browser: locally installed Google Chrome, headless, isolated Playwright
-  profile; the user browser/profile/cookies were not used.
-- Harness: `http://127.0.0.1:5178/`, real `GitGraphPanel` +
-  `RepositoryManager`, real read-only fixture repository.
-- Viewports: 1280 × 900; panel widths 520 px and 1100 px.
-- Script: `dev/ui-test/interactions.mjs`
-- Final machine result (TEMP only, not committed):
-  `%LOCALAPPDATA%\Temp\opencode\gg-ui-interactions-final2\result.json`
-- First-failure evidence retained (TEMP only):
-  `%LOCALAPPDATA%\Temp\opencode\gg-ui-interactions-run1-fail\result.json` and
-  `%LOCALAPPDATA%\Temp\opencode\gg-ui-interactions-run2-fail\result.json`
-
-## Historical baseline
-
-The earlier **79/79 PASS** result covered the graph-scroll viewport fix
-(`%LOCALAPPDATA%\Temp\opencode\gg-ui-artifacts-final\result.json`).
-
-That script asserted fixed 28 px rows and manual pagination. The integrated UI
-now uses `data-index`/`data-row-top`, a variable-height inline slot and automatic
-pagination, so the old 79 checks are **historical baseline only**, not the
-regression truth for these interactions.
+This public summary is anonymized. Private repository names, absolute paths,
+hashes, source paths and private file/diff content are not included. Complete
+machine evidence and screenshots remain only in the operator TEMP
+`gg-ui-release-final-pass` directory. Earlier 70/70 evidence is retained
+separately.
 
 ## Results
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| 100 → 200 → 300 automatic pagination | PASS | No manual Load more clicks. `getLog skip=100` once, `skip=200` once, no prefetch of the next page. `scrollTop` stayed 2097 after page 2 and 4993 after page 3; content heights 5600 / 8496, viewport 703. |
-| Inline slot | PASS | Slot immediately below the clicked merge row; spacer `data-slot-height=162`; following row tops shifted by exactly 162; 30 rendered rows (bounded); 6 real inline file rows. |
-| Inline graph + pan | PASS | Graph pan 74 px; all rendered row transforms and the inline continuation are `-74px`; inline graph width equals the 152 px effective graph column. |
-| Full-page commit diff | PASS | Clicking an inline file hides the history table and opens the full-page diff. Real HTTP body target matched the clicked commit with `parentIndex:0`; path equality was exact. Unified patch rendered. |
-| Merge parent switch | PASS | Two parents offered; switching to parent 2 issued `getDiff` with `parentIndex:1` and the matching commit; parent→commit header updated correctly. |
-| Back to history | PASS | Strict **≤ 1 px** threshold: `scrollTop 112 → 112`, graph `scrollLeft 74 → 74`; expanded index 4, slot visible, inline files 175 after async load. |
-| Same-row collapse / row switch | PASS | Same row collapsed the slot. Switching rows replaced it with the new row and aborted the previous `getCommitFiles` (1 expected abort), with no stale error. |
-| Slot + auto page | PASS | With the slot open, scrolling to bottom auto-loaded page 3; expansion and slot height preserved; scroll position not reset; `skip=200` once, no `skip=300`. |
-| Search jump | PASS | Last-row search at the bottom used real `data-row-top` and clamped correctly: `scrollTop=7793` (expected 7793), `blankBottom=0`, 32 rendered rows. |
-| Root commit | PASS | Root fixture reported `hasMore=false` and made no extra page request; root diff header **“Empty tree”**, target matched root commit with `parentIndex:0`, path equality held, 19 real lines rendered. |
-| 1100 px initial layout | PASS | Five columns, all five handles; header/row grid identical; panel overflow 0; body/document horizontal overflow 0. |
-| Five-column pointer drag | PASS | Actual pointer drags: graph 152→136 (narrowed to create a pan range), description 676→692, date 80→96, author 118→134, commit 74→90. Header and row widths stayed aligned; panel overflow stayed 0. Graph pan remained synchronized after resize. |
-| Persistence / 520 px | PASS | All five widths survived reload at 1100 px. At 520 px Date/Author are hidden; body/document and panel overflow are 0 even with the saved wide preferences. |
-| Fault injection: `getLog` 502 | PASS | Injected 502 showed Retry; no automatic retry at the bottom; manual retry recovered to 200 loaded. Fault evidence is isolated from the normal run. |
-| Fault injection: duplicate page | PASS | Injected duplicate real commit did not append; footer stayed 100 loaded with manual Load more; no error; no automatic retry while still at the bottom. |
-| RO-disabled live metrics | PASS | With ResizeObserver callbacks suppressed, auto pagination still used the live scroller: viewport 703 px, `scrollTop` 2097, footer 200 loaded, no error. |
-| Console/network | PASS | Normal page: 0 page errors, 0 unexpected console errors, 0 non-abort request failures, 0 unexpected HTTP ≥400. Only benign favicon 404 and one expected `getCommitFiles` abort. Injected 502 is isolated. |
-| Source/HMR stability | PASS | Source mtimes were identical before/after the run (`panel.tsx`, `styles.ts`, `pagination.ts`). HMR logs only `[vite] connecting/connected`; no hot update or reload. |
+| Existing core regression | PASS | All prior 70 checks passed again in this run: repository discovery, fixed 240 px graph, Date 150 px with 19-character seconds and ISO title, 520/1100 layouts, four non-graph column resizers, branch filters/refs, history controls, menus, context-menu compare, auto pagination, inline/Back, FR guard, TEMP writes, root, dirty/stale/unknown errors. |
+| FR loading gate | PASS | Initial load and Refresh held real `getStatus`/`getLog` responses. First-parent/remotes/tags/order were disabled or guarded while held; after release 100 loaded, rows/header/Refresh/repository select usable, no permanent busy. |
+| Scrolled plain + Ctrl/Cmd comparison | PASS | History at 900 px with inline slot open; plain first commit + Ctrl/Cmd second opened comparison. Real `getComparisonFiles`/`getComparisonDiff` carried the selected base/head. The files pane showed 152 files; selecting a file rendered a real text diff. |
+| Comparison Back | PASS | Vertical scroll remained 900 → 900 (≤1 px); expanded index and slot height were preserved; rendered DOM covered the viewport without a blank window. |
+| Selected-ref filters + mutation | PASS | Selected filter showed 3 loaded rows. Rename/delete left history usable with no invalid-ref error; secondary repository did not inherit the old filter. |
+| Badge keyboard | PASS | Enter and Space opened the ref menu without expanding the row; focus returned to the trigger after close. Ctrl+F/Enter and Ctrl+H/Escape worked. |
+| TEMP binary diff | PASS | Real binary file diff showed a Binary warning and zero text diff lines. |
+| Mutation warning fault | PASS | Isolated fault response carried a real status snapshot plus warning; UI showed it, one request, no automatic retry. Not mixed with normal success evidence. |
+| AfterServer mutation gate | PASS | Real checkout mutation executed, then its real response was held. Repository dropdown was busy-disabled, exactly one mutation request occurred, no abort/retry, and a newly opened dialog survived completion. |
+| FR read-only guard | PASS | Six invalid/guard probes returned 403 `rpc.method_forbidden`; HEAD and all refs unchanged. No valid confirmed FR mutation was sent. |
+| Refs failure isolation | PASS | Injected refs 502 showed a refs error while history stayed at 100 loaded / 30 rows. |
+| Console / network | PASS | FR and TEMP: 0 page errors, 0 unexpected console errors, 0 non-abort request failures, 0 unexpected HTTP ≥400. Only benign favicon 404s; expected aborts were separated; fault responses isolated. |
+| Source / HMR | PASS | Production source mtimes were identical before/after; no hot-update or page-reload events. |
 
-## Unit tests / typecheck / build
+## Screenshots (basenames; private TEMP only)
 
-Independent of this browser run, the repository passes **233/233** unit tests
-(`npm test`), `npm run typecheck` and `npm run build`. Those results are the
-regression gate for the logic; this report is the browser acceptance gate.
+- `01-fr-graph-date-1100.png` — fixed graph and full Date.
+- `02-fr-columns-after-drag.png` — four non-graph columns after pointer drags.
+- `03-fr-520.png` — compact layout.
+- `04-fr-branch-filter.png` — branch selector and refs.
+- `05-fr-ref-menu.png` — ref menu.
+- `06-fr-compare.png` — context-menu comparison path.
+- `07-temp-checkout-dialog.png` — checkout confirmation.
+- `08-temp-checkout-success.png` — confirmed checkout.
+- `09-temp-branch-success.png` — created branch visible.
+- `10-temp-error-paths.png` — TEMP root/error context.
+- `11-fr-refs-failure.png` — refs failure with usable history.
+- `12-fr-loading-gate.png` — held status/log loading state.
+- `13-fr-compare-scroll.png` — scrolled inline plain + Ctrl comparison with real diff.
+- `14-temp-binary-diff.png` — binary diff warning.
+- `15-temp-warning-fault.png` — isolated mutation warning.
+- `16-temp-mutation-switch.png` — afterServer-held mutation with busy repository control.
 
-## Screenshots (TEMP only, not committed)
+Complete private result and screenshots are under the operator TEMP
+`gg-ui-release-final-pass` directory. The earlier 70/70 baseline and 88/89
+failure evidence are retained separately. No private evidence is committed.
 
-All under `%LOCALAPPDATA%\Temp\opencode\gg-ui-interactions-final2\`:
+## Historical baseline
 
-1. `02-inline-slot-520.png` — inline commit file slot at 520 px.
-2. `03-fullpage-commit-diff-520.png` — full-page commit diff at 520 px.
-3. `04-fullpage-commit-diff-parent2-520.png` — merge parent 2 diff.
-4. `06-search-jump-520.png` — last-row search at the bottom, no virtual blank.
-5. `07-root-empty-tree-520.png` — root commit “Empty tree” diff.
-6. `08-all-column-widths-1100.png` — all five columns after real pointer
-   resizing at 1100 px.
-7. `09-520-after-wide.png` — wide preferences preserved; Date/Author hidden and
-   no overflow at 520 px.
-8. `10-fault-auto-load-520.png` — isolated 502 + Retry.
-9. `11-duplicate-page-stall-520.png` — duplicate-page stall.
-10. `12-ro-disabled-auto-200-520.png` — RO-disabled auto pagination 100→200.
-11. `result.json` — full private machine result.
+The earlier 79/79 and 70/70 results remain historical baselines only; they are
+not the regression truth for this extended interaction matrix.
 
-Screenshots/result are not copied into the repository or the fixture roots.
+## Not covered / unavailable
 
-## Not covered by this harness (Desktop-only)
-
-- Desktop window/panel chrome, tab strip, drag/resize and side-region rules.
-- `MenuItem` registration for `session.panel`.
-- OpenCode session switching, project/sidebar data, host theme injection and
-  the host event bus.
-- Real Desktop 520 px panel registration and user pointer drag/resize.
-
-No files were written under the fixture roots. This report intentionally
-contains no private commit hashes, subjects, repository file paths, full diff
-text or tokens.
+- Real Desktop session/scope switching and host session/route changes:
+  explicitly outside this harness; no debug hooks or prod signal changes were
+  used.
+- Desktop window/panel chrome, `MenuItem` registration, host theme/event bus and
+  real Desktop panel resize.
+- Network push/fetch/reset-clean; unavailable and not invoked.
+- Mutation output-warning behavior was exercised only as an isolated fault, not
+  as a real successful mutation.
+- No product FAIL remains in the exercised harness matrix.

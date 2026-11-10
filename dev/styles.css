@@ -76,6 +76,22 @@ body {
   letter-spacing: 0.06em;
 }
 
+.harness-badge-readonly {
+  border-color: #3d5a3d;
+  color: #8fdc9a;
+}
+
+.harness-badge-write {
+  border-color: #7a4d22;
+  background: rgba(255, 170, 70, 0.12);
+  color: #ffc46b;
+}
+
+.harness[data-mode="mutation-fixture"] .harness-toolbar {
+  border-bottom-color: #6b4a2a;
+  background: #211c16;
+}
+
 .harness-spacer {
   flex: 1 1 auto;
 }

@@ -3,10 +3,20 @@ import type { z } from "zod"
 import {
   ChangeCountsSchema,
   ChangedFileSchema,
+  CheckoutBranchInputSchema,
   CommitHashSchema,
+  CreateBranchInputSchema,
+  CreateTagInputSchema,
+  DeleteBranchInputSchema,
+  DeleteTagInputSchema,
   FileDiffSchema,
+  FullCommitHashSchema,
   GetCommitFilesInputSchema,
   GetCommitFilesOutputSchema,
+  GetComparisonDiffInputSchema,
+  GetComparisonDiffOutputSchema,
+  GetComparisonFilesInputSchema,
+  GetComparisonFilesOutputSchema,
   GetDiffInputSchema,
   GetDiffOutputSchema,
   GetLogInputSchema,
@@ -17,13 +27,19 @@ import {
   GetStatusOutputSchema,
   GitCommitSchema,
   GitGraphErrorSchemas,
+  GitGraphMutationErrorSchemas,
   GitGraphRpc,
+  GitMutationResultSchema,
   GitRefSchema,
   GitRepositorySchema,
   GitStatusSchema,
   GitTargetSchema,
   ListRepositoriesInputSchema,
   ListRepositoriesOutputSchema,
+  LogRefSchema,
+  MAX_LOG_REFS,
+  MUTATION_REASON_MAX_LENGTH,
+  RenameBranchInputSchema,
   RepositoryIdSchema,
   SafeRelativePathSchema,
 } from "../src/rpc.js"
@@ -32,6 +48,7 @@ import type {
   ChangedFile,
   FileDiff,
   GitCommit,
+  GitMutationResult,
   GitRef,
   GitRepository,
   GitStatus,
@@ -106,6 +123,25 @@ const diff: FileDiff = {
   binary: false,
 }
 
+const mutationResult: GitMutationResult = {
+  status,
+  changed: true,
+}
+
+type _MutationResult = Assert<Equal<z.infer<typeof GitMutationResultSchema>, GitMutationResult>>
+type _CheckoutInput = Assert<
+  Equal<
+    z.infer<typeof CheckoutBranchInputSchema>,
+    {
+      repositoryId: string
+      expectedHead: string | null
+      confirmed: true
+      branch: string
+    }
+  >
+>
+const FULL_HASH = "0123456789abcdef".repeat(2) + "01234567"
+
 describe("git-graph RPC contract", () => {
   it("declares every method and no events", () => {
     expect(GitGraphRpc.id).toBe("git-graph")
@@ -117,12 +153,21 @@ describe("git-graph RPC contract", () => {
       "getRefs",
       "getCommitFiles",
       "getDiff",
+      "getComparisonFiles",
+      "getComparisonDiff",
+      "checkoutBranch",
+      "createBranch",
+      "createTag",
+      "renameBranch",
+      "deleteBranch",
+      "deleteTag",
     ])
     expect(Object.keys(GitGraphRpc.events)).toEqual([])
   })
 
   it("declares the unified error set on every repository method", () => {
     const expected = Object.keys(GitGraphErrorSchemas).sort()
+    const mutationExpected = Object.keys(GitGraphMutationErrorSchemas).sort()
     for (const name of [
       "listRepositories",
       "getStatus",
@@ -130,9 +175,22 @@ describe("git-graph RPC contract", () => {
       "getRefs",
       "getCommitFiles",
       "getDiff",
+      "getComparisonFiles",
+      "getComparisonDiff",
     ] as const) {
       expect(Object.keys(GitGraphRpc.methods[name].errors ?? {}).sort()).toEqual(expected)
     }
+    for (const name of [
+      "checkoutBranch",
+      "createBranch",
+      "createTag",
+      "renameBranch",
+      "deleteBranch",
+      "deleteTag",
+    ] as const) {
+      expect(Object.keys(GitGraphRpc.methods[name].errors ?? {}).sort()).toEqual(mutationExpected)
+    }
+    expect(mutationExpected).toContain("mutation_rejected")
   })
 
   it("validates listRepositories input", () => {
@@ -170,6 +228,200 @@ describe("git-graph RPC contract", () => {
       expect(GetLogInputSchema.safeParse({ repositoryId: repository.id, skip }).success).toBe(false)
     }
   })
+
+  it("validates every getLog walk field and canonical refs", () => {
+    const full = {
+      repositoryId: repository.id,
+      refs: ["refs/heads/main", "refs/remotes/origin/main", "refs/tags/v1"],
+      showRemotes: false,
+      showTags: false,
+      firstParent: true,
+      order: "topo" as const,
+    }
+    expect(GetLogInputSchema.parse(full)).toEqual(full)
+    expect(GetLogInputSchema.parse({ repositoryId: repository.id, refs: [] })).toEqual({
+      repositoryId: repository.id,
+      refs: [],
+    })
+
+    expect(LogRefSchema.safeParse("refs/heads/feature/x").success).toBe(true)
+    for (const unsafe of [
+      "main",
+      "refs/heads/",
+      "refs/heads/x..y",
+      "refs/heads/x@{1}",
+      "refs/heads/x//y",
+      "refs/heads/x/",
+      "refs/heads/.hidden",
+      "refs/heads/x.lock",
+      "refs/heads/x y",
+      "refs/heads/x~1",
+      "refs/heads/x^",
+      "refs/tags/x:y",
+      "HEAD",
+      "refs/heads/" + "x".repeat(5000),
+    ]) {
+      expect(LogRefSchema.safeParse(unsafe).success).toBe(false)
+    }
+
+    expect(
+      GetLogInputSchema.safeParse({
+        repositoryId: repository.id,
+        refs: Array.from({ length: MAX_LOG_REFS + 1 }, (_value, index) => `refs/heads/b${index}`),
+      }).success,
+    ).toBe(false)
+    expect(
+      GetLogInputSchema.safeParse({ repositoryId: repository.id, order: "reverse" }).success,
+    ).toBe(false)
+    expect(
+      GetLogInputSchema.safeParse({ repositoryId: repository.id, firstParent: "yes" }).success,
+    ).toBe(false)
+  })
+
+  it("validates comparison input and output", () => {
+    expect(
+      GetComparisonFilesInputSchema.parse({
+        repositoryId: repository.id,
+        baseHash: FULL_HASH,
+        headHash: "abcd",
+      }),
+    ).toEqual({ repositoryId: repository.id, baseHash: FULL_HASH, headHash: "abcd" })
+    expect(
+      GetComparisonFilesInputSchema.safeParse({
+        repositoryId: repository.id,
+        baseHash: "HEAD~1",
+        headHash: "abcd",
+      }).success,
+    ).toBe(false)
+    expect(
+      GetComparisonDiffInputSchema.parse({
+        repositoryId: repository.id,
+        baseHash: FULL_HASH,
+        headHash: "abcd",
+        path: "src/a.txt",
+      }),
+    ).toEqual({
+      repositoryId: repository.id,
+      baseHash: FULL_HASH,
+      headHash: "abcd",
+      path: "src/a.txt",
+    })
+    expect(
+      GetComparisonDiffInputSchema.safeParse({
+        repositoryId: repository.id,
+        baseHash: FULL_HASH,
+        headHash: "abcd",
+        path: "../a.txt",
+      }).success,
+    ).toBe(false)
+
+    expect(GetComparisonFilesOutputSchema.parse({ files: [changedFile] })).toEqual({
+      files: [changedFile],
+    })
+    expect(GetComparisonDiffOutputSchema.parse(diff)).toEqual(diff)
+  })
+
+  it("validates mutation confirmation, expected head and operation fields", () => {
+    expect(FullCommitHashSchema.safeParse(FULL_HASH).success).toBe(true)
+    expect(FullCommitHashSchema.safeParse("abcd").success).toBe(false)
+    expect(FullCommitHashSchema.safeParse("HEAD").success).toBe(false)
+    expect(FullCommitHashSchema.safeParse("--all").success).toBe(false)
+
+    const expected = "f".repeat(64)
+    const base = {
+      repositoryId: repository.id,
+      expectedHead: expected,
+      confirmed: true as const,
+    }
+    const checkout = {
+      ...base,
+      branch: "feature/x",
+    }
+    expect(CheckoutBranchInputSchema.parse(checkout)).toEqual(checkout)
+    expect(
+      CheckoutBranchInputSchema.safeParse({ ...checkout, expectedHead: null }).success,
+    ).toBe(true)
+    expect(
+      CheckoutBranchInputSchema.safeParse({ ...checkout, confirmed: false }).success,
+    ).toBe(false)
+    const { confirmed: _confirmed, ...withoutConfirmation } = checkout
+    expect(CheckoutBranchInputSchema.safeParse(withoutConfirmation).success).toBe(false)
+
+    for (const expectedHead of ["abcd", "HEAD", "--all", expected.slice(1), expected + "a"]) {
+      expect(
+        CheckoutBranchInputSchema.safeParse({ ...checkout, expectedHead }).success,
+      ).toBe(false)
+    }
+
+    for (const branch of ["-x", "--all", "../x", "x..y", "x@{1}", "x y", "refs/heads/x", "a\\b"]) {
+      expect(CheckoutBranchInputSchema.safeParse({ ...checkout, branch }).success).toBe(false)
+    }
+
+    expect(
+      CreateBranchInputSchema.parse({
+        ...base,
+        name: "topic",
+        startPoint: expected,
+        checkout: true,
+      }),
+    ).toMatchObject({ name: "topic", startPoint: expected, checkout: true })
+    expect(
+      CreateBranchInputSchema.safeParse({
+        ...base,
+        name: "topic",
+        startPoint: "abcd",
+      }).success,
+    ).toBe(false)
+    expect(
+      CreateBranchInputSchema.safeParse({
+        ...base,
+        name: "--topic",
+        startPoint: expected,
+      }).success,
+    ).toBe(false)
+
+    expect(
+      CreateTagInputSchema.parse({
+        ...base,
+        name: "v1.0.0",
+        target: expected,
+        message: "release",
+      }),
+    ).toMatchObject({ name: "v1.0.0", target: expected, message: "release" })
+    expect(
+      CreateTagInputSchema.safeParse({
+        ...base,
+        name: "-v1",
+        target: expected,
+      }).success,
+    ).toBe(false)
+
+    expect(
+      RenameBranchInputSchema.parse({ ...base, oldName: "main", newName: "trunk" }),
+    ).toMatchObject({ oldName: "main", newName: "trunk" })
+    expect(
+      DeleteBranchInputSchema.parse({ ...base, name: "topic" }),
+    ).toMatchObject({ name: "topic" })
+    expect(DeleteTagInputSchema.parse({ ...base, name: "v1" })).toMatchObject({ name: "v1" })
+
+    expect(GitMutationResultSchema.parse(mutationResult)).toEqual(mutationResult)
+    expect(
+      GitMutationResultSchema.safeParse({ status, changed: true, warning: "cached" }).success,
+    ).toBe(true)
+    expect(GitMutationResultSchema.safeParse({ status, changed: "yes" }).success).toBe(false)
+    expect(
+      GitGraphMutationErrorSchemas.mutation_rejected.safeParse({ reason: "" }).success,
+    ).toBe(false)
+    expect(
+      GitGraphMutationErrorSchemas.mutation_rejected.safeParse({
+        reason: "x".repeat(MUTATION_REASON_MAX_LENGTH + 1),
+      }).success,
+    ).toBe(false)
+    expect(
+      GitGraphMutationErrorSchemas.mutation_rejected.safeParse({ reason: "rejected" }).success,
+    ).toBe(true)
+  })
+
 
   it("validates getRefs input", () => {
     expect(GetRefsInputSchema.parse({ repositoryId: repository.id })).toEqual({

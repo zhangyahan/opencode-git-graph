@@ -1,5 +1,6 @@
 import { lstat, readlink, realpath } from "node:fs/promises"
 import path from "node:path"
+import { git, GitError, type GitSignalOptions } from "./executor.js"
 
 /** Maximum number of commits a single `getLog` page may request. */
 export const MAX_LOG_LIMIT = 1_000
@@ -192,4 +193,86 @@ export async function resolveRepositoryPath(
     throw new GitInputError(`Invalid file path ${JSON.stringify(relative)}: resolves outside the repository`)
   }
   return { absolutePath: realCandidate, kind: "file" }
+}
+
+/** A full object id: exactly 40 (SHA-1) or 64 (SHA-256) hexadecimal characters. */
+const FULL_COMMIT_OID = /^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$/
+
+/**
+ * Validate a stale-write guard.
+ *
+ * `null` means "no caller expectation"; otherwise the value must be a full
+ * 40/64 character hexadecimal commit id. Abbreviated ids are rejected: an
+ * abbreviated id cannot be compared for exact equality with HEAD.
+ */
+export function assertExpectedHead(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  if (typeof value !== "string" || !FULL_COMMIT_OID.test(value)) {
+    throw new GitInputError(
+      "Invalid expected head: expected null or a full 40/64 character hexadecimal commit id",
+    )
+  }
+  return value.toLowerCase()
+}
+
+/**
+ * Characters git forbids anywhere in a refname. The range includes space and
+ * all ASCII control characters; DEL is included explicitly.
+ */
+const INVALID_REF_NAME_CHARS = /[\x00-\x20\x7f~^:?*[\\]/
+
+/**
+ * Pure, filesystem-independent syntax check for one ref component path.
+ *
+ * This is intentionally stricter than "does git accept it": names that look
+ * like options are rejected so they can never be confused with a command-line
+ * flag. `git check-ref-format` remains the authoritative final check.
+ */
+function isValidRefNameSyntax(name: unknown): name is string {
+  if (typeof name !== "string" || name.length === 0 || name.length > 255) return false
+  if (name === "@" || name === "HEAD") return false
+  if (name.startsWith("-") || name.startsWith("/") || name.startsWith("refs/")) return false
+  if (name.endsWith("/")) return false
+  if (name.endsWith(".")) return false
+  if (INVALID_REF_NAME_CHARS.test(name)) return false
+  if (name.includes("..") || name.includes("//") || name.includes("@{")) return false
+
+  for (const component of name.split("/")) {
+    if (component.length === 0) return false
+    if (component.startsWith(".")) return false
+    if (component.endsWith(".lock")) return false
+  }
+  return true
+}
+
+/** Pure syntax check for a branch name (without the `refs/heads/` prefix). */
+export function isValidBranchNameSyntax(name: unknown): name is string {
+  return isValidRefNameSyntax(name)
+}
+
+/** Pure syntax check for a tag name (without the `refs/tags/` prefix). */
+export function isValidTagNameSyntax(name: unknown): name is string {
+  return isValidRefNameSyntax(name)
+}
+
+/**
+ * Authoritative refname validation through `git check-ref-format`.
+ *
+ * Returns `false` for exit code 1 (invalid name). Other failures (repository
+ * unreadable, cancellation, spawn failure) are rethrown so the caller does not
+ * misreport them as an invalid name.
+ */
+export async function checkRefFormat(
+  repoPath: string,
+  refname: string,
+  options: GitSignalOptions = {},
+): Promise<boolean> {
+  if (refname.startsWith("-")) return false
+  try {
+    await git(repoPath, ["check-ref-format", refname], options)
+    return true
+  } catch (error) {
+    if (error instanceof GitError && error.code === 1) return false
+    throw error
+  }
 }

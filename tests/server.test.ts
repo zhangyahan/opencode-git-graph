@@ -3,10 +3,13 @@ import { join } from "node:path"
 import { describe, expect, it, vi } from "vitest"
 import {
   GetCommitFilesOutputSchema,
+  GetComparisonDiffOutputSchema,
+  GetComparisonFilesOutputSchema,
   GetDiffOutputSchema,
   GetLogOutputSchema,
   GetRefsOutputSchema,
   GetStatusOutputSchema,
+  GitMutationResultSchema,
   ListRepositoriesOutputSchema,
 } from "../src/rpc.js"
 import {
@@ -14,6 +17,7 @@ import {
   RepositoryManager,
   type GitGraphManager,
 } from "../src/server/repository/manager.js"
+import { GitInputError } from "../src/server/git/validation.js"
 import type { FileDiff, GitRepository, GitStatus } from "../src/shared/types.js"
 import { commit, initRepo, mkTmpDir } from "./helpers.js"
 
@@ -79,6 +83,32 @@ function fakeManager(overrides: Partial<GitGraphManager> = {}): GitGraphManager 
     getRefs: vi.fn(async () => []),
     getCommitFiles: vi.fn(async () => []),
     getDiff: vi.fn(async () => diffFixture),
+    getComparisonFiles: vi.fn(async () => []),
+    getComparisonDiff: vi.fn(async () => diffFixture),
+    checkoutBranch: vi.fn(async () => ({
+      status: statusFixture,
+      changed: true,
+    })),
+    createBranch: vi.fn(async () => ({
+      status: statusFixture,
+      changed: true,
+    })),
+    createTag: vi.fn(async () => ({
+      status: statusFixture,
+      changed: true,
+    })),
+    renameBranch: vi.fn(async () => ({
+      status: statusFixture,
+      changed: true,
+    })),
+    deleteBranch: vi.fn(async () => ({
+      status: statusFixture,
+      changed: true,
+    })),
+    deleteTag: vi.fn(async () => ({
+      status: statusFixture,
+      changed: true,
+    })),
     ...overrides,
   }
 }
@@ -138,6 +168,227 @@ describe("git-graph RPC handlers", () => {
       root.cleanup()
     }
   })
+
+  it("serves comparison and confirmed mutation methods through the real manager", async () => {
+    const root = mkTmpDir()
+    try {
+      const repo = join(root.dir, "repo")
+      initRepo(repo)
+      const base = commit(repo, { "a.txt": "one\n" }, "base")
+      const head = commit(repo, { "a.txt": "two\n", "b.txt": "new\n" }, "head")
+
+      const manager = new RepositoryManager(root.dir, { ttlMs: 60_000 })
+      try {
+        const handlers = createGitGraphHandlers(manager)
+        const { context } = makeContext()
+        const [entry] = await manager.listRepositories()
+
+        const log = GetLogOutputSchema.parse(
+          await handlers.getLog(
+            {
+              repositoryId: entry.id,
+              refs: ["refs/heads/main"],
+              showRemotes: false,
+              showTags: false,
+              firstParent: true,
+              order: "topo",
+              limit: 10,
+            },
+            context as never,
+          ),
+        )
+        expect(log.commits.map((commitEntry) => commitEntry.hash)).toEqual([head, base])
+
+        const files = GetComparisonFilesOutputSchema.parse(
+          await handlers.getComparisonFiles(
+            { repositoryId: entry.id, baseHash: base, headHash: head },
+            context as never,
+          ),
+        )
+        expect(files.files).toContainEqual({ path: "b.txt", status: "added", staged: true })
+
+        const diff = GetComparisonDiffOutputSchema.parse(
+          await handlers.getComparisonDiff(
+            { repositoryId: entry.id, baseHash: base, headHash: head, path: "a.txt" },
+            context as never,
+          ),
+        )
+        expect(diff.text).toContain("+two")
+
+        const created = GitMutationResultSchema.parse(
+          await handlers.createTag(
+            {
+              repositoryId: entry.id,
+              expectedHead: head,
+              confirmed: true,
+              name: "v1",
+              target: head,
+              message: "release",
+            },
+            context as never,
+          ),
+        )
+        expect(created).toMatchObject({ changed: true, status: { head } })
+
+        const deleted = GitMutationResultSchema.parse(
+          await handlers.deleteTag(
+            { repositoryId: entry.id, expectedHead: head, confirmed: true, name: "v1" },
+            context as never,
+          ),
+        )
+        expect(deleted.changed).toBe(true)
+      } finally {
+        manager.dispose()
+      }
+    } finally {
+      root.cleanup()
+    }
+  }, 30_000)
+
+  it("rejects a mutation whose confirmation is missing even when the handler is called directly", async () => {
+    const manager = fakeManager()
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext()
+
+    const result = (await handlers.checkoutBranch(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        branch: "main",
+      } as never,
+      context as never,
+    )) as unknown as TestError
+
+    expect(manager.checkoutBranch).not.toHaveBeenCalled()
+    expect(result).toMatchObject({ type: "invalid_input", data: { reason: "confirmation" } })
+  })
+
+  it("maps mutation failures to a bounded reason without leaking paths", async () => {
+    const manager = fakeManager({
+      checkoutBranch: vi.fn(async () => {
+        throw Object.assign(new Error("C:\\secret\\repo failed"), {
+          name: "GitMutationError",
+          reason: "x".repeat(500),
+        })
+      }),
+    })
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext()
+
+    const result = (await handlers.checkoutBranch(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        confirmed: true,
+        branch: "main",
+      },
+      context as never,
+    )) as unknown as TestError
+
+    expect(result).toMatchObject({ type: "mutation_rejected" })
+    const reason = result.data.reason as string
+    expect(reason).toHaveLength(200)
+    expect(result.message).not.toContain("secret")
+    expect(JSON.stringify(result)).not.toContain("secret")
+  })
+
+  it("maps unexpected write failures to a generic mutation reason", async () => {
+    const manager = fakeManager({
+      deleteBranch: vi.fn(async () => {
+        throw new Error("C:\\secret\\repo exploded")
+      }),
+    })
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext()
+
+    const result = (await handlers.deleteBranch(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        confirmed: true,
+        name: "topic",
+      },
+      context as never,
+    )) as unknown as TestError
+
+    expect(result).toMatchObject({
+      type: "mutation_rejected",
+      data: { reason: "mutation_failed" },
+    })
+    expect(JSON.stringify(result)).not.toContain("secret")
+  })
+
+  it("returns a successful write even when the caller aborts after it started", async () => {
+    const controller = new AbortController()
+    const changedStatus = { ...statusFixture, branch: "feature" }
+    const manager = fakeManager({
+      checkoutBranch: vi.fn(async () => {
+        controller.abort()
+        return { status: changedStatus, changed: true }
+      }),
+    })
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext(controller.signal)
+
+    const result = await handlers.checkoutBranch(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        confirmed: true,
+        branch: "feature",
+      },
+      context as never,
+    )
+
+    expect(result).toMatchObject({ changed: true, status: { branch: "feature" } })
+  })
+
+  it("does not start a write when the signal is already aborted", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const manager = fakeManager()
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext(controller.signal)
+
+    const result = (await handlers.deleteTag(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        confirmed: true,
+        name: "v1",
+      },
+      context as never,
+    )) as unknown as TestError
+
+    expect(manager.deleteTag).not.toHaveBeenCalled()
+    expect(result).toMatchObject({ type: "git_failed", data: { operation: "cancelled" } })
+    expect(result.message).toContain("no git process was started")
+  })
+
+  it("maps mutation input validation errors and disposal without leaking details", async () => {
+    const manager = fakeManager({
+      renameBranch: vi.fn(async () => {
+        throw new GitInputError("C:\\secret\\bad name")
+      }),
+    })
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext()
+
+    const result = (await handlers.renameBranch(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        confirmed: true,
+        oldName: "main",
+        newName: "trunk",
+      },
+      context as never,
+    )) as unknown as TestError
+
+    expect(result).toMatchObject({ type: "invalid_input", data: { reason: "input" } })
+    expect(JSON.stringify(result)).not.toContain("secret")
+  })
+
 
   it("maps unknown ids, unsafe paths and revision expressions to declared errors", async () => {
     const root = mkTmpDir()

@@ -7,15 +7,20 @@ import {
   detailsLayout,
   historyColumnTemplate,
   historyColumns,
+  refBadgeCountForBudget,
   visibleRefCount,
 } from "../src/gui/history-columns.js"
 import {
   clampGraphColumnWidth,
+  DEFAULT_LANE_SPACING,
   graphContentWidth,
+  graphLaneSpacing,
   graphLaneX,
   graphLinePath,
   GRAPH_COLUMN_MAX_WIDTH,
   GRAPH_COLUMN_MIN_WIDTH,
+  GRAPH_COLUMN_WIDTH,
+  isDenseGraph,
 } from "../src/gui/graph-geometry.js"
 import {
   repositoryOptionLabel,
@@ -77,20 +82,27 @@ describe("history column policy", () => {
 
   it("builds one grid template that matches the visible columns", () => {
     expect(
-      historyColumnTemplate({ graphWidth: 152, date: false, author: false }),
-    ).toBe("152px minmax(0, 1fr) 74px")
+      historyColumnTemplate({ graphWidth: 240, date: false, author: false }),
+    ).toBe("240px minmax(0, 1fr) 74px")
     expect(
-      historyColumnTemplate({ graphWidth: 180, date: true, author: false }),
-    ).toBe("180px minmax(0, 1fr) 96px 74px")
+      historyColumnTemplate({ graphWidth: 240, date: true, author: false }),
+    ).toBe("240px minmax(0, 1fr) 150px 74px")
     expect(
-      historyColumnTemplate({ graphWidth: 180, date: true, author: true }),
-    ).toBe("180px minmax(0, 1fr) 96px 118px 74px")
+      historyColumnTemplate({ graphWidth: 240, date: true, author: true }),
+    ).toBe("240px minmax(0, 1fr) 150px 118px 74px")
   })
 
   it("shows fewer ref badges before the subject on narrow panels", () => {
-    expect(visibleRefCount(520)).toBe(2)
+    expect(visibleRefCount(520)).toBe(1)
+    expect(visibleRefCount(600)).toBe(2)
     expect(visibleRefCount(DATE_COLUMN_MIN_WIDTH)).toBe(3)
     expect(visibleRefCount(AUTHOR_COLUMN_MIN_WIDTH)).toBe(4)
+  })
+
+  it("caps ref chips by the description budget", () => {
+    expect(refBadgeCountForBudget(206)).toBe(1)
+    expect(refBadgeCountForBudget(518)).toBe(3)
+    expect(refBadgeCountForBudget(1000)).toBe(4)
   })
 
   it("splits commit details vertically on narrow panels and horizontally when wide", () => {
@@ -131,11 +143,23 @@ describe("graph geometry", () => {
     ).toBe("M 15 14 C 15 21, 29 21, 29 28")
   })
 
-  it("clamps the resizable graph column to a usable range", () => {
+  it("clamps the graph column to its application-owned range", () => {
     expect(clampGraphColumnWidth(10)).toBe(GRAPH_COLUMN_MIN_WIDTH)
     expect(clampGraphColumnWidth(9999)).toBe(GRAPH_COLUMN_MAX_WIDTH)
-    expect(clampGraphColumnWidth(Number.NaN)).toBe(152)
+    expect(clampGraphColumnWidth(Number.NaN)).toBe(GRAPH_COLUMN_WIDTH)
     expect(clampGraphColumnWidth(171.6)).toBe(172)
+  })
+
+  it("keeps 14px for common lane counts and fits every edge in the fixed column", () => {
+    expect(graphLaneSpacing(GRAPH_COLUMN_WIDTH, 15, 8)).toBe(DEFAULT_LANE_SPACING)
+    expect(graphLaneSpacing(GRAPH_COLUMN_WIDTH, 1, 8)).toBe(DEFAULT_LANE_SPACING)
+    const dense = graphLaneSpacing(GRAPH_COLUMN_WIDTH, 172, 8)
+    expect(dense).toBeLessThan(2)
+    expect(isDenseGraph(dense)).toBe(true)
+    const lastLane = 171
+    expect(graphLaneX(lastLane, dense, 8) + dense / 2).toBeLessThanOrEqual(
+      GRAPH_COLUMN_WIDTH - 8,
+    )
   })
 })
 
@@ -253,7 +277,10 @@ describe("scroll clamping", () => {
 
 describe("commit formatting", () => {
   it("formats dates without locale or time-zone state", () => {
-    expect(formatCommitDate("2026-11-09T12:34:56+08:00")).toBe("2026-11-09")
+    const value = formatCommitDate("2026-11-09T12:34:56+08:00")
+    expect(value).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+    expect(value).not.toContain("T")
+    expect(value).not.toContain("+")
     expect(formatCommitDate("not a date")).toBe("not a date")
     expect(formatCommitDate("")).toBe("")
   })

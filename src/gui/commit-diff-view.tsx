@@ -14,6 +14,10 @@ export interface CommitDiffViewProps {
   diff?: FileDiff
   loading: boolean
   error?: string
+  /** When set, this is a read-only comparison base → commit view. */
+  comparisonBase?: GitCommit
+  /** Hide the top bar when the parent page already renders the range header. */
+  embedded?: boolean
   onBack: () => void
   onRetry: () => void
   onParentChange?: (index: number) => void
@@ -277,6 +281,14 @@ export const COMMIT_DIFF_STYLES = `
   color: var(--color-textMuted, #8a8a8a);
   font-size: 11px;
 }
+.gg-commit-diff-page.gg-commit-diff-embedded {
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+}
+.gg-commit-diff-embedded .gg-commit-diff-body {
+  flex: 1 1 auto;
+}
 `
 
 /**
@@ -303,9 +315,14 @@ export function CommitDiffView(props: CommitDiffViewProps) {
     return parents[selectedParentIndex()] ?? parents[0]
   }
 
-  const rangeTitle = () => `${parentHash() ?? "Empty tree"} → ${props.commit.hash}`
+  const rangeTitle = () =>
+    props.comparisonBase
+      ? `${shortHash(props.comparisonBase.hash)} → ${shortHash(props.commit.hash)}`
+      : `${parentHash() ?? "Empty tree"} → ${props.commit.hash}`
   const canPickParent = () =>
-    props.onParentChange !== undefined && props.commit.parents.length > 0
+    !props.comparisonBase &&
+    props.onParentChange !== undefined &&
+    props.commit.parents.length > 0
 
   const allLines = createMemo(() => buildCommitDiffLines(props.diff?.text ?? ""))
   const visibleLines = createMemo(() =>
@@ -315,56 +332,70 @@ export function CommitDiffView(props: CommitDiffViewProps) {
 
   return (
     <div
-      class="gg-commit-diff-page"
-      data-testid="commit-diff-page"
-      aria-label="Commit diff"
+      class={
+        props.embedded
+          ? "gg-commit-diff-page gg-commit-diff-embedded"
+          : "gg-commit-diff-page"
+      }
+      data-testid={props.comparisonBase ? "comparison-diff" : "commit-diff-page"}
+      data-comparison={props.comparisonBase ? "true" : undefined}
+      aria-label={props.comparisonBase ? "Comparison diff" : "Commit diff"}
     >
       <style>{COMMIT_DIFF_STYLES}</style>
 
-      <div class="gg-commit-diff-topbar">
-        <button
-          type="button"
-          class="gg-commit-diff-back"
-          data-testid="details-back"
-          aria-label="Back to history"
-          onClick={() => props.onBack()}
-        >
-          Back to history
-        </button>
-        <span class="gg-commit-diff-readonly" title="Historical commit diffs are read-only">
-          Read only
-        </span>
-        <span class="gg-commit-diff-range" title={rangeTitle()}>
-          <span class="gg-commit-diff-parent-hash">
-            {parentHash() ? shortHash(parentHash()) : "Empty tree"}
+      <Show when={!props.embedded}>
+        <div class="gg-commit-diff-topbar">
+          <button
+            type="button"
+            class="gg-commit-diff-back"
+            data-testid="details-back"
+            aria-label="Back to history"
+            onClick={() => props.onBack()}
+          >
+            Back to history
+          </button>
+          <span
+            class="gg-commit-diff-readonly"
+            title="Historical commit diffs are read-only"
+          >
+            Read only
           </span>
-          {" → "}
-          <span class="gg-commit-diff-commit-hash">
-            {shortHash(props.commit.hash)}
+          <span class="gg-commit-diff-range" title={rangeTitle()} data-testid="commit-diff-range">
+            <span class="gg-commit-diff-parent-hash">
+              {props.comparisonBase
+                ? shortHash(props.comparisonBase.hash)
+                : parentHash()
+                  ? shortHash(parentHash())
+                  : "Empty tree"}
+            </span>
+            {" → "}
+            <span class="gg-commit-diff-commit-hash">
+              {shortHash(props.commit.hash)}
+            </span>
           </span>
-        </span>
-        <Show when={canPickParent()}>
-          <label class="gg-commit-diff-parent">
-            <span class="gg-commit-diff-sr-only">Diff parent</span>
-            <select
-              aria-label="Diff parent"
-              value={String(selectedParentIndex())}
-              disabled={props.loading}
-              onChange={(event) =>
-                props.onParentChange?.(Number(event.currentTarget.value))
-              }
-            >
-              <For each={props.commit.parents}>
-                {(parent, index) => (
-                  <option value={String(index())}>
-                    Parent {index() + 1} · {shortHash(parent)}
-                  </option>
-                )}
-              </For>
-            </select>
-          </label>
-        </Show>
-      </div>
+          <Show when={canPickParent()}>
+            <label class="gg-commit-diff-parent">
+              <span class="gg-commit-diff-sr-only">Diff parent</span>
+              <select
+                aria-label="Diff parent"
+                value={String(selectedParentIndex())}
+                disabled={props.loading}
+                onChange={(event) =>
+                  props.onParentChange?.(Number(event.currentTarget.value))
+                }
+              >
+                <For each={props.commit.parents}>
+                  {(parent, index) => (
+                    <option value={String(index())}>
+                      Parent {index() + 1} · {shortHash(parent)}
+                    </option>
+                  )}
+                </For>
+              </select>
+            </label>
+          </Show>
+        </div>
+      </Show>
 
       <div class="gg-commit-diff-body" data-testid="diff" aria-label="Diff">
         <div class="gg-commit-diff-scroll">

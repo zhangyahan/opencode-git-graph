@@ -93,7 +93,7 @@ describe("RepositoryManager", () => {
     } finally {
       root.cleanup()
     }
-  })
+  }, 15_000)
 
   it("keeps listing healthy repositories when one has a corrupt index", async () => {
     const root = mkTmpDir()

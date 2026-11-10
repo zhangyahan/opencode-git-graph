@@ -60,6 +60,35 @@ Optional isolated settings:
 graph-scroll fix. It uses fixed 28px row geometry and manual pagination, so it is
 not the regression truth for the new row-layout/inline interactions.
 
+### Release-candidate two-environment acceptance
+
+`release.mjs` is prepared for the frozen release build. It expects the
+read-only FR harness and the separate TEMP mutation fixture:
+
+```powershell
+# default: FR http://127.0.0.1:5178/, TEMP http://127.0.0.1:5179/
+node dev/ui-test/release.mjs
+
+# selector readiness audit only; no writes
+node dev/ui-test/release.mjs --audit
+```
+
+Environment overrides:
+
+| variable | purpose |
+| --- | --- |
+| `GG_FR_URL` / `GG_TEMP_URL` | the two harness origins |
+| `GG_RELEASE_ARTIFACTS` | screenshot/result directory |
+| `GG_FR_REPO` / `GG_TEMP_REPO` | fixture repository names |
+| `GG_PLAYWRIGHT_CORE` / `GG_CHROME_PATH` | browser automation overrides |
+
+The script never sends a valid confirmed mutation to the FR origin. Mutation
+requests there are limited to `confirmed:false`, unknown-target and stale-head
+guard probes. Full write flows (checkout/create/rename/delete branch, create/
+delete tag, dirty/stale/unknown errors) run only against the approved TEMP
+fixture. Screenshots and private result data stay under the TEMP artifacts
+directory.
+
 Optional environment variables:
 
 | variable | purpose |

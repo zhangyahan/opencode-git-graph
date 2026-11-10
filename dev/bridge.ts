@@ -1,15 +1,23 @@
+import fs from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import type { Plugin, ViteDevServer } from "vite"
 import type { GitGraphManager } from "../src/server/repository/manager.js"
 import {
-  ALLOWED_HOST,
-  ALLOWED_ORIGIN,
+  FIXTURE_BASE,
+  FIXTURE_MARKER_KIND,
+  FIXTURE_MARKER_NAME,
+  FIXTURE_MARKER_VERSION,
+  FIXTURE_TEMP_PARENT,
+  FR_PORT,
   FR_ROOT,
-  HARNESS_METHOD_SET,
+  LOOPBACK_HOST,
   MAX_BODY_BYTES,
+  MUTATION_METHOD_SET,
   RPC_PATH_PREFIX,
+  methodsForMode,
+  type UiMode,
 } from "./protocol.js"
 
 /**
@@ -18,6 +26,13 @@ import {
  * The bridge loads the real server modules through Vite's SSR module runner, so
  * the harness exercises the same RepositoryManager, RPC handlers and zod
  * schemas as the plugin. It is never part of the production bundle.
+ *
+ * Mode isolation is decided by the environment at server startup, never by an
+ * HTTP request:
+ *
+ * - `fr` exposes only the read methods and always uses `FR_ROOT`.
+ * - `mutation-fixture` additionally exposes the six mutation methods and uses a
+ *   validated marker-owned directory below the approved TEMP subtree.
  */
 
 type RuntimeSchema = {
@@ -44,12 +59,24 @@ type HandlerContext = {
 type Handler = (input: unknown, context: HandlerContext) => Promise<unknown>
 type HandlerMap = Record<string, Handler>
 type RuntimeManager = GitGraphManager & { dispose(): void }
-type ManagerConstructor = new (root: string) => RuntimeManager
+type ManagerConstructor = new (
+  root: string,
+  options?: { deps?: { mutations?: unknown } },
+) => RuntimeManager
 
 type Runtime = {
   manager: RuntimeManager
   handlers: HandlerMap
   definition: RuntimeDefinition
+}
+
+type BridgeOptions = {
+  projectRoot: string
+  mode: UiMode
+  /** Exact port used for Host/Origin checks; must match the Vite server port. */
+  port: number
+  /** Required in mutation-fixture mode; ignored in FR mode. */
+  fixtureRoot?: string
 }
 
 interface BridgeErrorBody {
@@ -58,7 +85,13 @@ interface BridgeErrorBody {
   data?: unknown
 }
 
+type OriginGuard = {
+  host: string
+  origin: string
+}
+
 const HANDLER_ERROR = Symbol("git-graph-dev.handler-error")
+const MARKER_MAX_BYTES = 64 * 1024
 
 function makeHandlerError(type: string, message: string, data?: unknown): BridgeErrorBody {
   const error: BridgeErrorBody = { type, message }
@@ -81,6 +114,8 @@ function statusForError(type: string): number {
       return 404
     case "invalid_input":
       return 400
+    case "mutation_rejected":
+      return 409
     case "git_failed":
       return 502
     case "disposed":
@@ -111,10 +146,10 @@ function sendError(
   sendJson(res, status, { error })
 }
 
-function requestPreview(req: IncomingMessage): string {
+function requestPreview(req: IncomingMessage, guard: OriginGuard): string {
   if (req.method !== "POST") return "method"
-  if (req.headers.host !== ALLOWED_HOST) return "host"
-  if (req.headers.origin !== ALLOWED_ORIGIN) return "origin"
+  if (req.headers.host !== guard.host) return "host"
+  if (req.headers.origin !== guard.origin) return "origin"
   const fetchSite = req.headers["sec-fetch-site"]
   if (typeof fetchSite === "string" && fetchSite !== "same-origin" && fetchSite !== "none") {
     return "fetch-site"
@@ -170,15 +205,191 @@ function parseBody(text: string): { ok: true; value: unknown } | { ok: false } {
   }
 }
 
+function samePath(left: string, right: string): boolean {
+  const a = path.resolve(left)
+  const b = path.resolve(right)
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
+}
+
+function isStrictlyInside(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child)
+  if (relative === "" || path.isAbsolute(relative)) return false
+  return relative !== ".." && !relative.startsWith(`..${path.sep}`)
+}
+
+function lstatOrThrow(target: string, label: string): fs.Stats {
+  try {
+    return fs.lstatSync(target)
+  } catch {
+    throw new Error(`${label} does not exist or is not accessible`)
+  }
+}
+
+function assertRealDirectory(target: string, label: string): fs.Stats {
+  const stat = lstatOrThrow(target, label)
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`${label} must be a real directory (symlinks are rejected)`)
+  }
+  return stat
+}
+
+function assertRealFile(target: string, label: string): fs.Stats {
+  const stat = lstatOrThrow(target, label)
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${label} must be a real regular file`)
+  }
+  return stat
+}
+
+function assertCanonical(target: string, label: string): string {
+  const resolved = path.resolve(target)
+  const real = fs.realpathSync(resolved)
+  if (!samePath(real, resolved)) {
+    throw new Error(`${label} resolves through a symlink or junction`)
+  }
+  return real
+}
+
+function safeDirectoryName(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) return false
+  if (value === "." || value === "..") return false
+  if (value.includes("/") || value.includes("\\") || value.includes("\0")) return false
+  return true
+}
+
+/**
+ * Validate and canonicalize the mutation fixture root.
+ *
+ * This runs synchronously during Vite startup so a bad root aborts the dev
+ * server instead of serving a bridge that could write into FR or an arbitrary
+ * directory. The only accepted roots are direct children of the fixed TEMP
+ * subtree, with no symlink component and a fixture marker that is bound to the
+ * canonical root path.
+ */
+export function resolveMutationFixtureRoot(value: string | undefined): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("GG_UI_FIXTURE_ROOT is required in mutation-fixture mode")
+  }
+  if (!path.isAbsolute(value)) {
+    throw new Error("GG_UI_FIXTURE_ROOT must be an absolute path")
+  }
+
+  const tempParent = assertCanonical(FIXTURE_TEMP_PARENT, "The approved TEMP parent")
+  assertRealDirectory(tempParent, "The approved TEMP parent")
+
+  const base = assertCanonical(FIXTURE_BASE, "The mutation fixture base")
+  assertRealDirectory(base, "The mutation fixture base")
+  if (!isStrictlyInside(tempParent, base)) {
+    throw new Error("The mutation fixture base is outside the approved TEMP parent")
+  }
+
+  const requested = path.resolve(value)
+  assertRealDirectory(requested, "GG_UI_FIXTURE_ROOT")
+  const root = assertCanonical(requested, "GG_UI_FIXTURE_ROOT")
+
+  if (!samePath(path.dirname(root), base)) {
+    throw new Error("GG_UI_FIXTURE_ROOT must be a direct child of the mutation fixture base")
+  }
+  if (samePath(root, FR_ROOT) || isStrictlyInside(FR_ROOT, root)) {
+    throw new Error("GG_UI_FIXTURE_ROOT must never point at FR")
+  }
+
+  const markerPath = path.join(root, FIXTURE_MARKER_NAME)
+  const markerStat = assertRealFile(markerPath, "The mutation fixture marker")
+  if (markerStat.size > MARKER_MAX_BYTES) {
+    throw new Error("The mutation fixture marker is too large")
+  }
+  assertCanonical(markerPath, "The mutation fixture marker")
+
+  let marker: unknown
+  try {
+    marker = JSON.parse(fs.readFileSync(markerPath, "utf8"))
+  } catch {
+    throw new Error("The mutation fixture marker is not valid JSON")
+  }
+  if (typeof marker !== "object" || marker === null) {
+    throw new Error("The mutation fixture marker has an invalid shape")
+  }
+  const record = marker as Record<string, unknown>
+  if (record.kind !== FIXTURE_MARKER_KIND || record.version !== FIXTURE_MARKER_VERSION) {
+    throw new Error("The mutation fixture marker has the wrong kind or version")
+  }
+  if (typeof record.root !== "string" || !samePath(record.root, root)) {
+    throw new Error("The mutation fixture marker is bound to a different root")
+  }
+  if (!Array.isArray(record.repositories) || record.repositories.length < 1) {
+    throw new Error("The mutation fixture marker does not list its repositories")
+  }
+
+  for (const entry of record.repositories) {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error("The mutation fixture marker lists an invalid repository")
+    }
+    const repository = entry as Record<string, unknown>
+    if (typeof repository.alias !== "string" || repository.alias.length === 0) {
+      throw new Error("The mutation fixture marker repository is missing its alias")
+    }
+    if (!safeDirectoryName(repository.directory)) {
+      throw new Error("The mutation fixture marker repository directory is invalid")
+    }
+    const repositoryPath = path.join(root, repository.directory)
+    assertRealDirectory(repositoryPath, "A mutation fixture repository")
+    const canonicalRepository = assertCanonical(repositoryPath, "A mutation fixture repository")
+    if (!samePath(path.dirname(canonicalRepository), root)) {
+      throw new Error("A mutation fixture repository is outside the fixture root")
+    }
+  }
+
+  return root
+}
+
+const MUTATION_ENGINE_EXPORTS = [
+  "checkoutBranch",
+  "createBranch",
+  "createTag",
+  "renameBranch",
+  "deleteBranch",
+  "deleteTag",
+] as const
+
+/**
+ * Load the real write engine for the mutation-fixture mode.
+ *
+ * The production manager lazy-loads `../git/mutations.js`; that specifier is
+ * not resolvable by Vite's SSR runner from the TypeScript source tree. The
+ * manager already exposes `deps.mutations` for tests, so the harness injects
+ * the same production module here instead of mocking any result.
+ */
+async function loadMutationEngine(
+  server: ViteDevServer,
+  projectRoot: string,
+): Promise<unknown | undefined> {
+  try {
+    const module = await server.ssrLoadModule(
+      pathToFileURL(path.join(projectRoot, "src/server/git/mutations.ts")).href,
+    )
+    const record = module as Record<string, unknown>
+    const complete = MUTATION_ENGINE_EXPORTS.every(
+      (name) => typeof record[name] === "function",
+    )
+    return complete ? module : undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function loadModules(
   server: ViteDevServer,
   projectRoot: string,
-): Promise<Runtime> {
-  const [managerModule, rpcModule] = await Promise.all([
+  root: string,
+  mode: UiMode,
+): Promise<Runtime & { mutationEngine: boolean }> {
+  const [managerModule, rpcModule, mutations] = await Promise.all([
     server.ssrLoadModule(
       pathToFileURL(path.join(projectRoot, "src/server/repository/manager.ts")).href,
     ),
     server.ssrLoadModule(pathToFileURL(path.join(projectRoot, "src/rpc.ts")).href),
+    mode === "mutation-fixture" ? loadMutationEngine(server, projectRoot) : undefined,
   ])
 
   const Manager = managerModule.RepositoryManager as ManagerConstructor | undefined
@@ -198,20 +409,46 @@ async function loadModules(
 
   // The fixed root is the only repository allowlist source. No request can
   // change it or pass a repository path.
-  const manager = new Manager(FR_ROOT)
-  return { manager, handlers: createHandlers(manager), definition }
+  const managerOptions =
+    mode === "mutation-fixture" && mutations ? { deps: { mutations } } : undefined
+  const manager = new Manager(root, managerOptions)
+  return {
+    manager,
+    handlers: createHandlers(manager),
+    definition,
+    mutationEngine: mode === "mutation-fixture" && mutations !== undefined,
+  }
 }
 
-export function gitGraphDevHarness(options: { projectRoot: string }): Plugin {
+export function gitGraphDevHarness(options: BridgeOptions): Plugin {
   return {
     name: "git-graph-dev-harness",
     apply: "serve",
     configureServer(server) {
+      // Fail startup for an invalid mutation root; the HTTP layer must never be
+      // able to choose a root later.
+      const root =
+        options.mode === "mutation-fixture"
+          ? resolveMutationFixtureRoot(options.fixtureRoot)
+          : FR_ROOT
+      if (options.mode === "fr" && !samePath(root, FR_ROOT)) {
+        throw new Error("FR mode must use the fixed read-only root")
+      }
+      if (options.mode === "fr" && options.port !== FR_PORT) {
+        throw new Error("FR mode must use port 5178")
+      }
+
+      const guard: OriginGuard = {
+        host: `${LOOPBACK_HOST}:${options.port}`,
+        origin: `http://${LOOPBACK_HOST}:${options.port}`,
+      }
+      const allowedMethods = methodsForMode(options.mode)
+
       let runtime: Runtime | undefined
       let disposed = false
       let definition: RuntimeDefinition | undefined
 
-      const ready = loadModules(server, options.projectRoot)
+      const ready = loadModules(server, options.projectRoot, root, options.mode)
         .then((loaded) => {
           if (disposed) {
             loaded.manager.dispose()
@@ -219,9 +456,27 @@ export function gitGraphDevHarness(options: { projectRoot: string }): Plugin {
           }
           runtime = loaded
           definition = loaded.definition
-          server.config.logger.info(
-            `[git-graph-dev] read-only bridge ready (root ${FR_ROOT}, host ${ALLOWED_HOST})`,
+
+          const missing = [...allowedMethods].filter(
+            (method) =>
+              !(method in loaded.definition.methods) ||
+              typeof loaded.handlers[method] !== "function",
           )
+          server.config.logger.info(
+            `[git-graph-dev] ${options.mode} bridge ready (root ${root}, host ${guard.host})`,
+          )
+          if (missing.length > 0) {
+            server.config.logger.info(
+              `[git-graph-dev] methods not yet provided by the production RPC: ${missing.join(", ")}`,
+            )
+          }
+          if (options.mode === "mutation-fixture") {
+            server.config.logger.info(
+              loaded.mutationEngine
+                ? "[git-graph-dev] real mutation engine loaded for TEMP fixtures"
+                : "[git-graph-dev] mutation engine unavailable; writes will be rejected",
+            )
+          }
           return loaded
         })
         .catch((error: unknown) => {
@@ -235,9 +490,13 @@ export function gitGraphDevHarness(options: { projectRoot: string }): Plugin {
 
       server.middlewares.use((req, res, next) => {
         if (!req.url) return next()
-        const url = new URL(req.url, ALLOWED_ORIGIN)
+        const url = new URL(req.url, guard.origin)
         if (!url.pathname.startsWith(RPC_PATH_PREFIX)) return next()
-        void handleRpc(req, res, url, ready, server, () => definition).catch(() => {
+        void handleRpc(req, res, url, ready, server, () => definition, {
+          guard,
+          allowedMethods,
+          mode: options.mode,
+        }).catch(() => {
           sendError(res, 500, "rpc.internal", "Internal harness error")
         })
       })
@@ -260,8 +519,13 @@ export function gitGraphDevHarness(options: { projectRoot: string }): Plugin {
     ready: Promise<Runtime>,
     server: ViteDevServer,
     getDefinition: () => RuntimeDefinition | undefined,
+    policy: {
+      guard: OriginGuard
+      allowedMethods: ReadonlySet<string>
+      mode: UiMode
+    },
   ): Promise<void> {
-    const preview = requestPreview(req)
+    const preview = requestPreview(req, policy.guard)
     if (preview !== "ok") {
       const status = preview === "method" ? 405 : 403
       sendError(res, status, "rpc.unauthorized", "Request rejected by the harness origin guard")
@@ -275,7 +539,16 @@ export function gitGraphDevHarness(options: { projectRoot: string }): Plugin {
     }
 
     const method = url.pathname.slice(RPC_PATH_PREFIX.length)
-    if (!HARNESS_METHOD_SET.has(method)) {
+    if (!policy.allowedMethods.has(method)) {
+      if (policy.mode === "fr" && MUTATION_METHOD_SET.has(method)) {
+        sendError(
+          res,
+          403,
+          "rpc.method_forbidden",
+          "Mutation methods are not available in FR read-only mode",
+        )
+        return
+      }
       sendError(res, 404, "rpc.method_not_found", "Method is not exposed by the dev harness")
       return
     }
@@ -289,7 +562,7 @@ export function gitGraphDevHarness(options: { projectRoot: string }): Plugin {
     }
 
     const methodDefinition = (getDefinition() ?? loaded.definition).methods[method]
-    if (!methodDefinition) {
+    if (!methodDefinition || typeof loaded.handlers[method] !== "function") {
       sendError(res, 404, "rpc.method_not_found", "Method is not defined")
       return
     }

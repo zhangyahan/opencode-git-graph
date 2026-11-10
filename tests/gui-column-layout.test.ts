@@ -13,6 +13,7 @@ import {
   type ColumnPreferences,
   type ResolvedColumnLayout,
 } from "../src/gui/column-layout.js"
+import { GRAPH_COLUMN_WIDTH } from "../src/gui/graph-geometry.js"
 
 const PANEL_WIDE = 1100
 const PANEL_NARROW = 520
@@ -56,7 +57,7 @@ function memoryStorage(): ColumnPreferenceStorage & {
 }
 
 describe("default column layout", () => {
-  it("reproduces 152 / 660 / 96 / 118 / 74 at 1100px", () => {
+  it("reproduces 240 / 518 / 150 / 118 / 74 at 1100px", () => {
     const resolved = layout()
     expect(resolved.visible).toEqual([
       "graph",
@@ -66,29 +67,29 @@ describe("default column layout", () => {
       "commit",
     ])
     expect(resolved.widths).toEqual({
-      graph: 152,
-      description: 660,
-      date: 96,
+      graph: 240,
+      description: 518,
+      date: 150,
       author: 118,
       commit: 74,
     })
     expect(resolved.gridTemplate).toBe(
-      "152px minmax(120px, 1fr) 96px 118px 74px",
+      "240px minmax(120px, 1fr) 150px 118px 74px",
     )
     expect(resolved.satisfied).toBe(true)
-    expect(resolved.minimumWidth).toBe(424)
+    expect(resolved.minimumWidth).toBe(480)
     expect(visibleTotal(resolved)).toBe(PANEL_WIDE)
   })
 
-  it("reproduces 152 / 294 / 74 at 520px with date and author hidden", () => {
+  it("reproduces 240 / 206 / 74 at 520px with date and author hidden", () => {
     const resolved = layout(DEFAULT_COLUMN_PREFERENCES, PANEL_NARROW)
     expect(resolved.visible).toEqual(["graph", "description", "commit"])
     expect(resolved.visibility.date).toBe(false)
     expect(resolved.visibility.author).toBe(false)
-    expect(resolved.widths.graph).toBe(152)
-    expect(resolved.widths.description).toBe(294)
+    expect(resolved.widths.graph).toBe(240)
+    expect(resolved.widths.description).toBe(206)
     expect(resolved.widths.commit).toBe(74)
-    expect(resolved.gridTemplate).toBe("152px minmax(120px, 1fr) 74px")
+    expect(resolved.gridTemplate).toBe("240px minmax(120px, 1fr) 74px")
     expect(resolved.satisfied).toBe(true)
     expect(visibleTotal(resolved)).toBe(PANEL_NARROW)
   })
@@ -97,9 +98,10 @@ describe("default column layout", () => {
     const resolved = layout(DEFAULT_COLUMN_PREFERENCES, 640)
     expect(resolved.visibility.date).toBe(true)
     expect(resolved.visibility.author).toBe(false)
-    expect(resolved.widths.description).toBe(318)
+    expect(resolved.widths.date).toBe(150)
+    expect(resolved.widths.description).toBe(176)
     expect(resolved.gridTemplate).toBe(
-      "152px minmax(120px, 1fr) 96px 74px",
+      "240px minmax(120px, 1fr) 150px 74px",
     )
   })
 
@@ -107,9 +109,9 @@ describe("default column layout", () => {
     const resolved = layout(DEFAULT_COLUMN_PREFERENCES, 800)
     expect(resolved.visibility.date).toBe(true)
     expect(resolved.visibility.author).toBe(true)
-    expect(resolved.widths.description).toBe(360)
+    expect(resolved.widths.description).toBe(218)
     expect(resolved.gridTemplate).toBe(
-      "152px minmax(120px, 1fr) 96px 118px 74px",
+      "240px minmax(120px, 1fr) 150px 118px 74px",
     )
   })
 
@@ -126,6 +128,25 @@ describe("default column layout", () => {
   })
 })
 
+describe("application-owned graph column", () => {
+  it("ignores any stored graph width and stays at 240px on a normal panel", () => {
+    for (const stored of [96, 152, 240, 260, 9999]) {
+      const resolved = layout({ ...DEFAULT_COLUMN_PREFERENCES, graph: stored }, PANEL_WIDE)
+      expect(resolved.widths.graph).toBe(GRAPH_COLUMN_WIDTH)
+      expect(resolved.gridTemplate.startsWith(`${GRAPH_COLUMN_WIDTH}px `)).toBe(true)
+    }
+  })
+
+  it("shrinks passively only when the panel budget requires it", () => {
+    expect(layout(DEFAULT_COLUMN_PREFERENCES, 434).widths.graph).toBe(240)
+    expect(layout(DEFAULT_COLUMN_PREFERENCES, 400).widths.graph).toBe(206)
+    expect(layout(DEFAULT_COLUMN_PREFERENCES, 314).widths.graph).toBe(120)
+    expect(layout(DEFAULT_COLUMN_PREFERENCES, 290).widths.graph).toBe(96)
+    expect(layout(DEFAULT_COLUMN_PREFERENCES, 272).widths.graph).toBe(96)
+    expect(layout(DEFAULT_COLUMN_PREFERENCES, 250).widths.graph).toBe(96)
+  })
+})
+
 describe("shared grid template", () => {
   it("returns one template derived from the resolved columns", () => {
     for (const width of [520, 640, 800, 1100]) {
@@ -139,24 +160,19 @@ describe("shared grid template", () => {
   })
 })
 
-describe("dragging every column", () => {
-  it("graph grows and description compensates", () => {
+describe("dragging editable columns", () => {
+  it("does not resize the graph column", () => {
     const prefs = resizeColumnPreferences(
       DEFAULT_COLUMN_PREFERENCES,
       "graph",
       100,
       PANEL_WIDE,
     )
-    expect(prefs.graph).toBe(252)
-    expect(prefs.description).toBe(560)
-
+    expect(prefs.graph).toBe(GRAPH_COLUMN_WIDTH)
+    expect(prefs.description).toBe(DEFAULT_COLUMN_PREFERENCES.description)
     const resolved = layout(prefs)
-    expect(resolved.widths.graph).toBe(252)
-    expect(resolved.widths.description).toBe(560)
-    expect(resolved.widths.date).toBe(96)
-    expect(resolved.widths.author).toBe(118)
-    expect(resolved.widths.commit).toBe(74)
-    expect(visibleTotal(resolved)).toBe(PANEL_WIDE)
+    expect(resolved.widths.graph).toBe(GRAPH_COLUMN_WIDTH)
+    expect(resolved.widths.description).toBe(518)
   })
 
   it("date grows and description compensates", () => {
@@ -166,11 +182,11 @@ describe("dragging every column", () => {
       20,
       PANEL_WIDE,
     )
-    expect(prefs.date).toBe(116)
-    expect(prefs.description).toBe(640)
+    expect(prefs.date).toBe(170)
+    expect(prefs.description).toBe(498)
     const resolved = layout(prefs)
-    expect(resolved.widths.date).toBe(116)
-    expect(resolved.widths.description).toBe(640)
+    expect(resolved.widths.date).toBe(170)
+    expect(resolved.widths.description).toBe(498)
     expect(visibleTotal(resolved)).toBe(PANEL_WIDE)
   })
 
@@ -182,10 +198,10 @@ describe("dragging every column", () => {
       PANEL_WIDE,
     )
     expect(prefs.author).toBe(138)
-    expect(prefs.description).toBe(640)
+    expect(prefs.description).toBe(498)
     const resolved = layout(prefs)
     expect(resolved.widths.author).toBe(138)
-    expect(resolved.widths.description).toBe(640)
+    expect(resolved.widths.description).toBe(498)
     expect(visibleTotal(resolved)).toBe(PANEL_WIDE)
   })
 
@@ -197,10 +213,10 @@ describe("dragging every column", () => {
       PANEL_WIDE,
     )
     expect(prefs.commit).toBe(94)
-    expect(prefs.description).toBe(640)
+    expect(prefs.description).toBe(498)
     const resolved = layout(prefs)
     expect(resolved.widths.commit).toBe(94)
-    expect(resolved.widths.description).toBe(640)
+    expect(resolved.widths.description).toBe(498)
     expect(visibleTotal(resolved)).toBe(PANEL_WIDE)
   })
 
@@ -211,11 +227,11 @@ describe("dragging every column", () => {
       20,
       PANEL_WIDE,
     )
-    expect(prefs.date).toBe(76)
-    expect(prefs.description).toBe(680)
+    expect(prefs.date).toBe(130)
+    expect(prefs.description).toBe(538)
     const resolved = layout(prefs)
-    expect(resolved.widths.description).toBe(680)
-    expect(resolved.widths.date).toBe(76)
+    expect(resolved.widths.description).toBe(538)
+    expect(resolved.widths.date).toBe(130)
     expect(visibleTotal(resolved)).toBe(PANEL_WIDE)
   })
 
@@ -227,11 +243,11 @@ describe("dragging every column", () => {
       PANEL_NARROW,
     )
     expect(prefs.commit).toBe(56) // clamped to the 56px minimum
-    expect(prefs.date).toBe(96) // untouched, date is hidden
-    expect(prefs.description).toBe(312)
+    expect(prefs.date).toBe(150) // untouched, date is hidden
+    expect(prefs.description).toBe(224)
     const resolved = layout(prefs, PANEL_NARROW)
     expect(resolved.visible).not.toContain("date")
-    expect(resolved.widths.description).toBe(312)
+    expect(resolved.widths.description).toBe(224)
     expect(visibleTotal(resolved)).toBe(PANEL_NARROW)
   })
 
@@ -242,23 +258,15 @@ describe("dragging every column", () => {
       -40,
       PANEL_WIDE,
     )
-    expect(prefs.date).toBe(136)
-    expect(prefs.description).toBe(620)
-    expect(layout(prefs).widths.description).toBe(620)
+    expect(prefs.date).toBe(190)
+    expect(prefs.description).toBe(478)
+    expect(layout(prefs).widths.description).toBe(478)
   })
 
-  it("clamps graph to its 260px maximum without overflowing", () => {
-    const prefs = resizeColumnPreferences(
-      DEFAULT_COLUMN_PREFERENCES,
-      "graph",
-      1000,
-      PANEL_WIDE,
-    )
-    expect(prefs.graph).toBe(260)
-    const resolved = layout(prefs)
-    expect(resolved.widths.graph).toBe(260)
-    expect(resolved.widths.description).toBe(552)
-    expect(visibleTotal(resolved)).toBe(PANEL_WIDE)
+  it("keeps date at its 128px minimum and commit at 56px", () => {
+    expect(COLUMN_MIN_WIDTHS.date).toBe(128)
+    expect(COLUMN_MIN_WIDTHS.commit).toBe(56)
+    expect(COLUMN_MIN_WIDTHS.graph).toBe(96)
   })
 })
 
@@ -287,18 +295,17 @@ describe("resize on narrow panels", () => {
     }
   })
 
-  it("preserves a growing commit by driving description to its minimum", () => {
+  it("preserves a growing commit by driving graph and description to their minimums", () => {
     const prefs = resizeColumnPreferences(
       DEFAULT_COLUMN_PREFERENCES,
       "commit",
       1000,
       PANEL_NARROW,
     )
-    // The stored width is the user's new preference; the effective width is
-    // what fits on this panel (graph 152 + commit 248 + description 120).
     expect(prefs.commit).toBe(304)
     const resolved = layout(prefs, PANEL_NARROW)
-    expect(resolved.widths.commit).toBe(248)
+    expect(resolved.widths.commit).toBe(200)
+    expect(resolved.widths.graph).toBe(200)
     expect(resolved.widths.description).toBe(120)
     expect(visibleTotal(resolved)).toBe(PANEL_NARROW)
   })
@@ -338,7 +345,8 @@ describe("wide → narrow → wide budget restoration", () => {
       PANEL_WIDE,
     )
     expect(wide.commit).toBe(500)
-    expect(wide.description).toBe(234)
+    expect(wide.description).toBe(210)
+    expect(wide.author).toBe(118)
     expect(writeColumnPreferences(wide, storage)).toBe(true)
 
     const saved = readColumnPreferences(storage)
@@ -346,33 +354,33 @@ describe("wide → narrow → wide budget restoration", () => {
 
     const wideLayout = layout(saved, PANEL_WIDE)
     expect(wideLayout.visibility.date).toBe(true)
-    expect(wideLayout.visibility.author).toBe(true)
+    expect(wideLayout.visibility.author).toBe(false)
     expect(wideLayout.widths.commit).toBe(500)
-    expect(wideLayout.widths.description).toBe(234)
+    expect(wideLayout.widths.description).toBe(210)
     expect(visibleTotal(wideLayout)).toBe(PANEL_WIDE)
 
     // The stored commit width is impossible at 520. Date/author are already
-    // hidden; the fixed columns must shrink so the panel never overflows.
+    // hidden; graph and commit share the remaining budget.
     const narrow = layout(saved, PANEL_NARROW)
     expect(narrow.visibility.date).toBe(false)
     expect(narrow.visibility.author).toBe(false)
     expect(narrow.satisfied).toBe(true)
-    expect(narrow.widths.graph).toBe(152)
-    expect(narrow.widths.commit).toBe(248)
+    expect(narrow.widths.graph).toBe(200)
+    expect(narrow.widths.commit).toBe(200)
     expect(narrow.widths.description).toBe(120)
     expect(visibleTotal(narrow)).toBe(PANEL_NARROW)
-    expect(narrow.gridTemplate).toBe("152px minmax(120px, 1fr) 248px")
+    expect(narrow.gridTemplate).toBe("200px minmax(120px, 1fr) 200px")
 
     // Widening again must use the untouched stored preference, not the
-    // effective 248px from the narrow pass.
+    // effective widths from the narrow pass.
     const restored = layout(saved, PANEL_WIDE)
     expect(restored.widths.commit).toBe(500)
-    expect(restored.widths.description).toBe(234)
+    expect(restored.widths.description).toBe(210)
     expect(restored.gridTemplate).toBe(wideLayout.gridTemplate)
     expect(saved.commit).toBe(500)
   })
 
-  it("handles huge finite date/author/commit values and an oversized graph", () => {
+  it("handles huge finite date/author/commit values and an application-owned graph", () => {
     const huge: ColumnPreferences = {
       graph: 9999,
       description: 9999,
@@ -381,7 +389,7 @@ describe("wide → narrow → wide budget restoration", () => {
       commit: 5000,
     }
     const normalized = normalizeColumnPreferences(huge)
-    expect(normalized.graph).toBe(260)
+    expect(normalized.graph).toBe(240)
     expect(normalized.date).toBe(5000)
     expect(normalized.author).toBe(5000)
     expect(normalized.commit).toBe(5000)
@@ -391,27 +399,23 @@ describe("wide → narrow → wide budget restoration", () => {
     expect(wide.visibility.date).toBe(false)
     expect(wide.visibility.author).toBe(false)
     expect(visibleTotal(wide)).toBe(PANEL_WIDE)
-    expect(wide.widths.graph).toBe(260)
-    expect(wide.widths.description).toBeGreaterThanOrEqual(120)
+    expect(wide.widths.graph).toBe(240)
+    expect(wide.widths.commit).toBe(740)
+    expect(wide.widths.description).toBe(120)
     expect(wide.gridTemplate.startsWith(`${wide.widths.graph}px `)).toBe(true)
 
     const narrow = layout(normalized, PANEL_NARROW)
     expect(narrow.satisfied).toBe(true)
     expect(visibleTotal(narrow)).toBe(PANEL_NARROW)
     expect(narrow.widths.description).toBe(120)
-    expect(narrow.widths.graph).toBeGreaterThanOrEqual(
-      COLUMN_MIN_WIDTHS.graph,
-    )
-    expect(narrow.widths.graph).toBeLessThanOrEqual(260)
-    expect(narrow.widths.commit).toBeGreaterThanOrEqual(
-      COLUMN_MIN_WIDTHS.commit,
-    )
+    expect(narrow.widths.graph).toBe(200)
+    expect(narrow.widths.commit).toBe(200)
     expect(narrow.gridTemplate.startsWith(`${narrow.widths.graph}px `)).toBe(
       true,
     )
   })
 
-  it("drags from effective widths while preserving other stored preferences", () => {
+  it("ignores graph drags while preserving other stored preferences", () => {
     const stored: ColumnPreferences = {
       ...DEFAULT_COLUMN_PREFERENCES,
       graph: 260,
@@ -422,13 +426,12 @@ describe("wide → narrow → wide budget restoration", () => {
     expect(before.widths.commit).toBe(200)
 
     const next = resizeColumnPreferences(stored, "graph", -10, PANEL_NARROW)
-    // Effective 200 - 10, not stored 260 - 10.
-    expect(next.graph).toBe(190)
+    expect(next.graph).toBe(240)
     expect(next.commit).toBe(500)
 
     const after = layout(next, PANEL_NARROW)
-    expect(after.widths.graph).toBe(190)
-    expect(after.widths.commit).toBe(210)
+    expect(after.widths.graph).toBe(200)
+    expect(after.widths.commit).toBe(200)
     expect(visibleTotal(after)).toBe(PANEL_NARROW)
   })
 
@@ -437,7 +440,7 @@ describe("wide → narrow → wide budget restoration", () => {
       getItem: () =>
         '{"graph":1e300,"date":1e300,"author":1e300,"commit":1e300}',
     })
-    expect(stored.graph).toBe(260)
+    expect(stored.graph).toBe(240)
     expect(stored.commit).toBe(1e300)
 
     const narrow = layout(stored, PANEL_NARROW)
@@ -458,7 +461,8 @@ describe("wide → narrow → wide budget restoration", () => {
 
     expect(
       readColumnPreferences({
-        getItem: () => '{"graph":null,"date":null,"author":null,"commit":null,"description":null}',
+        getItem: () =>
+          '{"graph":null,"date":null,"author":null,"commit":null,"description":null}',
       }),
     ).toEqual(DEFAULT_COLUMN_PREFERENCES)
 
@@ -474,9 +478,9 @@ describe("persisted preferences", () => {
   it("round-trips valid preferences through injected storage", () => {
     const storage = memoryStorage()
     const preferences: ColumnPreferences = {
-      graph: 200,
+      graph: 240,
       description: 500,
-      date: 100,
+      date: 150,
       author: 90,
       commit: 60,
     }
@@ -503,12 +507,12 @@ describe("persisted preferences", () => {
     )
   })
 
-  it("clamps finite but out-of-range persisted widths", () => {
+  it("forces the graph width and clamps finite out-of-range persisted widths", () => {
     expect(
       readColumnPreferences({ getItem: () => '{"graph":10}' }),
     ).toEqual({
       ...DEFAULT_COLUMN_PREFERENCES,
-      graph: 96,
+      graph: 240,
     })
 
     expect(
@@ -517,9 +521,9 @@ describe("persisted preferences", () => {
           '{"graph":9999,"date":50,"author":60,"commit":40,"description":10}',
       }),
     ).toEqual({
-      graph: 260,
+      graph: 240,
       description: 120,
-      date: 72,
+      date: 128,
       author: 80,
       commit: 56,
     })
@@ -560,7 +564,7 @@ describe("immutability", () => {
     expect(original).toEqual(DEFAULT_COLUMN_PREFERENCES)
 
     const resolved = resolveColumnLayout(PANEL_WIDE, original)
-    expect(resolved.widths.description).toBe(660)
+    expect(resolved.widths.description).toBe(518)
     expect(original).toEqual(DEFAULT_COLUMN_PREFERENCES)
   })
 

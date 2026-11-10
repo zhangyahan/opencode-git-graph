@@ -287,3 +287,350 @@ describe("getLog", () => {
     }
   })
 })
+
+/**
+ * Build a repository where some commits are reachable only through a tag or
+ * only through a remote-tracking ref:
+ *
+ *   base <- tag-only (annotated tag v1.0)      -> deleted local branch
+ *   base <- remote-only                        -> refs/remotes/origin/remote-only
+ *   base <- main tip
+ */
+function buildRefKindsHistory(repo: TmpRepo): {
+  base: string
+  tagCommit: string
+  remoteCommit: string
+  tip: string
+} {
+  const base = commit(repo.dir, { "a.txt": "1\n" }, "base")
+
+  repo.git(["checkout", "-b", "tag-only"])
+  const tagCommit = commit(repo.dir, { "tag.txt": "t\n" }, "tag only")
+  repo.git(["tag", "-a", "v1.0", "-m", "release"])
+  repo.git(["checkout", "main"])
+  repo.git(["branch", "-D", "tag-only"])
+
+  repo.git(["checkout", "-b", "remote-only"])
+  const remoteCommit = commit(repo.dir, { "remote.txt": "r\n" }, "remote only")
+  repo.git(["update-ref", "refs/remotes/origin/remote-only", remoteCommit])
+  repo.git(["checkout", "main"])
+  repo.git(["branch", "-D", "remote-only"])
+
+  const tip = commit(repo.dir, { "a.txt": "2\n" }, "main tip")
+  return { base, tagCommit, remoteCommit, tip }
+}
+
+describe("getLog ref filtering", () => {
+  it("honours showRemotes and showTags in All mode", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const { base, tagCommit, remoteCommit, tip } = buildRefKindsHistory(repo)
+      const hashes = async (options: Parameters<typeof getLog>[1]) =>
+        new Set((await getLog(repo.dir, { limit: 100, ...options })).commits.map((entry) => entry.hash))
+
+      const all = await hashes({})
+      expect(all).toEqual(new Set([base, tagCommit, remoteCommit, tip]))
+
+      const noRemotes = await hashes({ showRemotes: false })
+      expect(noRemotes).toEqual(new Set([base, tagCommit, tip]))
+      expect(noRemotes.has(remoteCommit)).toBe(false)
+
+      const noTags = await hashes({ showTags: false })
+      expect(noTags).toEqual(new Set([base, remoteCommit, tip]))
+      expect(noTags.has(tagCommit)).toBe(false)
+
+      const branchesOnly = await hashes({ showRemotes: false, showTags: false })
+      expect(branchesOnly).toEqual(new Set([base, tip]))
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("walks only explicitly selected local, remote and tag refs", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const { base, tagCommit, remoteCommit, tip } = buildRefKindsHistory(repo)
+
+      const onlyMain = await getLog(repo.dir, { refs: ["refs/heads/main"], limit: 100 })
+      expect(onlyMain.commits.map((entry) => entry.hash)).toEqual([tip, base])
+
+      const onlyRemote = await getLog(repo.dir, {
+        refs: ["refs/remotes/origin/remote-only"],
+        limit: 100,
+      })
+      expect(onlyRemote.commits.map((entry) => entry.hash)).toEqual([remoteCommit, base])
+
+      // Annotated tags are peeled to the commit they point at.
+      const onlyTag = await getLog(repo.dir, { refs: ["refs/tags/v1.0"], limit: 100 })
+      expect(onlyTag.commits.map((entry) => entry.hash)).toEqual([tagCommit, base])
+
+      const multi = await getLog(repo.dir, {
+        refs: ["refs/heads/main", "refs/remotes/origin/remote-only"],
+        limit: 100,
+      })
+      expect(new Set(multi.commits.map((entry) => entry.hash))).toEqual(
+        new Set([tip, remoteCommit, base]),
+      )
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("lets explicit refs win over showRemotes/showTags", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const { base, remoteCommit } = buildRefKindsHistory(repo)
+
+      const result = await getLog(repo.dir, {
+        refs: ["refs/remotes/origin/remote-only"],
+        showRemotes: false,
+        showTags: false,
+        limit: 100,
+      })
+      expect(result.commits.map((entry) => entry.hash)).toEqual([remoteCommit, base])
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("accepts a symbolic remote HEAD when selected", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const { base, remoteCommit } = buildRefKindsHistory(repo)
+      repo.git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/remote-only"])
+
+      const result = await getLog(repo.dir, {
+        refs: ["refs/remotes/origin/HEAD"],
+        limit: 100,
+      })
+      expect(result.commits.map((entry) => entry.hash)).toEqual([remoteCommit, base])
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("treats an empty refs array as All", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const { base, tagCommit, remoteCommit, tip } = buildRefKindsHistory(repo)
+      const result = await getLog(repo.dir, { refs: [], limit: 100 })
+      expect(new Set(result.commits.map((entry) => entry.hash))).toEqual(
+        new Set([base, tagCommit, remoteCommit, tip]),
+      )
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("rejects unknown, glob, revision-expression and option-like refs", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const hash = commit(repo.dir, { "a.txt": "one\n" }, "base")
+      repo.git(["tag", "v1.0"])
+      const marker = join(repo.dir, "created-by-ref-attack.txt")
+
+      const invalid = [
+        "--all",
+        `--output=${marker}`,
+        "HEAD",
+        "main",
+        "refs/heads/main~1",
+        "refs/heads/main^",
+        "refs/heads/*",
+        "refs/tags/v1.0^{commit}",
+        "refs/heads/../evil",
+        "refs/heads/",
+        "refs/notes/commits",
+        "refs/heads/main\0evil",
+        "refs/heads/main.lock",
+      ]
+      for (const ref of invalid) {
+        await expect(getLog(repo.dir, { refs: [ref], limit: 10 })).rejects.toThrow(
+          /Invalid log ref|Unknown log ref/,
+        )
+        await expect(getLog(repo.dir, { refs: [hash, ref], limit: 10 })).rejects.toThrow(
+          /Invalid log ref|Unknown log ref/,
+        )
+      }
+
+      await expect(
+        getLog(repo.dir, { refs: ["refs/heads/does-not-exist"], limit: 10 }),
+      ).rejects.toThrow(/Unknown log ref/)
+      await expect(getLog(repo.dir, { refs: "refs/heads/main" as never })).rejects.toThrow(
+        /Invalid log refs/,
+      )
+      await expect(
+        getLog(repo.dir, {
+          refs: Array.from({ length: 33 }, () => "refs/heads/main"),
+          limit: 10,
+        }),
+      ).rejects.toThrow(/at most 32 refs/)
+
+      expect(existsSync(marker)).toBe(false)
+      await expect(getLog(repo.dir, { refs: ["refs/heads/"], limit: 10 })).rejects.toThrow()
+      expect(existsSync(marker)).toBe(false)
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("rejects invalid boolean and order options", async () => {
+    const repo = mkTmpRepo()
+    try {
+      commit(repo.dir, { "a.txt": "one\n" }, "base")
+      await expect(getLog(repo.dir, { showRemotes: "yes" as never })).rejects.toThrow(
+        /Invalid log showRemotes/,
+      )
+      await expect(getLog(repo.dir, { showTags: 1 as never })).rejects.toThrow(
+        /Invalid log showTags/,
+      )
+      await expect(getLog(repo.dir, { firstParent: "no" as never })).rejects.toThrow(
+        /Invalid log firstParent/,
+      )
+      await expect(getLog(repo.dir, { order: "topological" as never })).rejects.toThrow(
+        /Invalid log order/,
+      )
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("follows only first parents when firstParent is set", async () => {
+    const repo = mkTmpRepo()
+    try {
+      buildMergeHistory(repo)
+
+      const full = await getLog(repo.dir, { limit: 100 })
+      const byHash = new Map(full.commits.map((entry) => [entry.hash, entry]))
+      const expected: string[] = []
+      let cursor = full.commits.find((entry) => entry.subject === "merge side")
+      while (cursor) {
+        expected.push(cursor.hash)
+        cursor = cursor.parents[0] ? byHash.get(cursor.parents[0]) : undefined
+      }
+
+      // `--first-parent` limits the walk from each start point, so select the
+      // mainline ref explicitly: with `--all` every side-branch tip is a start.
+      const firstParent = await getLog(repo.dir, {
+        limit: 100,
+        firstParent: true,
+        refs: ["refs/heads/main"],
+      })
+      expect(firstParent.commits.map((entry) => entry.hash)).toEqual(expected)
+      expect(firstParent.commits.map((entry) => entry.subject)).toEqual([
+        "merge side",
+        "main4",
+        "main3",
+        "main2",
+        "main1",
+        "base",
+      ])
+
+      // Side-branch commits are only reachable through second parents.
+      expect(firstParent.commits.map((entry) => entry.subject)).not.toContain("side4")
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("switches between date and topo order", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const newestFirst = buildMergeHistory(repo)
+
+      const date = await getLog(repo.dir, { limit: 100, order: "date" })
+      const topo = await getLog(repo.dir, { limit: 100, order: "topo" })
+
+      expect(date.commits.map((entry) => entry.hash)).toEqual(newestFirst)
+      expect(new Set(topo.commits.map((entry) => entry.hash))).toEqual(new Set(newestFirst))
+      expect(topo.commits.map((entry) => entry.hash)).not.toEqual(
+        date.commits.map((entry) => entry.hash),
+      )
+
+      // Topo order must still emit every parent after its children.
+      const rowOf = new Map(topo.commits.map((entry, index) => [entry.hash, index]))
+      for (let index = 0; index < topo.commits.length; index += 1) {
+        for (const parent of topo.commits[index].parents) {
+          const parentRow = rowOf.get(parent)
+          if (parentRow !== undefined) expect(parentRow).toBeGreaterThan(index)
+        }
+      }
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("keeps 100+100 pagination identical to a larger request", async () => {
+    const repo = mkTmpRepo()
+    try {
+      commit(repo.dir, { "a.txt": "base\n" }, "base")
+      for (let index = 0; index < 204; index++) {
+        repo.git(["commit", "--allow-empty", "-m", `empty ${index}`])
+      }
+
+      const full = await getLog(repo.dir, { limit: 1000 })
+      expect(full.commits).toHaveLength(205)
+      expect(full.hasMore).toBe(false)
+
+      const page1 = await getLog(repo.dir, { limit: 100, skip: 0 })
+      const page2 = await getLog(repo.dir, { limit: 100, skip: 100 })
+
+      expect([...page1.commits, ...page2.commits]).toEqual(full.commits.slice(0, 200))
+      expect(page1.hasMore).toBe(true)
+      expect(page2.hasMore).toBe(true)
+    } finally {
+      repo.cleanup()
+    }
+  }, 60_000)
+
+  it("preserves a detached HEAD when show flags narrow All mode", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const hash = commit(repo.dir, { "a.txt": "one\n" }, "only")
+      repo.git(["checkout", "--detach", hash])
+      repo.git(["branch", "-D", "main"])
+
+      const result = await getLog(repo.dir, { showRemotes: false, showTags: false })
+      expect(result.commits.map((entry) => entry.hash)).toEqual([hash])
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("keeps branch history when HEAD is unborn", async () => {
+    const repo = mkTmpRepo()
+    try {
+      repo.git(["checkout", "--orphan", "other"])
+      const hash = commit(repo.dir, { "other.txt": "one\n" }, "other")
+      // Point HEAD at an unborn main: --all would still see refs/heads/other.
+      repo.git(["symbolic-ref", "HEAD", "refs/heads/main"])
+
+      const result = await getLog(repo.dir, { showRemotes: false, showTags: false })
+      expect(result.commits.map((entry) => entry.hash)).toEqual([hash])
+
+      const defaulted = await getLog(repo.dir)
+      expect(defaulted.commits.map((entry) => entry.hash)).toEqual([hash])
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("returns an empty page for an empty repository with any show flags", async () => {
+    const repo = mkTmpRepo()
+    try {
+      await expect(
+        getLog(repo.dir, { showRemotes: false, showTags: false }),
+      ).resolves.toEqual({ commits: [], hasMore: false })
+      await expect(getLog(repo.dir, { showRemotes: false, showTags: true })).resolves.toEqual({
+        commits: [],
+        hasMore: false,
+      })
+      await expect(getLog(repo.dir, { refs: [], showRemotes: true, showTags: false })).resolves.toEqual({
+        commits: [],
+        hasMore: false,
+      })
+    } finally {
+      repo.cleanup()
+    }
+  })
+})

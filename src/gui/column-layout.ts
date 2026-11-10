@@ -24,8 +24,8 @@
 
 import {
   DEFAULT_GRAPH_COLUMN_WIDTH,
-  GRAPH_COLUMN_MAX_WIDTH,
   GRAPH_COLUMN_MIN_WIDTH,
+  GRAPH_COLUMN_WIDTH,
 } from "./graph-geometry.js"
 import { historyColumns } from "./history-columns.js"
 
@@ -39,11 +39,11 @@ export const COLUMN_IDS = [
 
 export type ColumnId = (typeof COLUMN_IDS)[number]
 
-/** Hard lower bounds for every column. Graph has a separate upper bound. */
+/** Hard lower bounds for every column. The graph has an application-owned width. */
 export const COLUMN_MIN_WIDTHS: Readonly<Record<ColumnId, number>> = Object.freeze({
   graph: GRAPH_COLUMN_MIN_WIDTH,
   description: 120,
-  date: 72,
+  date: 128,
   author: 80,
   commit: 56,
 })
@@ -57,11 +57,11 @@ export interface ColumnPreferences {
   readonly commit: number
 }
 
-/** Defaults reproduce the 1100px layout: 152 / 660 / 96 / 118 / 74. */
+/** Defaults: graph owned by the app, date wide enough for 19 characters. */
 export const DEFAULT_COLUMN_PREFERENCES: ColumnPreferences = Object.freeze({
   graph: DEFAULT_GRAPH_COLUMN_WIDTH,
   description: 660,
-  date: 96,
+  date: 150,
   author: 118,
   commit: 74,
 })
@@ -185,11 +185,9 @@ function shrinkFixedWidths(
 export function normalizeColumnPreferences(value: unknown): ColumnPreferences {
   const source = isRecord(value) ? value : {}
   return {
-    graph: clampWidth(
-      validWidth(source.graph, DEFAULT_COLUMN_PREFERENCES.graph),
-      GRAPH_COLUMN_MIN_WIDTH,
-      GRAPH_COLUMN_MAX_WIDTH,
-    ),
+    // The graph column is fixed by the application. Any older stored graph
+    // width is deliberately discarded so it cannot resize or scroll the graph.
+    graph: GRAPH_COLUMN_WIDTH,
     description: clampWidth(
       validWidth(source.description, DEFAULT_COLUMN_PREFERENCES.description),
       COLUMN_MIN_WIDTHS.description,
@@ -357,13 +355,19 @@ export function resizeColumnPreferences(
 
   const layout = resolveColumnLayout(width, base)
   const next: Record<ColumnId, number> = {
-    graph: base.graph,
+    graph: GRAPH_COLUMN_WIDTH,
     description: base.description,
     date: base.date,
     author: base.author,
     commit: base.commit,
   }
   const descriptionMinimum = COLUMN_MIN_WIDTHS.description
+
+  if (column === "graph") {
+    // The graph column is application-owned: dragging its edge is not
+    // supported, so its stored width (and any old saved value) stays fixed.
+    return { ...next }
+  }
 
   if (column === "description") {
     const neighbour: ColumnId = layout.visibility.date ? "date" : "commit"
@@ -384,8 +388,7 @@ export function resizeColumnPreferences(
     next[neighbour] = Math.round(nextNeighbour)
   } else {
     const minimum = COLUMN_MIN_WIDTHS[column]
-    const maximum =
-      column === "graph" ? GRAPH_COLUMN_MAX_WIDTH : Number.POSITIVE_INFINITY
+    const maximum = Number.POSITIVE_INFINITY
     const current = layout.widths[column]
     const visible = layout.visibility[column]
 

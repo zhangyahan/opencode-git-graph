@@ -1,12 +1,18 @@
-import { HARNESS_METHOD_SET, RPC_PATH_PREFIX, type HarnessMethod } from "./protocol.js"
+import {
+  HARNESS_METHOD_SET,
+  RPC_PATH_PREFIX,
+  methodsForMode,
+  type HarnessMethod,
+  type UiMode,
+} from "./protocol.js"
 
 /**
  * Browser-side RPC client for the dev harness.
  *
- * It intentionally mirrors the one method the production panel uses
- * (`client.rpc(definition)`) and nothing else. Every call goes through the
- * same-origin bridge, validates the response envelope, and throws a typed
- * `GitGraphRpcError` for non-2xx or typed-error replies.
+ * It mirrors the production panel contract (`client.rpc(definition)`) and
+ * exposes only the methods allowed by the mode injected at build time. FR mode
+ * never exposes mutation methods in the browser, even though the bridge also
+ * rejects them server-side.
  */
 
 export class GitGraphRpcError extends Error {
@@ -72,16 +78,19 @@ async function call(
 
 /**
  * The minimal client shape the production panel reads from
- * `session.server.client`. Unknown methods are not exposed.
+ * `session.server.client`. Unknown or disallowed methods are not exposed.
  */
-export function createHarnessClient() {
+export function createHarnessClient(mode: UiMode = "fr") {
+  const allowed = methodsForMode(mode)
   return {
     rpc(_definition: unknown) {
       return new Proxy(
         {},
         {
           get(_target, property) {
-            if (typeof property !== "string" || !isMethod(property)) return undefined
+            if (typeof property !== "string" || !isMethod(property) || !allowed.has(property)) {
+              return undefined
+            }
             return (input: unknown, options?: HarnessRpcOptions) =>
               call(property, input, options)
           },

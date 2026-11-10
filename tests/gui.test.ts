@@ -416,4 +416,19 @@ describe("SelectionGeneration", () => {
     expect(generation.isCurrent(refreshSnapshot)).toBe(false)
     expect(generation.isCurrent(selectionB)).toBe(true)
   })
+
+  it("lets only the latest request own a shared loading flag", () => {
+    const generation = new SelectionGeneration()
+    let loading = true
+
+    // Two loads start; the older one settles first and must not clear loading
+    // that now belongs to the successor.
+    const older = generation.bump()
+    const newer = generation.bump()
+    if (generation.isCurrent(older)) loading = false
+    expect(loading).toBe(true)
+
+    if (generation.isCurrent(newer)) loading = false
+    expect(loading).toBe(false)
+  })
 })

@@ -6,14 +6,17 @@ import { FR_ROOT } from "./protocol"
 import { createHarnessClient } from "./rpc-client"
 
 const WIDTHS = [520, 1100] as const
-const FIXED_DIRECTORY = FR_ROOT
+const MODE = __GG_UI_MODE__
+const FIXED_DIRECTORY = __GG_UI_DIRECTORY__ || FR_ROOT
+const MODE_LABEL = MODE === "mutation-fixture" ? "TEMP WRITE TEST FIXTURE" : "FR READONLY"
+const MODE_CLASS = MODE === "mutation-fixture" ? "harness-badge-write" : "harness-badge-readonly"
 
 const TAB: PanelTab = { id: "main", title: "Git Graph" }
 
 function App() {
   const [width, setWidth] = createSignal<(typeof WIDTHS)[number]>(520)
   const [directory] = createSignal(FIXED_DIRECTORY)
-  const client = createHarnessClient()
+  const client = createHarnessClient(MODE)
 
   /*
    * Minimal host stand-ins.
@@ -55,7 +58,7 @@ function App() {
               return "dev-harness"
             },
             get url() {
-              return "http://127.0.0.1:5178"
+              return `http://127.0.0.1:${__GG_UI_PORT__}`
             },
             get client() {
               return client
@@ -70,14 +73,23 @@ function App() {
   } as unknown as PanelProps
 
   return (
-    <div class="harness">
+    <div class="harness" data-mode={MODE}>
       <header class="harness-toolbar" data-testid="harness-toolbar">
         <span class="harness-title">Git Graph dev harness</span>
         <span class="harness-root" data-testid="harness-root" title={FIXED_DIRECTORY}>
           {FIXED_DIRECTORY}
         </span>
-        <span class="harness-badge" data-testid="harness-readonly">
-          read-only
+        <span
+          class={`harness-badge ${MODE_CLASS}`}
+          data-testid="harness-mode"
+          data-mode={MODE}
+          title={
+            MODE === "mutation-fixture"
+              ? "Real checkout/create/tag/rename/delete against throwaway TEMP repositories"
+              : "Real FR repositories, read-only RPC allowlist"
+          }
+        >
+          {MODE_LABEL}
         </span>
         <span class="harness-spacer" />
         <span class="harness-label">Panel width</span>

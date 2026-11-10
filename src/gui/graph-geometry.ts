@@ -20,13 +20,20 @@ export interface GraphLine {
   readonly colour: number
 }
 
-/** Default lane step. Git Graph keeps tracks readable instead of shrinking them. */
+/** Preferred lane step. Common histories (up to 15 lanes) keep this spacing. */
 export const DEFAULT_LANE_SPACING = 14
 /** Horizontal padding on each side of the lane field. */
 export const DEFAULT_LANE_PADDING = 8
+/**
+ * The graph column is owned by the application, not the user: it stays at
+ * `GRAPH_COLUMN_WIDTH` and only shrinks passively when the panel is too narrow
+ * to keep the description readable.
+ */
+export const GRAPH_COLUMN_WIDTH = 240
 export const GRAPH_COLUMN_MIN_WIDTH = 96
-export const GRAPH_COLUMN_MAX_WIDTH = 260
-export const DEFAULT_GRAPH_COLUMN_WIDTH = 152
+/** Kept for callers that still validate persisted data; dragging is disabled. */
+export const GRAPH_COLUMN_MAX_WIDTH = GRAPH_COLUMN_WIDTH
+export const DEFAULT_GRAPH_COLUMN_WIDTH = GRAPH_COLUMN_WIDTH
 
 export interface GraphPathOptions {
   readonly laneSpacing: number
@@ -37,6 +44,34 @@ export interface GraphPathOptions {
 /** Centre x for a lane. Lanes are never compressed below the configured step. */
 export function graphLaneX(lane: number, laneSpacing: number, padding: number): number {
   return padding + lane * laneSpacing + laneSpacing / 2
+}
+
+/**
+ * Lane step for a fixed-width graph column.
+ *
+ * The column is never scrolled horizontally, so every lane edge has to fit
+ * inside it. Up to 15 lanes keep the preferred 14px step; beyond that the step
+ * shrinks as `min(14, (graphWidth - 2*padding) / lanes)` and may fall below 2px
+ * (the panel then asks the user to narrow the branch filter rather than hiding
+ * parent edges).
+ */
+export function graphLaneSpacing(
+  graphWidth: number,
+  lanes: number,
+  padding: number = DEFAULT_LANE_PADDING,
+): number {
+  const width = Number.isFinite(graphWidth)
+    ? Math.max(GRAPH_COLUMN_MIN_WIDTH, graphWidth)
+    : GRAPH_COLUMN_WIDTH
+  const laneCount = Number.isFinite(lanes) ? Math.max(1, Math.ceil(lanes)) : 1
+  const edge = Number.isFinite(padding) ? Math.max(0, padding) : DEFAULT_LANE_PADDING
+  const usable = Math.max(0, width - edge * 2)
+  return Math.min(DEFAULT_LANE_SPACING, usable / laneCount)
+}
+
+/** True when the tracks are compressed too far to read comfortably. */
+export function isDenseGraph(laneSpacing: number): boolean {
+  return Number.isFinite(laneSpacing) && laneSpacing < 2
 }
 
 /**

@@ -8,69 +8,138 @@ small loopback HTTP bridge.
 It is dev-only. Nothing under `dev/` is part of the production plugin bundle,
 and the bridge is only created by `dev/vite.config.ts`.
 
-## Start
+The harness has two environment-selected modes. The mode and repository root
+are fixed at server startup; no HTTP request can choose either one.
+
+| mode | default URL | root | write RPC |
+| --- | --- | --- | --- |
+| `fr` (default) | <http://127.0.0.1:5178/> | `D:\Workspace\FR` | never |
+| `mutation-fixture` | <http://127.0.0.1:5179/> | validated child of the approved TEMP subtree | six explicit mutation methods |
+
+## FR read-only mode
 
 From the repository root:
 
-```bash
+```powershell
 npm run dev:ui
 ```
 
 Open <http://127.0.0.1:5178/>.
 
-The server binds `127.0.0.1:5178` with `strictPort`, so a second instance fails
-instead of silently moving to another port. Stop it with `Ctrl+C`; the manager
-is disposed when the HTTP server closes.
-
-## Real data, fixed root
-
 - Repository root is fixed to `D:\Workspace\FR`. The browser cannot choose a
   root, and RPC input cannot contain `repoPath`.
-- The repository allowlist comes from the production discovery flow, exactly
-  like the plugin. The expected fixture has **16 repositories / 4 worktrees**.
-- Primary manual checks:
-  - `sai-qx-api` — about **395 refs** (394 observed at verification time),
-    exercising the ref pill/overflow UI.
-  - `qx-api` — 1 unstaged working-tree change (848 commits in the current
-    fixture) for changes/diff views.
-- No comment, commit subject, diff or repository data is mocked. If the bridge
-  cannot reach `D:\Workspace\FR`, the panel shows its normal loading/error
-  states.
+- Only `ping`, `listRepositories`, `getStatus`, `getLog`, `getRefs`,
+  `getCommitFiles`, `getDiff`, `getComparisonFiles` and `getComparisonDiff`
+  are exposed.
+- `checkoutBranch`, `createBranch`, `createTag`, `renameBranch`,
+  `deleteBranch` and `deleteTag` are rejected with HTTP 403 even if the
+  production RPC later defines them.
+- The expected fixture has **16 repositories / 4 worktrees**.
+- Primary manual checks: `sai-qx-api` for the large ref set, `qx-api` for a
+  working-tree change.
+- No comment, commit subject, diff or repository data is mocked. FR is only
+  read, never written.
 
-## Read-only boundary
+## Mutation fixture mode (TEMP write tests)
 
-The harness uses the existing safe repository manager and only calls:
+This mode is for real checkout/create-branch/create-tag/rename/delete tests.
+It uses two throwaway repositories created by a script, never FR or any
+user-provided path.
 
-`ping`, `listRepositories`, `getStatus`, `getLog`, `getRefs`,
-`getCommitFiles`, `getDiff`.
+### 1. Create a fixture
 
-There are no write routes. The git engine is the production read-only engine:
-arguments are passed as arrays, `GIT_OPTIONAL_LOCKS=0` for read commands,
-external diff/textconv/filter execution is disabled, and commit hashes /
-relative paths are validated. The harness never runs stage, commit, checkout,
-pull, push, or any command that mutates a worktree or index. It does not write
-files inside `D:\Workspace\FR`.
+```powershell
+node dev/ui-test/create-mutation-fixture.mjs
+```
+
+The script creates
+`C:\Users\yahan\AppData\Local\Temp\opencode\gg-mutation-fixtures\fixture-<random>`,
+initialises two real git repositories with isolated config, disabled hooks,
+local `main`/`feature`/`release` branches, metadata-only remote refs, lightweight
+and annotated tags, plus root/merge/rename/binary diff cases. It prints only the
+fixture root and repository paths, then exits.
+
+### 2. Start the harness
+
+Use the `root` value printed by the script:
+
+```powershell
+$env:GG_UI_MODE = "mutation-fixture"
+$env:GG_UI_PORT = "5179"
+$env:GG_UI_FIXTURE_ROOT = "<printed root>"
+npm run dev:ui
+```
+
+Open <http://127.0.0.1:5179/>. The page header shows
+`TEMP WRITE TEST FIXTURE`; FR mode shows `FR READONLY`.
+
+### Fixture and root validation
+
+The bridge refuses to start when:
+
+- `GG_UI_MODE` has an unknown value or `GG_UI_FIXTURE_ROOT` is missing;
+- the root is not an absolute direct child of the fixed TEMP base;
+- the root, the marker or any listed repository resolves through a symlink or
+  junction;
+- `.gg-mutation-fixture.json` is missing, malformed, has the wrong
+  kind/version, or is bound to a different canonical root;
+- the root or its base resolves into FR;
+- FR mode is given a fixture root or a port other than 5178.
+
+The manager still owns the repository allowlist through normal discovery below
+the fixed root. RPC input cannot supply a repository path or a root.
+
+### Mutation contract
+
+Mutations are only forwarded when the production `GitGraphRpc`/handler exposes
+them. The bridge validates the real input/output schemas; it never fabricates a
+mutation result. The frozen contract is:
+
+- `checkoutBranch({ repositoryId, branch, expectedHead, confirmed: true })`
+- `createBranch({ repositoryId, name, startPoint, checkout?, expectedHead, confirmed: true })`
+- `createTag({ repositoryId, name, target, message?, expectedHead, confirmed: true })`
+- `renameBranch({ repositoryId, oldName, newName, expectedHead, confirmed: true })`
+- `deleteBranch({ repositoryId, name, expectedHead, confirmed: true })`
+- `deleteTag({ repositoryId, name, expectedHead, confirmed: true })`
+
+Each returns `{ status, changed, warning? }`. `expectedHead` is `string | null`
+and `confirmed` must be `true`. Until the production engine/rpc lands these
+methods, startup still succeeds and the bridge logs the missing method names;
+mutation requests return 404.
+
+The bridge injects the real `src/server/git/mutations.ts` module through the
+manager's documented `deps.mutations` seam in mutation-fixture mode. This is
+needed because the manager's production lazy loader uses a `../git/mutations.js`
+specifier that Vite's SSR runner cannot resolve from the TypeScript tree. No
+mutation result or git command is mocked; the same upstream engine executes the
+writes.
+
+`GG_UI_FIXTURE_ROOT` is not accepted in FR mode. The fixture script takes no
+arguments and never creates repositories outside its random TEMP directory.
 
 ## Bridge security
 
 `POST /__gg/rpc/:method` only:
 
-- loopback host `127.0.0.1:5178`;
-- strict `Host` (`127.0.0.1:5178`) and `Origin`
-  (`http://127.0.0.1:5178`) checks; no CORS headers are sent, so cross-site
-  browser requests cannot read responses;
-- `Sec-Fetch-Site` must be `same-origin`/`none` when present;
-- JSON body only, capped at **64 KiB**;
-- input and output are parsed with the real zod schemas from `src/rpc.ts`;
-- typed errors are returned as `{ "error": { "type", "message", "data" } }`
-  with a status mapped from the type (`invalid_input` 400,
-  `repository_not_found` 404, `git_failed` 502, `disposed` 503);
-- the browser client throws `GitGraphRpcError` for non-2xx/typed-error replies,
-  so the panel's normal error and retry UI is exercised;
-- the bridge never logs request bodies, commit messages, file contents, or
-  tokens;
-- `AbortSignal` flows browser `fetch` → request close → handler context →
-  manager → `git` child process where the engine supports cancellation.
+- binds loopback `127.0.0.1` on the mode's exact port (5178 or the configured
+  mutation port);
+- checks the exact `Host` (`127.0.0.1:<port>`) and `Origin`
+  (`http://127.0.0.1:<port>`); no CORS headers are sent, so cross-site browser
+  requests cannot read responses;
+- requires `Sec-Fetch-Site` to be `same-origin`/`none` when present;
+- accepts JSON bodies only, capped at **64 KiB**;
+- parses input and output with the real zod schemas from `src/rpc.ts`;
+- maps typed errors to `{ "error": { "type", "message", "data" } }` with
+  statuses `invalid_input` 400, `repository_not_found` 404, `git_failed` 502,
+  `disposed` 503;
+- returns 403 for mutation method names in FR mode and 404 for methods not in
+  the active mode's allowlist;
+- never logs request bodies, commit messages, file contents or tokens;
+- forwards `AbortSignal` from browser `fetch` → request close → handler context
+  → manager → `git` child process where supported.
+
+Vite's `fs.allow`/`fs.deny` remain scoped to the project root; the fixture is
+accessed by git commands, not served as static files.
 
 The bridge loads server modules through `server.ssrLoadModule` during
 `configureServer`, so Vite transforms the TypeScript sources instead of
@@ -86,8 +155,8 @@ Harness shell:
 | element | selector |
 | --- | --- |
 | harness toolbar | `[data-testid="harness-toolbar"]` |
+| harness mode badge | `[data-testid="harness-mode"]` (`data-mode="fr"` or `"mutation-fixture"`) |
 | harness fixed root | `[data-testid="harness-root"]` |
-| harness read-only badge | `[data-testid="harness-readonly"]` |
 | 520 px width | `[data-testid="harness-width-520"]` |
 | 1100 px width | `[data-testid="harness-width-1100"]` |
 | harness panel shell | `[data-testid="harness-panel-shell"]` (`data-panel-width`) |
@@ -120,7 +189,6 @@ Stable fallback classes:
 - diff: `.gg-diff-line`, `.gg-diff-add`, `.gg-diff-remove`, `.gg-diff-hunk`,
   `.gg-diff-context`
 
-
 The layout uses normal document flow: `html`, `body`, `#root` and `.harness`
 are 100% high, the stage is the flex remainder, and `.harness-panel` gives
 `.git-graph-panel` a full-height flex parent. No fixed viewport height is baked
@@ -144,7 +212,8 @@ Desktop integration:
 
 ## Acceptance checklist
 
-1. `npm run dev:ui` starts on `http://127.0.0.1:5178/` with a 520 px panel.
+1. `npm run dev:ui` starts on `http://127.0.0.1:5178/` with a 520 px panel and a
+   `FR READONLY` badge.
 2. Repository select lists **16** entries and the default repository loads
    status, refs and commits.
 3. `sai-qx-api` shows its large ref set; `qx-api` shows working-tree changes.
@@ -155,3 +224,8 @@ Desktop integration:
 7. `npm run typecheck` and `npm run build` pass.
 8. The browser console has no errors; no RPC request is made to a non-loopback
    origin.
+9. In mutation-fixture mode, the badge reads `TEMP WRITE TEST FIXTURE`, both
+   fixture repositories are listed, and checkout/create/tag/rename/delete work
+   against the TEMP repositories once the production engine exposes them.
+10. A fixture root outside the TEMP subtree, or one without the marker, aborts
+    server startup.
