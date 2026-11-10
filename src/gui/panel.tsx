@@ -7,7 +7,7 @@ import {
   onCleanup,
   untrack,
 } from "solid-js"
-import { type PanelProps } from "@opencode/plugin/gui"
+import { type PanelProps, usePlugin } from "@opencode/plugin/gui"
 import type {
   ChangedFile,
   FileDiff,
@@ -20,11 +20,13 @@ import { GitGraphRpc } from "../rpc.js"
 import { buildCommitGraph } from "./graph.js"
 import {
   DEFAULT_LANE_PADDING,
+  graphContentWidth,
   graphLaneSpacing,
   graphLaneX,
   graphLinePath,
   graphRowLines,
-  isDenseGraph,
+  isGraphClipped,
+  LANE_SPACING,
   type GraphLine,
 } from "./graph-geometry.js"
 import {
@@ -76,6 +78,7 @@ import { sessionRoute } from "./routing.js"
 import { GG_STYLES } from "./styles.js"
 import {
   detailsLayout,
+  HISTORY_COLUMN_LABELS,
   refBadgeCountForBudget,
   visibleRefCount,
 } from "./history-columns.js"
@@ -85,14 +88,19 @@ import { repositoryOptionLabel } from "./repository-label.js"
 import { clampScrollOffset } from "./scroll.js"
 import {
   DEFAULT_HISTORY_FILTER,
+  absoluteRepositoryFilePath,
+  canViewFileAtCommit,
   canonicalRefName,
+  changedFileStats,
   checkoutBlockedReason,
   commitMenuActions,
   decideCompareActivation,
+  detectCommitFileContentSupport,
   detectRpcCapabilities,
   extendedClient,
   filterRefsToAvailable,
   firstParentGraphCommits,
+  hasFileStats,
   historyFilterFingerprint,
   historyLogInput,
   isCompareModifier,
@@ -102,6 +110,9 @@ import {
   refKindLabel,
   refMenuActions,
   typedRefForBadge,
+  workspaceRelativePath,
+  type ChangedFileStats,
+  type CommitFileContent,
   type ExtendedLogInput,
   type HistoryFilterState,
   type HistoryLogSettings,
@@ -115,6 +126,7 @@ import { ContextMenu } from "./ref-menu.js"
 import { BranchSelector } from "./branch-selector.js"
 import { ConfirmDialog, type ConfirmFact, type ConfirmField } from "./confirm-dialog.js"
 import { ComparisonView } from "./compare-view.js"
+import { CommitFileContentView } from "./file-content-view.js"
 
 const PAGE_SIZE = 100
 const ROW_HEIGHT = 28
@@ -230,18 +242,7 @@ function statusClass(status: ChangedFile["status"]): string {
 }
 
 function columnLabel(column: ColumnId): string {
-  switch (column) {
-    case "graph":
-      return "Graph"
-    case "description":
-      return "Description"
-    case "date":
-      return "Date"
-    case "author":
-      return "Author"
-    case "commit":
-      return "Commit"
-  }
+  return HISTORY_COLUMN_LABELS[column]
 }
 
 type SearchState = "none" | "match" | "dim"
@@ -500,18 +501,24 @@ interface CommitFilesSlotProps {
   readonly top: number
   readonly height: number
   readonly row: GraphRowView["row"]
+  readonly commit: GitCommit
   readonly graphWidth: number
   readonly columnWidth: number
   readonly laneSpacing: number
   readonly nodes: readonly FileTreeNode[]
+  readonly files: readonly ChangedFile[]
   readonly fileCount: number
   readonly expanded: ReadonlySet<string>
   readonly selectedPath: string | undefined
+  readonly view: "list" | "tree"
   readonly loading: boolean
   readonly error: string | undefined
   readonly disabled: boolean
   readonly onToggle: (path: string) => void
   readonly onSelect: (file: ChangedFile) => void
+  readonly onViewChange: (view: "list" | "tree") => void
+  readonly onViewAtCommit: (file: ChangedFile) => void
+  readonly onOpenCurrent: (file: ChangedFile) => void
   readonly onRetry: () => void
 }
 
@@ -572,48 +579,163 @@ function CommitFilesSlot(props: CommitFilesSlotProps) {
       </div>
 
       <div class="gg-row-slot-body">
-        <div class="gg-row-slot-head">
-          <span class="gg-row-slot-title">Files changed</span>
-          <span class="gg-muted">
-            {props.loading ? "loading…" : `${props.fileCount} file${props.fileCount === 1 ? "" : "s"}`}
-          </span>
+        <div class="gg-inline-info" data-testid="inline-info">
+          <div class="gg-inline-info-subject" title={props.commit.subject}>
+            {props.commit.subject || "(no subject)"}
+          </div>
+          <div class="gg-inline-info-row" title={props.commit.author}>
+            <span class="gg-inline-info-label">Author</span>
+            <span class="gg-inline-info-value">{props.commit.author}</span>
+          </div>
+          <div class="gg-inline-info-row" title={props.commit.authorDate}>
+            <span class="gg-inline-info-label">Date</span>
+            <span class="gg-inline-info-value">
+              {formatCommitDate(props.commit.authorDate)}
+            </span>
+          </div>
+          <div class="gg-inline-info-row" title={props.commit.hash}>
+            <span class="gg-inline-info-label">Commit</span>
+            <span class="gg-inline-info-value gg-inline-info-mono">
+              {shortHash(props.commit.hash)}
+            </span>
+          </div>
+          <div class="gg-inline-info-row">
+            <span class="gg-inline-info-label">Parents</span>
+            <span class="gg-inline-info-value gg-inline-parents">
+              <Show
+                when={props.commit.parents.length > 0}
+                fallback={<span class="gg-muted">None</span>}
+              >
+                <For each={props.commit.parents}>
+                  {(parent) => (
+                    <span class="gg-inline-parent" title={parent}>
+                      {shortHash(parent)}
+                    </span>
+                  )}
+                </For>
+              </Show>
+            </span>
+          </div>
+          <details class="gg-inline-info-details">
+            <summary>Full details</summary>
+            <div class="gg-inline-info-mono" title={props.commit.hash}>
+              {props.commit.hash}
+            </div>
+            <div class="gg-inline-info-mono" title={props.commit.authorDate}>
+              {props.commit.authorDate}
+            </div>
+            <For each={props.commit.parents}>
+              {(parent) => (
+                <div class="gg-inline-info-mono" title={parent}>
+                  {parent}
+                </div>
+              )}
+            </For>
+          </details>
         </div>
-        <div class="gg-row-slot-tree inline-files" data-testid="inline-files">
-          <Show when={props.loading}>
-            <div class="gg-status">Loading files…</div>
-          </Show>
-          <Show when={props.error}>
-            {(message) => (
-              <div class="gg-error">
-                <span>{message()}</span>
-                <button
-                  type="button"
-                  disabled={props.disabled}
-                  onClick={() => props.onRetry()}
-                >
-                  Retry
-                </button>
-              </div>
-            )}
-          </Show>
-          <Show when={!props.loading && !props.error}>
-            <Show
-              when={props.fileCount > 0}
-              fallback={<div class="gg-empty">No files changed relative to this parent.</div>}
-            >
-              <div class="gg-tree">
-                <FileTree
-                  nodes={props.nodes}
-                  depth={0}
-                  expanded={props.expanded}
-                  selectedPath={props.selectedPath}
-                  disabled={props.disabled}
-                  onToggle={props.onToggle}
-                  onSelect={props.onSelect}
-                />
-              </div>
+
+        <div class="gg-row-slot-files">
+          <div class="gg-row-slot-head">
+            <span class="gg-row-slot-title">Files changed</span>
+            <span class="gg-muted">
+              {props.loading ? "loading…" : `${props.fileCount} file${props.fileCount === 1 ? "" : "s"}`}
+            </span>
+          </div>
+          <div class="gg-row-slot-tree inline-files" data-testid="inline-files">
+            <Show when={props.loading}>
+              <div class="gg-status">Loading files…</div>
             </Show>
-          </Show>
+            <Show when={props.error}>
+              {(message) => (
+                <div class="gg-error">
+                  <span>{message()}</span>
+                  <button
+                    type="button"
+                    disabled={props.disabled}
+                    onClick={() => props.onRetry()}
+                  >
+                    Retry
+                  </button>
+                </div>
+              )}
+            </Show>
+            <Show when={!props.loading && !props.error}>
+              <Show
+                when={props.fileCount > 0}
+                fallback={<div class="gg-empty">No files changed relative to this parent.</div>}
+              >
+                <Show
+                  when={props.view === "tree"}
+                  fallback={
+                    <div class="gg-file-list" data-testid="inline-file-list">
+                      <For each={props.files}>
+                        {(file) => (
+                          <FileRow
+                            file={file}
+                            label={file.path}
+                            indent={4}
+                            selected={props.selectedPath === file.path}
+                            disabled={props.disabled}
+                            onSelect={props.onSelect}
+                            onViewAtCommit={props.onViewAtCommit}
+                            onOpenCurrent={props.onOpenCurrent}
+                          />
+                        )}
+                      </For>
+                    </div>
+                  }
+                >
+                  <div class="gg-tree">
+                    <FileTree
+                      nodes={props.nodes}
+                      depth={0}
+                      expanded={props.expanded}
+                      selectedPath={props.selectedPath}
+                      disabled={props.disabled}
+                      onToggle={props.onToggle}
+                      onSelect={props.onSelect}
+                      onViewAtCommit={props.onViewAtCommit}
+                      onOpenCurrent={props.onOpenCurrent}
+                    />
+                  </div>
+                </Show>
+              </Show>
+            </Show>
+          </div>
+        </div>
+
+        <div class="gg-inline-view-controls" data-testid="inline-view-controls">
+          <button
+            type="button"
+            class={props.view === "list" ? "gg-inline-view active" : "gg-inline-view"}
+            data-testid="view-toggle-list"
+            aria-label="List view"
+            aria-pressed={props.view === "list"}
+            title="Flat list view"
+            onClick={() => props.onViewChange("list")}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M8 6h13M8 12h13M8 18h13" />
+              <circle cx="3.5" cy="6" r="1" />
+              <circle cx="3.5" cy="12" r="1" />
+              <circle cx="3.5" cy="18" r="1" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class={props.view === "tree" ? "gg-inline-view active" : "gg-inline-view"}
+            data-testid="view-toggle-tree"
+            aria-label="Tree view"
+            aria-pressed={props.view === "tree"}
+            title="Folder tree view"
+            onClick={() => props.onViewChange("tree")}
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+              stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 4h6v6H4zM14 14h6v6h-6zM7 10v4h7" />
+            </svg>
+          </button>
         </div>
       </div>
     </div>
@@ -676,6 +798,135 @@ function StatusGroupSection(props: StatusGroupSectionProps) {
 
 /* ---------- commit file tree ---------- */
 
+function EyeIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12Z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  )
+}
+
+function ExternalIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M14 4h6v6" />
+      <path d="M20 4 10 14" />
+      <path d="M20 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h5" />
+    </svg>
+  )
+}
+
+function FileStats(props: { readonly file: ChangedFile }) {
+  const stats = () => changedFileStats(props.file)
+  return (
+    <span class="gg-file-stats">
+      <Show
+        when={hasFileStats(stats())}
+        fallback={
+          <span class="gg-file-stat-none" data-testid="file-stat-none">
+            -
+          </span>
+        }
+      >
+        <Show when={stats().added !== undefined}>
+          <span class="gg-file-stat-add" data-testid="file-stat-add">
+            +{stats().added}
+          </span>
+        </Show>
+        <Show when={stats().deleted !== undefined}>
+          <span class="gg-file-stat-del" data-testid="file-stat-del">
+            -{stats().deleted}
+          </span>
+        </Show>
+      </Show>
+    </span>
+  )
+}
+
+interface FileRowProps {
+  readonly file: ChangedFile
+  readonly label: string
+  readonly indent: number
+  readonly selected: boolean
+  readonly disabled: boolean
+  readonly onSelect: (file: ChangedFile) => void
+  readonly onViewAtCommit: (file: ChangedFile) => void
+  readonly onOpenCurrent: (file: ChangedFile) => void
+}
+
+function FileRow(props: FileRowProps) {
+  const canView = () => canViewFileAtCommit(props.file)
+  return (
+    <div
+      role="button"
+      tabIndex={props.disabled ? -1 : 0}
+      class={props.selected ? "gg-file-row gg-selected" : "gg-file-row"}
+      style={`--gg-indent:${props.indent}px`}
+      title={props.file.oldPath ? `${props.file.oldPath} → ${props.file.path}` : props.file.path}
+      aria-disabled={props.disabled}
+      onClick={() => {
+        if (!props.disabled) props.onSelect(props.file)
+      }}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault()
+          if (!props.disabled) props.onSelect(props.file)
+        }
+      }}
+    >
+      <span class={statusClass(props.file.status)}>{statusLetter(props.file.status)}</span>
+      <span class="gg-file-name">{props.label}</span>
+      <Show when={props.file.oldPath}>
+        <span class="gg-file-old">← {props.file.oldPath}</span>
+      </Show>
+      <FileStats file={props.file} />
+      <span class="gg-file-actions">
+        <button
+          type="button"
+          class="gg-file-action"
+          data-testid="file-view-at-commit"
+          aria-label={
+            !canView()
+              ? `${props.file.path} was deleted; no commit version is available (the parent version is only in the diff)`
+              : `View ${props.file.path} at this commit`
+          }
+          title={
+            !canView()
+              ? "Deleted at this commit; the parent version is only available in the diff"
+              : "View this file at the selected commit"
+          }
+          disabled={!canView()}
+          onClick={(event) => {
+            event.stopPropagation()
+            props.onViewAtCommit(props.file)
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <EyeIcon />
+        </button>
+        <button
+          type="button"
+          class="gg-file-action"
+          data-testid="file-open-current"
+          aria-label={`Open current workspace file ${props.file.path}`}
+          title="Open the current workspace file"
+          onClick={(event) => {
+            event.stopPropagation()
+            props.onOpenCurrent(props.file)
+          }}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <ExternalIcon />
+        </button>
+      </span>
+    </div>
+  )
+}
+
 interface FileTreeProps {
   readonly nodes: readonly FileTreeNode[]
   readonly depth: number
@@ -684,6 +935,8 @@ interface FileTreeProps {
   readonly disabled: boolean
   readonly onToggle: (path: string) => void
   readonly onSelect: (file: ChangedFile) => void
+  readonly onViewAtCommit: (file: ChangedFile) => void
+  readonly onOpenCurrent: (file: ChangedFile) => void
 }
 
 function FileTree(props: FileTreeProps) {
@@ -719,6 +972,8 @@ function FileTree(props: FileTreeProps) {
                     disabled={props.disabled}
                     onToggle={props.onToggle}
                     onSelect={props.onSelect}
+                    onViewAtCommit={props.onViewAtCommit}
+                    onOpenCurrent={props.onOpenCurrent}
                   />
                 </div>
               </Show>
@@ -727,20 +982,16 @@ function FileTree(props: FileTreeProps) {
         }
 
         return (
-          <button
-            type="button"
-            class={props.selectedPath === node.path ? "gg-file-row gg-selected" : "gg-file-row"}
-            style={`--gg-indent:${props.depth * 12 + 4}px`}
-            title={node.file.oldPath ? `${node.file.oldPath} → ${node.path}` : node.path}
+          <FileRow
+            file={node.file}
+            label={node.name}
+            indent={props.depth * 12 + 4}
+            selected={props.selectedPath === node.path}
             disabled={props.disabled}
-            onClick={() => props.onSelect(node.file)}
-          >
-            <span class={statusClass(node.file.status)}>{statusLetter(node.file.status)}</span>
-            <span class="gg-file-name">{node.name}</span>
-            <Show when={node.file.oldPath}>
-              <span class="gg-file-old">← {node.file.oldPath}</span>
-            </Show>
-          </button>
+            onSelect={props.onSelect}
+            onViewAtCommit={props.onViewAtCommit}
+            onOpenCurrent={props.onOpenCurrent}
+          />
         )
       }}
     </For>
@@ -757,6 +1008,16 @@ function FileTree(props: FileTreeProps) {
  * therefore its directory) changes.
  */
 export function GitGraphPanel(props: { readonly panel: PanelProps }) {
+  // `usePlugin` throws when the harness renders this panel directly rather
+  // than through the plugin contribution; host-only actions then degrade to a
+  // safe copy-path notice.
+  const pluginContext = (() => {
+    try {
+      return usePlugin()
+    } catch {
+      return undefined
+    }
+  })()
   const [repositories, setRepositories] = createSignal<GitRepository[]>([])
   const [repositoriesLoading, setRepositoriesLoading] = createSignal(false)
   const [repositoriesError, setRepositoriesError] = createSignal<string | undefined>()
@@ -813,6 +1074,14 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const [diff, setDiff] = createSignal<FileDiff | undefined>()
   const [diffLoading, setDiffLoading] = createSignal(false)
   const [diffError, setDiffError] = createSignal<string | undefined>()
+  /** Inline file list mode: Git Graph-style flat list or the existing tree. */
+  const [inlineView, setInlineView] = createSignal<"list" | "tree">("tree")
+  const [fileContentTarget, setFileContentTarget] = createSignal<
+    { readonly hash: string; readonly path: string } | undefined
+  >()
+  const [fileContent, setFileContent] = createSignal<CommitFileContent | undefined>()
+  const [fileContentLoading, setFileContentLoading] = createSignal(false)
+  const [fileContentError, setFileContentError] = createSignal<string | undefined>()
   /** Full-panel commit diff view; the history list stays mounted state, not DOM. */
   const [commitDiffOpen, setCommitDiffOpen] = createSignal(false)
 
@@ -835,6 +1104,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const refsRequest = new LatestRequest()
   const comparisonFilesRequest = new LatestRequest()
   const comparisonDiffRequest = new LatestRequest()
+  const fileContentRequest = new LatestRequest()
 
   const selectionCache = SELECTION_CACHE
   const selectionGeneration = new SelectionGeneration()
@@ -1010,8 +1280,17 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     })
   }
 
+  function clearFileContent(): void {
+    fileContentRequest.cancel()
+    setFileContentTarget(undefined)
+    setFileContent(undefined)
+    setFileContentLoading(false)
+    setFileContentError(undefined)
+  }
+
   function clearCommitSelection(): void {
     filesRequest.cancel()
+    clearFileContent()
     setSelectedCommit(undefined)
     setSelectedParentIndex(0)
     setCommitFiles([])
@@ -1045,6 +1324,11 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     diffRequest.cancel()
     comparisonFilesRequest.cancel()
     comparisonDiffRequest.cancel()
+    fileContentRequest.cancel()
+    setFileContentTarget(undefined)
+    setFileContent(undefined)
+    setFileContentLoading(false)
+    setFileContentError(undefined)
     historyVersion += 1
     loadMoreInFlight = false
 
@@ -1575,6 +1859,120 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     }
   }
 
+  function openCurrentWorkspaceFile(file: ChangedFile): void {
+    const repository = selectedRepository()
+    if (!repository) {
+      setMutationNotice("No repository is selected; the current file path was not opened.")
+      return
+    }
+    const absolute = absoluteRepositoryFilePath(repository.rootPath, file.path)
+    let target = workspaceRelativePath(currentDirectory(), repository.rootPath, file.path)
+    try {
+      // The screen's public file model normalizes into the session workspace
+      // and leaves paths outside it absolute.
+      target = props.panel.screen.file.resolve(absolute)
+    } catch {
+      // Keep the pure-helper result when the screen file model is unavailable.
+    }
+
+    try {
+      if (pluginContext?.layout) {
+        pluginContext.layout.open(`file:${target}`, props.panel.session)
+        return
+      }
+    } catch {
+      // Fall through to the system default app.
+    }
+
+    void (async () => {
+      try {
+        if (!pluginContext?.desktop) throw new Error("desktop unavailable")
+        await pluginContext.desktop.launch(absolute)
+      } catch {
+        await copyText(file.path, "File path")
+        setMutationNotice(
+          "This host could not open the current file; the repository-relative path was copied instead.",
+        )
+      }
+    })()
+  }
+
+  function viewFileAtCommit(file: ChangedFile, commit: GitCommit): void {
+    if (!fileContentSupported()) {
+      setMutationNotice(
+        "Coming soon: the connected server does not expose getCommitFileContent yet.",
+      )
+      return
+    }
+    const repositoryId = selectedRepositoryId()
+    if (!repositoryId) return
+    setFileContentTarget({ hash: commit.hash, path: file.path })
+    setFileContent(undefined)
+    setFileContentError(undefined)
+    setFileContentLoading(true)
+    void loadFileContent(repositoryId, commit.hash, file.path)
+  }
+
+  async function loadFileContent(
+    repositoryId: string,
+    hash: string,
+    path: string,
+  ): Promise<void> {
+    const { route, rpc } = currentRpc()
+    const { directory } = route
+    if (!directory) return
+    const key = selectionKey(route.serverId, route.directory)
+    const client = extendedClient(rpc)
+    setFileContentLoading(true)
+    setFileContentError(undefined)
+
+    const result = await fileContentRequest.run((signal) => {
+      if (!client.getCommitFileContent) {
+        return Promise.reject(new Error("getCommitFileContent is unavailable"))
+      }
+      return client.getCommitFileContent(
+        { repositoryId, hash, path },
+        requestOptions(directory, signal),
+      )
+    })
+
+    if (!result.accepted) {
+      if (!result.aborted) {
+        setFileContentLoading(false)
+        setFileContentError(formatError(result.error))
+      }
+      return
+    }
+    const target = fileContentTarget()
+    if (
+      key !== activeKey ||
+      selectedRepositoryId() !== repositoryId ||
+      !target ||
+      target.hash !== hash ||
+      target.path !== path
+    ) {
+      return
+    }
+    setFileContentLoading(false)
+    setFileContent(result.value)
+  }
+
+  function closeFileContent(): void {
+    fileContentRequest.cancel()
+    setFileContentTarget(undefined)
+    setFileContent(undefined)
+    setFileContentLoading(false)
+    setFileContentError(undefined)
+  }
+
+  function retryFileContent(): void {
+    const target = fileContentTarget()
+    const repositoryId = selectedRepositoryId()
+    if (target && repositoryId) {
+      void loadFileContent(repositoryId, target.hash, target.path)
+    }
+  }
+
   function closeDetails(): void {
     selectionGeneration.bump()
     diffRequest.cancel()
@@ -1824,7 +2222,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     column: ColumnId,
     event: PointerEvent & { currentTarget: HTMLButtonElement },
   ): void {
-    if (column === "graph") return
     event.preventDefault()
     const startX = event.clientX
     const base = untrack(() => columnPreferences())
@@ -1863,6 +2260,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   )
   const capabilities = createMemo<RpcCapabilities>(() =>
     detectRpcCapabilities(currentRpc().rpc, GitGraphRpc),
+  )
+  const fileContentSupported = createMemo(() =>
+    detectCommitFileContentSupport(currentRpc().rpc, GitGraphRpc),
   )
   const busy = createMemo(
     () => repositoriesLoading() || repositoryLoading() || mutationBusy(),
@@ -1921,11 +2321,11 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resolveColumnLayout(panelWidth(), columnPreferences()),
   )
   const graphColumnWidth = createMemo(() => resolvedColumns().widths.graph)
-  const graphWidth = createMemo(() => graphColumnWidth())
-  const laneSpacing = createMemo(() =>
-    graphLaneSpacing(graphColumnWidth(), maxLanes(), LANE_PADDING),
+  const graphWidth = createMemo(() =>
+    graphContentWidth(maxLanes(), LANE_SPACING, LANE_PADDING),
   )
-  const denseGraph = createMemo(() => isDenseGraph(laneSpacing()))
+  const laneSpacing = createMemo(() => graphLaneSpacing())
+  const denseGraph = createMemo(() => isGraphClipped(graphWidth(), graphColumnWidth()))
   const maxRefs = createMemo(() =>
     Math.min(
       visibleRefCount(panelWidth()),
@@ -3144,6 +3544,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     refsRequest.dispose()
     comparisonFilesRequest.dispose()
     comparisonDiffRequest.dispose()
+    fileContentRequest.dispose()
   })
 
   return (
@@ -3503,16 +3904,14 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                   }
                 >
                   <span>{columnLabel(column)}</span>
-                  <Show when={column !== "graph"}>
-                    <button
-                      type="button"
-                      class="gg-column-resize"
-                      data-testid={`resize-column-${column}`}
-                      aria-label={`Resize ${column} column`}
-                      title={`Drag to resize ${column} column`}
-                      onPointerDown={(event) => startColumnResize(column, event)}
-                    />
-                  </Show>
+                  <button
+                    type="button"
+                    class={column === "graph" ? "gg-column-resize gg-graph-resize" : "gg-column-resize"}
+                    data-testid={`resize-column-${column}`}
+                    aria-label={`Resize ${column} column`}
+                    title={`Drag to resize ${column} column`}
+                    onPointerDown={(event) => startColumnResize(column, event)}
+                  />
                 </div>
               )}
             </For>
@@ -3521,8 +3920,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           <Show when={denseGraph()}>
             <div class="gg-dense-graph" data-testid="dense-graph">
               <span>
-                {maxLanes()} lanes; filter branches for clarity. Dense tracks are compressed, not
-                removed.
+                {maxLanes()} lanes; narrow columns hide branches on the right. Drag the column
+                wider to reveal them.
               </span>
               <button
                 type="button"
@@ -3608,13 +4007,16 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                       top={rowLayout().slotTop ?? 0}
                       height={rowLayout().slotHeight}
                       row={row()}
+                      commit={selectedCommit()!}
                       graphWidth={graphWidth()}
                       columnWidth={graphColumnWidth()}
                       laneSpacing={laneSpacing()}
                       nodes={commitTree()}
+                      files={commitFiles()}
                       fileCount={commitFiles().length}
                       expanded={expandedDirectories()}
                       selectedPath={inlineSelectedPath()}
+                      view={inlineView()}
                       loading={filesLoading()}
                       error={filesError()}
                       disabled={busy()}
@@ -3623,6 +4025,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                         const commit = selectedCommit()
                         if (commit) selectCommitFile(file, commit, selectedParentIndex())
                       }}
+                      onViewChange={(view) => setInlineView(view)}
+                      onViewAtCommit={(file) => {
+                        const commit = selectedCommit()
+                        if (commit) viewFileAtCommit(file, commit)
+                      }}
+                      onOpenCurrent={(file) => openCurrentWorkspaceFile(file)}
                       onRetry={() => {
                         const commit = selectedCommit()
                         if (commit) void loadCommitFiles(commit, selectedParentIndex())
@@ -3917,6 +4325,17 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           if (state) handleCommitMenuAction(state.commit, id)
         }}
         onClose={() => setCommitMenu(undefined)}
+      />
+
+      <CommitFileContentView
+        open={fileContentTarget() !== undefined}
+        path={fileContentTarget()?.path ?? ""}
+        hash={fileContentTarget()?.hash ?? ""}
+        loading={fileContentLoading()}
+        content={fileContent()}
+        error={fileContentError()}
+        onClose={() => closeFileContent()}
+        onRetry={() => retryFileContent()}
       />
     </div>
   )

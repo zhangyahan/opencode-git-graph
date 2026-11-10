@@ -1,9 +1,61 @@
 import { chmodSync, existsSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { getCommitFiles, getDiff } from "../src/server/git/diff.js"
+import {
+  getCommitFiles,
+  getDiff,
+  parseNumstat,
+  withNumstat,
+} from "../src/server/git/diff.js"
 import { getStatus } from "../src/server/git/status.js"
 import { commit, mkTmpDir, mkTmpRepo } from "./helpers.js"
+
+describe("parseNumstat", () => {
+  it("parses normal, rename, copy, binary and tab-bearing records", () => {
+    const output = [
+      "4\t1\tpackage.json\0",
+      "2\t3\tdir with space/中文 文件.txt\0",
+      "7\t5\tdir/with\ttab.txt\0",
+      "0\t0\t\0旧 文件.txt\0新 文件.txt\0",
+      "3\t2\t\0src/a.ts\0copy/b.ts\0",
+      "-\t-\tbinary.bin\0",
+      "-\t-\t\0old.bin\0new.bin\0",
+    ].join("")
+
+    const counts = parseNumstat(output)
+    expect(counts.get("package.json")).toEqual({ added: 4, deleted: 1 })
+    expect(counts.get("dir with space/中文 文件.txt")).toEqual({ added: 2, deleted: 3 })
+    expect(counts.get("dir/with\ttab.txt")).toEqual({ added: 7, deleted: 5 })
+    expect(counts.get("新 文件.txt")).toEqual({ added: 0, deleted: 0 })
+    expect(counts.get("copy/b.ts")).toEqual({ added: 3, deleted: 2 })
+    expect(counts.has("binary.bin")).toBe(false)
+    expect(counts.has("new.bin")).toBe(false)
+  })
+
+  it("matches by the new path and leaves unmatched entries untouched", () => {
+    const files = [
+      { path: "新 文件.txt", oldPath: "旧 文件.txt", status: "renamed" as const, staged: true },
+      { path: "binary.bin", status: "modified" as const, staged: true },
+      { path: "unknown.txt", status: "added" as const, staged: true },
+    ]
+    const counts = parseNumstat(
+      "0\t0\t\0旧 文件.txt\0新 文件.txt\0-\t-\tbinary.bin\0",
+    )
+
+    expect(withNumstat(files, counts)).toEqual([
+      {
+        path: "新 文件.txt",
+        oldPath: "旧 文件.txt",
+        status: "renamed",
+        staged: true,
+        added: 0,
+        deleted: 0,
+      },
+      { path: "binary.bin", status: "modified", staged: true },
+      { path: "unknown.txt", status: "added", staged: true },
+    ])
+  })
+})
 
 describe("getCommitFiles", () => {
   it("lists root-commit files against the empty tree", async () => {
@@ -11,7 +63,9 @@ describe("getCommitFiles", () => {
     try {
       const hash = commit(repo.dir, { "a.txt": "hello\nworld\n" }, "root")
       const files = await getCommitFiles(repo.dir, hash)
-      expect(files).toEqual([{ path: "a.txt", status: "added", staged: true }])
+      expect(files).toEqual([
+        { path: "a.txt", status: "added", staged: true, added: 2, deleted: 0 },
+      ])
     } finally {
       repo.cleanup()
     }
@@ -27,7 +81,14 @@ describe("getCommitFiles", () => {
       const hash = repo.git(["rev-parse", "HEAD"]).trim()
       const files = await getCommitFiles(repo.dir, hash)
       expect(files).toEqual([
-        { path: "b.txt", oldPath: "a.txt", status: "renamed", staged: true },
+        {
+          path: "b.txt",
+          oldPath: "a.txt",
+          status: "renamed",
+          staged: true,
+          added: 0,
+          deleted: 0,
+        },
       ])
     } finally {
       repo.cleanup()
@@ -44,7 +105,66 @@ describe("getCommitFiles", () => {
       const hash = repo.git(["rev-parse", "HEAD"]).trim()
       const files = await getCommitFiles(repo.dir, hash)
       expect(files).toEqual([
-        { path: "新 文件.txt", oldPath: "旧 文件.txt", status: "renamed", staged: true },
+        {
+          path: "新 文件.txt",
+          oldPath: "旧 文件.txt",
+          status: "renamed",
+          staged: true,
+          added: 0,
+          deleted: 0,
+        },
+      ])
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("merges numstat into the new path of a rename with edits", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const original = Array.from({ length: 20 }, (_value, index) => `line ${index}`).join("\n")
+      commit(repo.dir, { "old.txt": `${original}\n` }, "add")
+      repo.git(["mv", "old.txt", "new.txt"])
+      writeFileSync(join(repo.dir, "new.txt"), `${original}\nextra\n`)
+      repo.git(["commit", "-am", "rename and edit"])
+
+      const hash = repo.git(["rev-parse", "HEAD"]).trim()
+      const files = await getCommitFiles(repo.dir, hash)
+      expect(files).toEqual([
+        {
+          path: "new.txt",
+          oldPath: "old.txt",
+          status: "renamed",
+          staged: true,
+          added: 1,
+          deleted: 0,
+        },
+      ])
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("does not count gitlink additions or bumps in numstat", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const target1 = commit(repo.dir, { "a.txt": "one\n" }, "target1")
+      repo.git(["update-index", "--add", "--cacheinfo", `160000,${target1},vendor/module`])
+      repo.git(["commit", "-m", "add gitlink"])
+      const addHash = repo.git(["rev-parse", "HEAD"]).trim()
+
+      expect(await getCommitFiles(repo.dir, addHash)).toEqual([
+        { path: "vendor/module", status: "added", staged: true },
+      ])
+
+      repo.git(["commit", "--allow-empty", "-m", "target2"])
+      const target2 = repo.git(["rev-parse", "HEAD"]).trim()
+      repo.git(["update-index", "--cacheinfo", `160000,${target2},vendor/module`])
+      repo.git(["commit", "-m", "bump gitlink"])
+      const bumpHash = repo.git(["rev-parse", "HEAD"]).trim()
+
+      expect(await getCommitFiles(repo.dir, bumpHash)).toEqual([
+        { path: "vendor/module", status: "modified", staged: true },
       ])
     } finally {
       repo.cleanup()

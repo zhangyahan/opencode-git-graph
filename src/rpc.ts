@@ -44,6 +44,21 @@ export const ChangedFileSchema = z
     oldPath: z.string().min(1).optional(),
     status: z.enum(STATUS_VALUES),
     staged: z.boolean(),
+    added: integerInRange(0, Number.MAX_SAFE_INTEGER).optional(),
+    deleted: integerInRange(0, Number.MAX_SAFE_INTEGER).optional(),
+  })
+  .strict()
+
+export const COMMIT_FILE_CONTENT_KINDS = ["text", "binary", "symlink", "missing"] as const
+
+export const CommitFileContentSchema = z
+  .object({
+    path: z.string().min(1),
+    mode: z.string().nullable(),
+    kind: z.enum(COMMIT_FILE_CONTENT_KINDS),
+    text: z.string().nullable(),
+    size: integerInRange(0, Number.MAX_SAFE_INTEGER).nullable(),
+    truncated: z.boolean().optional(),
   })
   .strict()
 
@@ -275,6 +290,16 @@ export const GetCommitFilesOutputSchema = z
   .object({ files: z.array(ChangedFileSchema) })
   .strict()
 
+export const GetCommitFileContentInputSchema = z
+  .object({
+    repositoryId: RepositoryIdSchema,
+    hash: CommitHashSchema,
+    path: SafeRelativePathSchema,
+  })
+  .strict()
+
+export const GetCommitFileContentOutputSchema = CommitFileContentSchema
+
 export const GetDiffInputSchema = z
   .object({
     repositoryId: RepositoryIdSchema,
@@ -418,6 +443,11 @@ export const GitGraphRpc = Rpc.define({
     getCommitFiles: {
       input: GetCommitFilesInputSchema,
       output: GetCommitFilesOutputSchema,
+      errors,
+    },
+    getCommitFileContent: {
+      input: GetCommitFileContentInputSchema,
+      output: GetCommitFileContentOutputSchema,
       errors,
     },
     getDiff: {

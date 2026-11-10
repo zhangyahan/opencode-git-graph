@@ -1,5 +1,6 @@
 import type { ChangedFile, FileDiff } from "../../shared/types.js"
 import { git, GitError, type GitSignalOptions } from "./executor.js"
+import { parseNumstat, withNumstat } from "./diff.js"
 import { GitInputError, assertCommitOid, assertRelativeFilePath } from "./validation.js"
 
 /** Options accepted by the comparison helpers (cancellation only). */
@@ -160,6 +161,38 @@ async function readComparisonFiles(
   return parseComparisonNameStatus(output)
 }
 
+/** Attach numeric numstat counts; a numstat failure keeps the plain file list. */
+async function readComparisonNumstat(
+  repoPath: string,
+  comparison: ResolvedComparison,
+  files: ChangedFile[],
+  options: GitSignalOptions,
+): Promise<ChangedFile[]> {
+  if (files.length === 0) return files
+  let output: string
+  try {
+    output = await git(
+      repoPath,
+      [
+        "diff",
+        ...DIFF_SAFETY_ARGS,
+        "--numstat",
+        "-z",
+        "-M",
+        "--ignore-submodules=all",
+        comparison.base,
+        comparison.head,
+        "--",
+      ],
+      options,
+    )
+  } catch (error) {
+    if (options.signal?.aborted || !(error instanceof GitError)) throw error
+    return files
+  }
+  return withNumstat(files, parseNumstat(output))
+}
+
 /**
  * List the files that differ between two commits.
  *
@@ -176,7 +209,8 @@ export async function getComparisonFiles(
   options: ComparisonOptions = {},
 ): Promise<ChangedFile[]> {
   const comparison = await resolveComparison(repoPath, baseHash, headHash, options)
-  return readComparisonFiles(repoPath, comparison, options)
+  const files = await readComparisonFiles(repoPath, comparison, options)
+  return readComparisonNumstat(repoPath, comparison, files, options)
 }
 
 /**

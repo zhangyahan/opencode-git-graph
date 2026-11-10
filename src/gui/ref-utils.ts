@@ -404,6 +404,10 @@ export interface ExtendedGitGraphRpc {
     input: { repositoryId: string; baseHash: string; headHash: string; path: string },
     options?: RequestOptionsLike,
   ): Promise<FileDiff>
+  getCommitFileContent?(
+    input: GetCommitFileContentInput,
+    options?: RequestOptionsLike,
+  ): Promise<CommitFileContent>
   checkoutBranch(
     input: CheckoutBranchInput,
     options?: RequestOptionsLike,
@@ -521,6 +525,95 @@ export function detectRpcCapabilities(
   }
 }
 
+/** `getCommitFileContent` is landing separately; hide real behavior until then. */
+export function detectCommitFileContentSupport(
+  client: unknown,
+  definition?: DefinitionLike,
+): boolean {
+  // Require the runtime client method too: a harness can expose an older
+  // allowlist while the shared definition already carries the new method.
+  if (
+    typeof client !== "object" ||
+    client === null ||
+    typeof (client as Record<string, unknown>).getCommitFileContent !== "function"
+  ) {
+    return false
+  }
+  return methodPresent(client, definition, "getCommitFileContent")
+}
+
+export interface ChangedFileStats {
+  readonly added?: number
+  readonly deleted?: number
+}
+
+/** True when git reported at least one numeric side of the numstat. */
+export function hasFileStats(stats: ChangedFileStats): boolean {
+  return stats.added !== undefined || stats.deleted !== undefined
+}
+
+/**
+ * Read optional `added`/`deleted` counts without changing the shared file type.
+ * The backend contract adds them as non-negative integers; malformed values are
+ * ignored so the row still renders.
+ */
+export function changedFileStats(file: ChangedFile): ChangedFileStats {
+  const source = file as ChangedFile & {
+    readonly added?: unknown
+    readonly deleted?: unknown
+  }
+  const count = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? Math.trunc(value)
+      : undefined
+  const added = count(source.added)
+  const deleted = count(source.deleted)
+  return {
+    ...(added !== undefined ? { added } : {}),
+    ...(deleted !== undefined ? { deleted } : {}),
+  }
+}
+
+/**
+ * A deleted file has no blob in the commit tree, so its "at commit" view would
+ * always be `missing`; leave the eye disabled and keep the diff/parent view.
+ */
+export function canViewFileAtCommit(file: ChangedFile): boolean {
+  return file.status !== "deleted"
+}
+
+export type CommitFileContentKind = "text" | "binary" | "symlink" | "missing"
+
+export interface CommitFileContent {
+  readonly path: string
+  readonly mode: string | null
+  readonly kind: CommitFileContentKind
+  readonly text: string | null
+  readonly size: number | null
+  readonly truncated?: boolean
+}
+
+/**
+ * Very large text blobs are returned metadata-only: kind "text", text null,
+ * size present and truncated true. This must not render as an empty file or a
+ * binary file.
+ */
+export function isSizeOnlyFileContent(
+  content: CommitFileContent | undefined,
+): boolean {
+  return (
+    content?.kind === "text" &&
+    content.text === null &&
+    content.truncated === true
+  )
+}
+
+export interface GetCommitFileContentInput {
+  readonly repositoryId: string
+  readonly hash: string
+  readonly path: string
+}
+
 export function refMenuActions(
   ref: GitRef,
   currentBranch: string | null,
@@ -590,6 +683,41 @@ export function isCompareModifier(event: {
   readonly metaKey: boolean
 }): boolean {
   return event.ctrlKey || event.metaKey
+}
+
+function slashPath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+/g, "/")
+}
+
+/** Absolute repository file path with forward slashes, for host `file:` tabs. */
+export function absoluteRepositoryFilePath(
+  repositoryRoot: string,
+  filePath: string,
+): string {
+  const root = slashPath(repositoryRoot).replace(/\/+$/, "")
+  const file = slashPath(filePath).replace(/^\/+/, "")
+  return root.length > 0 ? `${root}/${file}` : file
+}
+
+/**
+ * Path to pass to `ctx.layout.open('file:' + path, session)`.
+ * Workspace-relative when the repository sits under the session directory;
+ * otherwise the absolute normalized path (still safer than inventing `../`).
+ */
+export function workspaceRelativePath(
+  sessionDirectory: string,
+  repositoryRoot: string,
+  filePath: string,
+): string {
+  const absolute = absoluteRepositoryFilePath(repositoryRoot, filePath)
+  const base = slashPath(sessionDirectory).replace(/\/+$/, "")
+  if (!base) return absolute
+  if (absolute.toLowerCase() === base.toLowerCase()) return filePath
+  const prefix = `${base.toLowerCase()}/`
+  if (absolute.toLowerCase().startsWith(prefix)) {
+    return absolute.slice(base.length + 1)
+  }
+  return absolute
 }
 
 /**

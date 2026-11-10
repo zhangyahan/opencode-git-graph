@@ -79,7 +79,9 @@ describe("RepositoryManager", () => {
         expect(log.hasMore).toBe(false)
 
         const files = await manager.getCommitFiles(alphaId!, alphaHead)
-        expect(files).toEqual([{ path: "a.txt", status: "added", staged: true }])
+        expect(files).toEqual([
+          { path: "a.txt", status: "added", staged: true, added: 1, deleted: 0 },
+        ])
 
         writeFileSync(join(beta, "b.txt"), "two\n")
         const diff = await manager.getDiff(betaId!, { type: "working-tree" }, "b.txt")
@@ -145,6 +147,9 @@ describe("RepositoryManager", () => {
           await expect(
             manager.getDiff(entry.id, { type: "working-tree" }, unsafe),
           ).rejects.toMatchObject({ type: "invalid_input" })
+          await expect(
+            manager.getCommitFileContent(entry.id, head, unsafe),
+          ).rejects.toMatchObject({ type: "invalid_input" })
         }
 
         await expect(manager.getCommitFiles(entry.id, "--all")).rejects.toMatchObject({
@@ -153,14 +158,27 @@ describe("RepositoryManager", () => {
         await expect(manager.getCommitFiles(entry.id, "HEAD")).rejects.toMatchObject({
           type: "invalid_input",
         })
+        await expect(manager.getCommitFileContent(entry.id, "HEAD", "a.txt")).rejects.toMatchObject(
+          { type: "invalid_input" },
+        )
+        await expect(
+          manager.getCommitFileContent(entry.id, head, "missing.txt"),
+        ).rejects.toThrow(/does not exist/)
         await expect(
           manager.getDiff(entry.id, { type: "commit", hash: "HEAD~1" }, "a.txt"),
         ).rejects.toMatchObject({ type: "invalid_input" })
 
         // The real hash still works.
         await expect(manager.getCommitFiles(entry.id, head)).resolves.toEqual([
-          { path: "a.txt", status: "added", staged: true },
+          { path: "a.txt", status: "added", staged: true, added: 1, deleted: 0 },
         ])
+        await expect(
+          manager.getCommitFileContent(entry.id, head, "a.txt"),
+        ).resolves.toMatchObject({
+          path: "a.txt",
+          kind: "text",
+          text: "one\n",
+        })
       } finally {
         manager.dispose()
       }

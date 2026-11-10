@@ -20,19 +20,22 @@ export interface GraphLine {
   readonly colour: number
 }
 
-/** Preferred lane step. Common histories (up to 15 lanes) keep this spacing. */
-export const DEFAULT_LANE_SPACING = 14
+/**
+ * Fixed lane step. Narrowing the graph column never compresses the tracks:
+ * anything beyond the column's right edge is clipped instead.
+ */
+export const LANE_SPACING = 14
+/** Backwards-compatible alias for the fixed lane step. */
+export const DEFAULT_LANE_SPACING = LANE_SPACING
 /** Horizontal padding on each side of the lane field. */
 export const DEFAULT_LANE_PADDING = 8
 /**
- * The graph column is owned by the application, not the user: it stays at
- * `GRAPH_COLUMN_WIDTH` and only shrinks passively when the panel is too narrow
- * to keep the description readable.
+ * The graph column is user-resizable (96..400px). Lanes keep their fixed
+ * 14px step, and the container clips the overflow instead of scrolling.
  */
 export const GRAPH_COLUMN_WIDTH = 240
 export const GRAPH_COLUMN_MIN_WIDTH = 96
-/** Kept for callers that still validate persisted data; dragging is disabled. */
-export const GRAPH_COLUMN_MAX_WIDTH = GRAPH_COLUMN_WIDTH
+export const GRAPH_COLUMN_MAX_WIDTH = 400
 export const DEFAULT_GRAPH_COLUMN_WIDTH = GRAPH_COLUMN_WIDTH
 
 export interface GraphPathOptions {
@@ -47,41 +50,29 @@ export function graphLaneX(lane: number, laneSpacing: number, padding: number): 
 }
 
 /**
- * Lane step for a fixed-width graph column.
+ * Lane step for the graph column.
  *
- * The column is never scrolled horizontally, so every lane edge has to fit
- * inside it. Up to 15 lanes keep the preferred 14px step; beyond that the step
- * shrinks as `min(14, (graphWidth - 2*padding) / lanes)` and may fall below 2px
- * (the panel then asks the user to narrow the branch filter rather than hiding
- * parent edges).
+ * The step is always the fixed `LANE_SPACING` (14px). The column no longer
+ * compresses tracks to fit: when `graphContentWidth` exceeds the column width,
+ * the right-hand lanes are clipped by the row/graph container.
  */
-export function graphLaneSpacing(
-  graphWidth: number,
-  lanes: number,
-  padding: number = DEFAULT_LANE_PADDING,
-): number {
-  const width = Number.isFinite(graphWidth)
-    ? Math.max(GRAPH_COLUMN_MIN_WIDTH, graphWidth)
-    : GRAPH_COLUMN_WIDTH
-  const laneCount = Number.isFinite(lanes) ? Math.max(1, Math.ceil(lanes)) : 1
-  const edge = Number.isFinite(padding) ? Math.max(0, padding) : DEFAULT_LANE_PADDING
-  const usable = Math.max(0, width - edge * 2)
-  return Math.min(DEFAULT_LANE_SPACING, usable / laneCount)
+export function graphLaneSpacing(): number {
+  return LANE_SPACING
 }
 
-/** True when the tracks are compressed too far to read comfortably. */
-export function isDenseGraph(laneSpacing: number): boolean {
-  return Number.isFinite(laneSpacing) && laneSpacing < 2
+/** True when the lane field is wider than its column and the right side is clipped. */
+export function isGraphClipped(contentWidth: number, columnWidth: number): boolean {
+  if (!Number.isFinite(contentWidth) || !Number.isFinite(columnWidth)) return false
+  return contentWidth > columnWidth
 }
 
 /**
- * Width of the scrollable lane field. The graph column itself stays narrow and
- * clips this field, so wide histories get a local horizontal viewport instead
- * of pushing the commit text off screen.
+ * Width of the full lane field: every lane at the fixed 14px step plus padding.
+ * The panel renders each SVG at this width and lets the column clip the excess.
  */
 export function graphContentWidth(lanes: number, laneSpacing: number, padding: number): number {
   const laneCount = Number.isFinite(lanes) ? Math.max(1, Math.ceil(lanes)) : 1
-  const spacing = Number.isFinite(laneSpacing) ? Math.max(1, laneSpacing) : DEFAULT_LANE_SPACING
+  const spacing = Number.isFinite(laneSpacing) ? Math.max(1, laneSpacing) : LANE_SPACING
   const edge = Number.isFinite(padding) ? Math.max(0, padding) : DEFAULT_LANE_PADDING
   return laneCount * spacing + edge * 2
 }

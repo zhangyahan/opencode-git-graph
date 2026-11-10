@@ -1,14 +1,14 @@
 # OpenCode Git Graph
 
-面向 OpenCode Desktop 的 Git 侧边栏插件：仓库切换、工作区变更、提交拓扑图、内联 Commit 文件树、整页只读 Unified Diff，以及经确认的本地 Git 写操作。它是受 [mhutchie.git-graph](https://github.com/mhutchie/vscode-git-graph) 启发的**独立实现**，不是该扩展的移植版，也不是完整功能复刻。
+面向 OpenCode Desktop 的 Git 侧边栏插件：仓库切换、工作区变更、提交拓扑图、内联 Commit 三栏（提交信息 / 文件列表 / 视图切换）、整页只读 Unified Diff，以及经确认的本地 Git 写操作。它是受 [mhutchie.git-graph](https://github.com/mhutchie/vscode-git-graph) 启发的**独立实现**，不是该扩展的移植版，也不是完整功能复刻。
 
-`0.2.0` 是本地可用功能版：**生产读操作 + 确认式本地 mutation**（checkout / create / rename / delete merged branch / create / delete lightweight & annotated tag）。不提供网络、stash、rebase/reset/cherry-pick/revert 等能力。
+`0.2.1` 是本地可用功能版：**生产读操作 + 确认式本地 mutation**（checkout / create / rename / delete merged branch / create / delete lightweight & annotated tag）。在 `0.2.0` 基线上新增可拖宽 Graph 列、内联三栏提交详情与 commit 版本文件内容查看。不提供网络、stash、rebase/reset/cherry-pick/revert 等能力。
 
 ## 当前状态
 
-- `0.2.0` 最终 release UI 验收为 **93/93 PASS，0 failed**：在 FR 只读真实仓库环境与隔离 TEMP mutation fixture 两个环境中，以真实浏览器、真实生产面板和真实 RepositoryManager / RPC 路径执行（非 mock 数据）。结果记录在 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。
-- 自动化验证：**390 tests passed，1 platform-specific skip**（Windows 专用路径用例在其他平台跳过）；`npm run typecheck`、`npm run build`、`git diff --check` 均通过。
-- 93/93 是本 harness 交互矩阵的最终结论，**不等于原生 Desktop 全链路 E2E**。真实 Desktop 的会话/scope 切换、窗口与面板 chrome、`MenuItem` 注册、宿主主题/事件总线、真实 Desktop 面板 resize 未被该 harness 覆盖，需要用户在实际 Desktop 中 `/reload` 后人工确认。
+- `0.2.1` 最终 release UI 验收为 **131/131 PASS，0 failed**：在 FR 只读真实仓库环境与隔离 TEMP mutation/content fixture 两个环境中，以真实浏览器、真实生产面板和真实 RepositoryManager / RPC 路径执行（非 mock 数据）。结果记录在 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。
+- 自动化验证：**418 tests passed，1 platform-specific skip**（Windows 专用路径用例在其他平台跳过）；`npm run typecheck`、`npm run build`、`git diff --check` 均通过。
+- 131/131 是本 harness 交互矩阵的最终结论，**不等于原生 Desktop 全链路 E2E**。真实 Desktop 的会话/scope 切换、窗口与面板 chrome、`MenuItem` 注册、宿主主题/事件总线、真实 Desktop 面板 resize 未被该 harness 覆盖，需要用户在实际 Desktop 中 `/reload` 后人工确认。
 - 本版本不是 mhutchie.git-graph 的完整功能复刻：网络、stash、merge/rebase/reset/cherry-pick/revert 等仍未实现（见“明确未实现”）。能力边界详见 [`docs/FEATURE-PARITY.md`](docs/FEATURE-PARITY.md)。
 
 ## 功能概览
@@ -25,10 +25,9 @@
 
 ### Graph 与列布局
 
-- **Graph 固定 240px，不可拖动、没有 resize handle、没有 Graph 列内横向滚动。**
-- 窄面板下 Graph 只做**被动宽度适配**：在列预算不足时按硬下限收缩（最低 96px），不会挤压 Description 到不可读；加宽面板后恢复 240px。
-- 轨道默认 14px 步进；密集历史会保留**所有 parent 边**，只压缩 lane spacing，并显示 dense graph 提示，引导用户用 Branches filter 降低密度，而不是隐藏边或增加横向滚动。
-- Description / Date / Author / Commit 四列可拖动改宽，偏好持久化到 `localStorage`；存储不可用或数据损坏时安全回退默认值。窄侧边栏（默认 520px）自动隐藏 Date / Author，但保存的宽屏偏好不被破坏。
+- **Graph 列默认 240px，可拖动 96–400px**，宽度偏好持久化到 `localStorage`；存储不可用或数据损坏时安全回退默认值。
+- 轨道间距**恒为 14px**，不会因列变窄而压缩。列宽不足时右侧分支被**裁剪隐藏**，但 SVG 仍按完整内容宽度渲染；历史列表**绝不出现横向滚动条**。出现裁剪时显示 dense graph 提示，引导用户把 Graph 列拖宽，或用 Branches filter 降低密度。
+- Description / Date / Author / Commit 四列同样可拖动改宽并持久化；窄侧边栏（默认 520px）自动隐藏 Date / Author，但保存的宽屏偏好不被破坏。列头使用 Title Case（Graph / Description / Date / Author / Commit），列间常显竖分割线。
 - 固定 28px 行高、SVG 提交图、自实现虚拟滚动；滚动接近底部自动加载下一页，同时保留手动 **Load more** 与失败后的 **Retry**。自动加载有单次触发守卫，失败后不会在底部无限自动重试。
 - 搜索只针对**已加载**的 commit：高亮匹配行、淡化其余行，不改变拓扑或行数；`Enter` 跳到首匹配，`Esc` 清空。`Ctrl/Cmd+F` 聚焦搜索，`Ctrl/Cmd+H` 或 **HEAD** 按钮跳到 HEAD，`Ctrl/Cmd+R` 刷新，`Shift+F10` 打开 commit 菜单，`Esc` 依次关闭菜单 / Branches / 比较 / 整页 diff。没有实现 Ctrl/Cmd+S stash、上下提交导航或整库搜索。
 
@@ -39,7 +38,10 @@
 
 ### Commit 详情、整页 diff 与比较
 
-- 点击 commit 在同行下方展开文件树，再次点击折叠；点击文件后侧栏内容替换为整页只读 commit diff，`Back` 返回历史并恢复滚动位置与展开状态。
+- 点击 commit 在同行下方展开**内联三栏**：左列显示提交信息（subject、author、date、hash、parents，Full details 展开完整值）；中列是文件列表/目录树，内部独立滚动；右列是 list / tree 视图切换。再次点击 commit 折叠。
+- 文件行显示 status、文件名，以及 git numstat 的 `+N -M`；binary 或没有 numstat 的条目显示 `-`。点击文件名仍打开整页只读 commit diff，`Back` 返回历史并恢复滚动位置与展开状态。
+- 行尾 eye 通过 `getCommitFileContent` 查看该 commit 版本的单个文件：text 直接展示；binary、symlink、submodule（`missing`）分别提示；文本超过 1 MiB 会截断并提示，超过 20 MiB 只显示大小。deleted 条目不提供该版本视图。
+- 行尾 open current 打开工作区当前文件：优先使用公开的 `ctx.layout.open` 与 `file:` 目标；宿主不支持时退到系统默认应用；再失败则复制仓库相对路径并提示。图标点击会 `stopPropagation`，不会误选或展开 commit。
 - Merge commit 在整页 diff 中提供 parent selector（默认第一父提交）；切换后重新加载文件树与 diff。Root commit 使用空树，不请求不存在的父提交。
 - 整页 diff 只比较所选 commit 与其所选 parent，不读取工作区/索引。最多渲染 **4000** 行；超出时提示只显示前 4000 行。Binary 与服务端截断（truncated）有明确提示。
 - 两个 commit 比较：先选一个 commit 作为 base，再 `Ctrl/Cmd` 点击另一个 commit，或通过 commit 右键菜单选择比较；进入独立只读比较页。比较只生成 **commit-pair** 的 `getComparisonFiles` / `getComparisonDiff`，目标为 `base..head`，不混入工作区或索引，返回不改变 HEAD。
@@ -65,7 +67,8 @@
 - 请求按 workspace（server id + directory）隔离并在切换时中止旧请求；迟到的响应会被丢弃。
 - 刷新期间禁用仓库下拉、commit、状态文件、commit 文件、parent 和 Load more 交互；若刷新期间仍发生新选择，旧刷新快照按 generation 丢弃。
 - 切换目录/仓库/commit 时清理失效选择；同一窗口内用有界缓存保留最近的仓库/commit/文件选择。
-- refs 独立加载，refs 失败不会阻塞 history；比较请求、commit 文件请求与 diff 请求各自隔离并可取消。
+- refs 独立加载，refs 失败不会阻塞 history；比较请求、commit 文件请求、commit 文件内容请求与 diff 请求各自隔离并可取消。
+- `getCommitFiles` / `getComparisonFiles` 在 numstat 可用时附带可选 `added` / `deleted`；binary 不伪造 `0`，numstat 失败时文件列表仍可用。
 
 ## 明确未实现
 
@@ -169,9 +172,9 @@ npm run build -- --watch
 
 ## 测试与验收
 
-- 自动化测试：`npm test` 为 **390 passed / 1 platform-specific skip**；覆盖文件树、Unified Diff、虚拟滚动/行布局、分页与自动加载守卫、列布局与偏好回退、commit diff 行号、ref 交互、日期格式化、比较、写操作安全、manager 写绑定/锁、dev harness 安全等。
+- 自动化测试：`npm test` 为 **418 passed / 1 platform-specific skip**；覆盖文件树、Unified Diff、虚拟滚动/行布局、分页与自动加载守卫、列布局与偏好回退、Graph 列拖拽与固定 lane 间距、内联三栏、commit 文件内容、commit diff 行号、ref 交互、日期格式化、比较、写操作安全、manager 写绑定/锁、dev harness 安全等。
 - 静态检查：`npm run typecheck`、`npm run build`、`git diff --check` 在本轮冻结源码上通过。
-- 最终 release UI 验收：真实浏览器 **93/93 PASS**（FR 只读 + 隔离 TEMP mutation fixture），记录在 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。此前 70/70 仅保留为历史基线，不是本版回归结论。
+- 最终 release UI 验收：真实浏览器 **131/131 PASS，0 failed**（FR 只读 + 隔离 TEMP mutation/content fixture），记录在 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。`0.2.0` 的 93/93 与更早的 70/70 仅保留为历史基线，不是本版回归结论。
 - 该验收覆盖真实面板、真实 Git 数据路径、真实指针/键盘输入、对比与 mutation 路径；不覆盖原生 Desktop 宿主集成（见“当前状态”）。
 - 验收脚本与运行方式见 [`dev/ui-test/README.md`](dev/ui-test/README.md)。截图、`result.json` 等证据默认写入批准的 TEMP 目录（如 `%LOCALAPPDATA%\Temp\opencode\...`），可能包含私有仓库路径、提交信息或 diff 片段，**不得提交到版本库**，也不应写入公开文档。
 

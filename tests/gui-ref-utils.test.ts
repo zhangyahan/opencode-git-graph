@@ -1,23 +1,30 @@
 import { describe, expect, it } from "vitest"
-import type { GitCommit, GitRef, GitStatus } from "../src/shared/types.js"
+import type { ChangedFile, GitCommit, GitRef, GitStatus } from "../src/shared/types.js"
 import {
   DEFAULT_HISTORY_FILTER,
   MAX_LOG_REFS,
+  absoluteRepositoryFilePath,
   canonicalRefName,
+  canViewFileAtCommit,
+  changedFileStats,
   checkoutBlockedReason,
   commitMenuActions,
   decideCompareActivation,
+  detectCommitFileContentSupport,
   detectRpcCapabilities,
   firstParentGraphCommits,
   filterRefsToAvailable,
+  hasFileStats,
   historyFilterFingerprint,
   historyLogInput,
   isCompareModifier,
+  isSizeOnlyFileContent,
   normalizeRefSelection,
   reconcileRefFilter,
   refBadgesForCommit,
   refMenuActions,
   typedRefForBadge,
+  workspaceRelativePath,
   type RpcCapabilities,
 } from "../src/gui/ref-utils.js"
 
@@ -302,6 +309,123 @@ describe("menu actions", () => {
       capabilities: { ...CAPS, comparison: false, createBranch: false, createTag: false },
     }).map((item) => item.id)
     expect(readonly).toEqual(["view-changes", "copy-hash", "copy-subject"])
+  })
+})
+
+describe("file row metadata and host paths", () => {
+  it("reads optional added/deleted counts and ignores malformed values", () => {
+    const file = {
+      path: "src/a.ts",
+      status: "modified",
+      staged: false,
+      added: 5,
+      deleted: 2,
+    } as ChangedFile & { added: number; deleted: number }
+    expect(changedFileStats(file)).toEqual({ added: 5, deleted: 2 })
+    expect(
+      changedFileStats({
+        path: "src/b.ts",
+        status: "modified",
+        staged: false,
+      }),
+    ).toEqual({})
+    expect(
+      changedFileStats({
+        path: "src/c.ts",
+        status: "modified",
+        staged: false,
+        added: -1,
+        deleted: Number.NaN,
+      } as unknown as ChangedFile),
+    ).toEqual({})
+    expect(hasFileStats({ added: 5, deleted: 2 })).toBe(true)
+    expect(hasFileStats({ added: 0 })).toBe(true)
+    expect(hasFileStats({ deleted: 0 })).toBe(true)
+    expect(hasFileStats({})).toBe(false)
+  })
+
+  it("disables the commit-version eye only for deleted files", () => {
+    expect(
+      canViewFileAtCommit({ path: "a", status: "modified", staged: false }),
+    ).toBe(true)
+    expect(
+      canViewFileAtCommit({ path: "a", status: "deleted", staged: false }),
+    ).toBe(false)
+  })
+
+  it("builds normalized absolute and workspace-relative host paths", () => {
+    expect(
+      absoluteRepositoryFilePath("C:\\work\\repo", "src\\a.ts"),
+    ).toBe("C:/work/repo/src/a.ts")
+    expect(
+      workspaceRelativePath("C:\\work", "C:\\work\\repo", "src/a.ts"),
+    ).toBe("repo/src/a.ts")
+    expect(
+      workspaceRelativePath("C:\\work\\repo", "C:\\work\\repo", "src/a.ts"),
+    ).toBe("src/a.ts")
+    expect(
+      workspaceRelativePath("C:\\other", "C:\\work\\repo", "src/a.ts"),
+    ).toBe("C:/work/repo/src/a.ts")
+    expect(workspaceRelativePath("/work", "/work/repo", "src/a.ts")).toBe(
+      "repo/src/a.ts",
+    )
+  })
+
+  it("detects getCommitFileContent independently of mutations", () => {
+    expect(
+      detectCommitFileContentSupport({
+        getCommitFileContent: () => undefined,
+      }),
+    ).toBe(true)
+    expect(detectCommitFileContentSupport({})).toBe(false)
+    expect(
+      detectCommitFileContentSupport(
+        {},
+        { methods: { getCommitFileContent: { input: {} } } },
+      ),
+    ).toBe(false)
+  })
+
+  it("detects the real shared contract's file-content method when the client exposes it", async () => {
+    const { GitGraphRpc } = await import("../src/rpc.js")
+    expect(
+      detectCommitFileContentSupport(
+        { getCommitFileContent: () => undefined },
+        GitGraphRpc,
+      ),
+    ).toBe(true)
+  })
+
+  it("recognizes metadata-only oversized text content", () => {
+    expect(
+      isSizeOnlyFileContent({
+        path: "big.txt",
+        mode: "100644",
+        kind: "text",
+        text: null,
+        size: 25 * 1024 * 1024,
+        truncated: true,
+      }),
+    ).toBe(true)
+    expect(
+      isSizeOnlyFileContent({
+        path: "empty.txt",
+        mode: "100644",
+        kind: "text",
+        text: "",
+        size: 0,
+      }),
+    ).toBe(false)
+    expect(
+      isSizeOnlyFileContent({
+        path: "image.png",
+        mode: "100644",
+        kind: "binary",
+        text: null,
+        size: 25 * 1024 * 1024,
+        truncated: true,
+      }),
+    ).toBe(false)
   })
 })
 

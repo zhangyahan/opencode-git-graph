@@ -18,6 +18,7 @@ export const FR_READ_METHODS = [
   "getLog",
   "getRefs",
   "getCommitFiles",
+  "getCommitFileContent",
   "getDiff",
   "getComparisonFiles",
   "getComparisonDiff",

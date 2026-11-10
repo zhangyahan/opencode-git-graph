@@ -4,6 +4,7 @@ import {
   ChangeCountsSchema,
   ChangedFileSchema,
   CheckoutBranchInputSchema,
+  CommitFileContentSchema,
   CommitHashSchema,
   CreateBranchInputSchema,
   CreateTagInputSchema,
@@ -11,6 +12,8 @@ import {
   DeleteTagInputSchema,
   FileDiffSchema,
   FullCommitHashSchema,
+  GetCommitFileContentInputSchema,
+  GetCommitFileContentOutputSchema,
   GetCommitFilesInputSchema,
   GetCommitFilesOutputSchema,
   GetComparisonDiffInputSchema,
@@ -46,6 +49,7 @@ import {
 import type {
   ChangeCounts,
   ChangedFile,
+  CommitFileContent,
   FileDiff,
   GitCommit,
   GitMutationResult,
@@ -69,6 +73,9 @@ type _Commit = Assert<Equal<z.infer<typeof GitCommitSchema>, GitCommit>>
 type _Ref = Assert<Equal<z.infer<typeof GitRefSchema>, GitRef>>
 type _Target = Assert<Equal<z.infer<typeof GitTargetSchema>, GitTarget>>
 type _Diff = Assert<Equal<z.infer<typeof FileDiffSchema>, FileDiff>>
+type _CommitFileContent = Assert<
+  Equal<z.infer<typeof CommitFileContentSchema>, CommitFileContent>
+>
 
 const changes: ChangeCounts = {
   staged: 1,
@@ -82,6 +89,16 @@ const changedFile: ChangedFile = {
   oldPath: "src/old.txt",
   status: "renamed",
   staged: true,
+  added: 3,
+  deleted: 1,
+}
+
+const fileContent: CommitFileContent = {
+  path: "src/a.txt",
+  mode: "100644",
+  kind: "text",
+  text: "hello\n",
+  size: 6,
 }
 
 const repository: GitRepository = {
@@ -152,6 +169,7 @@ describe("git-graph RPC contract", () => {
       "getLog",
       "getRefs",
       "getCommitFiles",
+      "getCommitFileContent",
       "getDiff",
       "getComparisonFiles",
       "getComparisonDiff",
@@ -174,6 +192,7 @@ describe("git-graph RPC contract", () => {
       "getLog",
       "getRefs",
       "getCommitFiles",
+      "getCommitFileContent",
       "getDiff",
       "getComparisonFiles",
       "getComparisonDiff",
@@ -319,6 +338,71 @@ describe("git-graph RPC contract", () => {
       files: [changedFile],
     })
     expect(GetComparisonDiffOutputSchema.parse(diff)).toEqual(diff)
+  })
+
+  it("validates commit file content input and output", () => {
+    expect(
+      GetCommitFileContentInputSchema.parse({
+        repositoryId: repository.id,
+        hash: "abcd",
+        path: "src/中文 file.txt",
+      }),
+    ).toEqual({
+      repositoryId: repository.id,
+      hash: "abcd",
+      path: "src/中文 file.txt",
+    })
+    for (const hash of ["HEAD", "--all", "xyz", "a".repeat(65), ""]) {
+      expect(
+        GetCommitFileContentInputSchema.safeParse({
+          repositoryId: repository.id,
+          hash,
+          path: "a.txt",
+        }).success,
+      ).toBe(false)
+    }
+    for (const path of ["", "../a.txt", "/etc/passwd", "C:\\Windows\\win.ini", "a\\b.txt"]) {
+      expect(
+        GetCommitFileContentInputSchema.safeParse({
+          repositoryId: repository.id,
+          hash: "abcd",
+          path,
+        }).success,
+      ).toBe(false)
+    }
+    expect(
+      GetCommitFileContentInputSchema.safeParse({
+        repositoryId: repository.id,
+        hash: "abcd",
+        path: "a.txt",
+        extra: true,
+      }).success,
+    ).toBe(false)
+
+    expect(GetCommitFileContentOutputSchema.parse(fileContent)).toEqual(fileContent)
+    expect(
+      GetCommitFileContentOutputSchema.parse({
+        path: "sub",
+        mode: "160000",
+        kind: "missing",
+        text: null,
+        size: null,
+      }),
+    ).toEqual({ path: "sub", mode: "160000", kind: "missing", text: null, size: null })
+    expect(
+      CommitFileContentSchema.safeParse({ ...fileContent, kind: "bogus" }).success,
+    ).toBe(false)
+    expect(CommitFileContentSchema.safeParse({ ...fileContent, size: -1 }).success).toBe(false)
+    expect(
+      CommitFileContentSchema.safeParse({ ...fileContent, truncated: "yes" }).success,
+    ).toBe(false)
+    expect(CommitFileContentSchema.safeParse({ ...fileContent, text: undefined }).success).toBe(
+      false,
+    )
+
+    expect(ChangedFileSchema.parse(changedFile)).toEqual(changedFile)
+    expect(ChangedFileSchema.safeParse({ ...changedFile, added: -1 }).success).toBe(false)
+    expect(ChangedFileSchema.safeParse({ ...changedFile, deleted: 1.5 }).success).toBe(false)
   })
 
   it("validates mutation confirmation, expected head and operation fields", () => {

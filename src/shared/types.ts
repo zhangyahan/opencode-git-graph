@@ -47,6 +47,21 @@ export interface ChangedFile {
     | "untracked"
     | "conflicted"
   staged: boolean
+  /** Lines added, when git's numstat reported a numeric count (never for binary). */
+  added?: number
+  /** Lines deleted, when git's numstat reported a numeric count (never for binary). */
+  deleted?: number
+}
+
+/** Immutable content of one path in a commit tree. */
+export interface CommitFileContent {
+  path: string
+  mode: string | null
+  kind: "text" | "binary" | "symlink" | "missing"
+  text: string | null
+  /** Blob size in bytes; null when the path has no blob (gitlink). */
+  size: number | null
+  truncated?: boolean
 }
 
 export interface GitCommit {

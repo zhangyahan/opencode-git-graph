@@ -13,6 +13,15 @@ export interface HistoryColumnVisibility {
 
 export type DetailsLayout = "columns" | "rows"
 
+/** Stable header copy: Title Case, matching Git Graph. */
+export const HISTORY_COLUMN_LABELS = Object.freeze({
+  graph: "Graph",
+  description: "Description",
+  date: "Date",
+  author: "Author",
+  commit: "Commit",
+})
+
 /** Date stays visible from this width upwards. */
 export const DATE_COLUMN_MIN_WIDTH = 640
 /** Author needs a little more room than date. */

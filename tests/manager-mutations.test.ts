@@ -394,8 +394,20 @@ describe("RepositoryManager writes", () => {
       try {
         const [entry] = await manager.listRepositories()
         const files = await manager.getComparisonFiles(entry.id, base, head)
-        expect(files).toContainEqual({ path: "a.txt", status: "modified", staged: true })
-        expect(files).toContainEqual({ path: "b.txt", status: "added", staged: true })
+        expect(files).toContainEqual({
+          path: "a.txt",
+          status: "modified",
+          staged: true,
+          added: 1,
+          deleted: 1,
+        })
+        expect(files).toContainEqual({
+          path: "b.txt",
+          status: "added",
+          staged: true,
+          added: 1,
+          deleted: 0,
+        })
 
         const diff = await manager.getComparisonDiff(entry.id, base, head, "a.txt")
         expect(diff.text).toContain("-one")

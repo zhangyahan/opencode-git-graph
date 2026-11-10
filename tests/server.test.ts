@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it, vi } from "vitest"
 import {
+  GetCommitFileContentOutputSchema,
   GetCommitFilesOutputSchema,
   GetComparisonDiffOutputSchema,
   GetComparisonFilesOutputSchema,
@@ -18,8 +19,13 @@ import {
   type GitGraphManager,
 } from "../src/server/repository/manager.js"
 import { GitInputError } from "../src/server/git/validation.js"
-import type { FileDiff, GitRepository, GitStatus } from "../src/shared/types.js"
-import { commit, initRepo, mkTmpDir } from "./helpers.js"
+import type {
+  CommitFileContent,
+  FileDiff,
+  GitRepository,
+  GitStatus,
+} from "../src/shared/types.js"
+import { commit, initRepo, mkTmpDir, runGit } from "./helpers.js"
 
 type Handlers = ReturnType<typeof createGitGraphHandlers>
 type TestContext = Parameters<Handlers["getStatus"]>[1]
@@ -82,6 +88,15 @@ function fakeManager(overrides: Partial<GitGraphManager> = {}): GitGraphManager 
     getLog: vi.fn(async () => ({ commits: [], hasMore: false })),
     getRefs: vi.fn(async () => []),
     getCommitFiles: vi.fn(async () => []),
+    getCommitFileContent: vi.fn(
+      async (): Promise<CommitFileContent> => ({
+        path: "a.txt",
+        mode: "100644",
+        kind: "text",
+        text: "one\n",
+        size: 4,
+      }),
+    ),
     getDiff: vi.fn(async () => diffFixture),
     getComparisonFiles: vi.fn(async () => []),
     getComparisonDiff: vi.fn(async () => diffFixture),
@@ -150,7 +165,23 @@ describe("git-graph RPC handlers", () => {
         const files = GetCommitFilesOutputSchema.parse(
           await handlers.getCommitFiles({ repositoryId, hash: head }, context as never),
         )
-        expect(files.files).toEqual([{ path: "a.txt", status: "added", staged: true }])
+        expect(files.files).toEqual([
+          { path: "a.txt", status: "added", staged: true, added: 1, deleted: 0 },
+        ])
+
+        const content = GetCommitFileContentOutputSchema.parse(
+          await handlers.getCommitFileContent(
+            { repositoryId, hash: head, path: "a.txt" },
+            context as never,
+          ),
+        )
+        expect(content).toEqual({
+          path: "a.txt",
+          mode: "100644",
+          kind: "text",
+          text: "one\n",
+          size: 4,
+        })
 
         writeFileSync(join(repo, "a.txt"), "two\n")
         const diff = GetDiffOutputSchema.parse(
@@ -205,7 +236,13 @@ describe("git-graph RPC handlers", () => {
             context as never,
           ),
         )
-        expect(files.files).toContainEqual({ path: "b.txt", status: "added", staged: true })
+        expect(files.files).toContainEqual({
+          path: "b.txt",
+          status: "added",
+          staged: true,
+          added: 1,
+          deleted: 0,
+        })
 
         const diff = GetComparisonDiffOutputSchema.parse(
           await handlers.getComparisonDiff(
@@ -430,6 +467,43 @@ describe("git-graph RPC handlers", () => {
         expect(revision).toMatchObject({
           type: "invalid_input",
           data: { reason: "hash" },
+        })
+
+        const contentTraversal = (await handlers.getCommitFileContent(
+          { repositoryId: entry.id, hash: entry.head!, path: "../outside.txt" },
+          context as never,
+        )) as unknown as TestError
+        expect(contentTraversal).toMatchObject({
+          type: "invalid_input",
+          data: { reason: "path" },
+        })
+
+        const contentMissing = (await handlers.getCommitFileContent(
+          { repositoryId: entry.id, hash: entry.head!, path: "missing.txt" },
+          context as never,
+        )) as unknown as TestError
+        expect(contentMissing).toMatchObject({
+          type: "invalid_input",
+          data: { reason: "input" },
+        })
+
+        const tree = runGit(repo, ["rev-parse", `${entry.head}^{tree}`]).trim()
+        const contentTree = (await handlers.getCommitFileContent(
+          { repositoryId: entry.id, hash: tree, path: "a.txt" },
+          context as never,
+        )) as unknown as TestError
+        expect(contentTree).toMatchObject({
+          type: "invalid_input",
+          data: { reason: "input" },
+        })
+
+        const contentMissingOid = (await handlers.getCommitFileContent(
+          { repositoryId: entry.id, hash: "f".repeat(40), path: "a.txt" },
+          context as never,
+        )) as unknown as TestError
+        expect(contentMissingOid).toMatchObject({
+          type: "invalid_input",
+          data: { reason: "input" },
         })
       } finally {
         manager.dispose()

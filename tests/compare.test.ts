@@ -96,24 +96,38 @@ describe("getComparisonFiles", () => {
       const files = await getComparisonFiles(repo.dir, base, head)
       const map = byPath(files)
 
-      expect(map.get("added.txt")).toEqual({ path: "added.txt", status: "added", staged: true })
+      expect(map.get("added.txt")).toEqual({
+        path: "added.txt",
+        status: "added",
+        staged: true,
+        added: 1,
+        deleted: 0,
+      })
       expect(map.get("modify.txt")).toEqual({
         path: "modify.txt",
         status: "modified",
         staged: true,
+        added: 1,
+        deleted: 1,
       })
       expect(map.get("delete.txt")).toEqual({
         path: "delete.txt",
         status: "deleted",
         staged: true,
+        added: 0,
+        deleted: 1,
       })
       expect(map.get("新 文件.txt")).toEqual({
         path: "新 文件.txt",
         oldPath: "旧 文件.txt",
         status: "renamed",
         staged: true,
+        added: 0,
+        deleted: 0,
       })
       expect(map.get("binary.bin")?.status).toBe("modified")
+      expect(map.get("binary.bin")?.added).toBeUndefined()
+      expect(map.get("binary.bin")?.deleted).toBeUndefined()
       expect(map.get("keep.txt")).toBeUndefined()
       expect(map.get("stable.txt")).toBeUndefined()
 
@@ -137,17 +151,23 @@ describe("getComparisonFiles", () => {
         path: "added.txt",
         status: "deleted",
         staged: true,
+        added: 0,
+        deleted: 1,
       })
       expect(map.get("delete.txt")).toEqual({
         path: "delete.txt",
         status: "added",
         staged: true,
+        added: 1,
+        deleted: 0,
       })
       expect(map.get("旧 文件.txt")).toEqual({
         path: "旧 文件.txt",
         oldPath: "新 文件.txt",
         status: "renamed",
         staged: true,
+        added: 0,
+        deleted: 0,
       })
       expect(map.get("modify.txt")?.status).toBe("modified")
     } finally {
@@ -172,8 +192,38 @@ describe("getComparisonFiles", () => {
       const child = commit(repo.dir, { "a.txt": "two\n" }, "child")
 
       const files = await getComparisonFiles(repo.dir, root, child)
-      expect(files).toEqual([{ path: "a.txt", status: "modified", staged: true }])
+      expect(files).toEqual([
+        { path: "a.txt", status: "modified", staged: true, added: 1, deleted: 1 },
+      ])
       expect(await getComparisonFiles(repo.dir, root, root)).toEqual([])
+    } finally {
+      repo.cleanup()
+    }
+  })
+
+  it("does not count gitlink additions or bumps", async () => {
+    const repo = mkTmpRepo()
+    try {
+      const base = commit(repo.dir, { "a.txt": "one\n" }, "base")
+      repo.git(["update-index", "--add", "--cacheinfo", `160000,${base},vendor/module`])
+      repo.git(["commit", "-m", "add gitlink"])
+      const added = repo.git(["rev-parse", "HEAD"]).trim()
+
+      const addFiles = await getComparisonFiles(repo.dir, base, added)
+      expect(addFiles).toEqual([
+        { path: "vendor/module", status: "added", staged: true },
+      ])
+
+      repo.git(["commit", "--allow-empty", "-m", "target2"])
+      const target2 = repo.git(["rev-parse", "HEAD"]).trim()
+      repo.git(["update-index", "--cacheinfo", `160000,${target2},vendor/module`])
+      repo.git(["commit", "-m", "bump gitlink"])
+      const bumped = repo.git(["rev-parse", "HEAD"]).trim()
+
+      const bumpFiles = await getComparisonFiles(repo.dir, added, bumped)
+      expect(bumpFiles).toEqual([
+        { path: "vendor/module", status: "modified", staged: true },
+      ])
     } finally {
       repo.cleanup()
     }

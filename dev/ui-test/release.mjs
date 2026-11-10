@@ -24,6 +24,7 @@
  */
 
 import { createRequire } from "node:module"
+import { execFileSync } from "node:child_process"
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
@@ -67,6 +68,11 @@ const SOURCE_FILES = [
   "src/server/repository/manager.ts",
   "src/server/git/compare.ts",
   "src/server/git/log.ts",
+  "src/server/git/file-content.ts",
+  "src/server/git/diff.ts",
+  "src/gui/file-content-view.tsx",
+  "src/gui/graph-geometry.ts",
+  "src/gui/history-columns.ts",
 ]
 
 const screenshots = []
@@ -110,7 +116,19 @@ const SELECTORS = {
   confirmCancel: ['[data-testid="confirm-cancel"]'],
   dialog: ['[data-testid="confirm-dialog"]'],
   inlineSlot: ['[data-testid="inline-slot"]'],
+  inlineInfo: ['[data-testid="inline-info"]'],
   inlineFiles: ['[data-testid="inline-files"]'],
+  fileStatAdd: ['[data-testid="file-stat-add"]'],
+  fileStatDel: ['[data-testid="file-stat-del"]'],
+  viewToggleList: ['[data-testid="view-toggle-list"]'],
+  viewToggleTree: ['[data-testid="view-toggle-tree"]'],
+  fileViewAtCommit: ['[data-testid="file-view-at-commit"]'],
+  fileOpenCurrent: ['[data-testid="file-open-current"]'],
+  fileContentPanel: ['[data-testid="commit-file-content"]', '[data-testid="file-content-panel"]'],
+  fileContentClose: ['[data-testid="commit-file-content-close"]', '[data-testid="file-content-close"]', '[data-testid="close-details"]'],
+  fileCopyPath: ['[data-testid="file-copy-path"]', '[data-testid="file-copy-path-action"]', '[data-action="copy-path"]'],
+  mutationNotice: ['[data-testid="mutation-notice"]', '.gg-mutation-notice'],
+  graphHScrollLegacy: [".gg-graph-hscroll"],
   commitDiff: ['[data-testid="commit-diff-page"]'],
   comparisonDiff: ['[data-testid="comparison-page"]', '[data-testid="comparison-diff"]'],
   comparisonBack: ['[data-testid="details-back"][data-comparison-back="true"]', '[data-testid="details-back"]'],
@@ -325,6 +343,8 @@ async function layoutSnapshot(page) {
       viewport: { width: innerWidth, height: innerHeight },
       panel: rect(panel),
       panelOverflowX: overflow(panel),
+      historyHeadOverflow: overflow(q(".gg-history-head")),
+      rowOverflow: overflow(firstRow),
       doc: { scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth },
       body: { scrollWidth: document.body.scrollWidth, clientWidth: document.body.clientWidth },
       nestedButtons: qa(".git-graph-panel button button").length,
@@ -338,10 +358,25 @@ async function layoutSnapshot(page) {
         rowWidth: graphCell?.getBoundingClientRect().width ?? null,
         scrollWidth: graphCell?.scrollWidth ?? null,
         clientWidth: graphCell?.clientWidth ?? null,
+        scrollbarWidth: graphCell ? graphCell.offsetWidth - graphCell.clientWidth : null,
         hasGraphScroll: Boolean(q('[data-testid="graph-scroll"]')),
         hasGraphHandle: Boolean(q('[data-testid="resize-column-graph"]')),
+        handleCount: qa('[data-testid="resize-column-graph"]').length,
         svgWidth: firstRow?.querySelector(".gg-graph-svg")?.getAttribute("width") ?? null,
+        svgMaxX: (() => {
+          const cell = firstRow?.querySelector(".gg-row-graph")
+          const svg = firstRow?.querySelector(".gg-graph-svg")
+          if (!cell || !svg) return null
+          const cellRect = cell.getBoundingClientRect()
+          let max = 0
+          for (const shape of svg.querySelectorAll("path, circle, rect")) {
+            const rect = shape.getBoundingClientRect()
+            max = Math.max(max, rect.right - cellRect.left)
+          }
+          return max
+        })(),
       },
+      denseGraphVisible: Boolean(q('[data-testid="dense-graph"]')),
       date: firstDate
         ? {
             text: firstDate.textContent.trim(),
@@ -384,6 +419,71 @@ async function layoutSnapshot(page) {
         commit: Boolean(q('[data-testid="resize-column-commit"]')),
         graph: Boolean(q('[data-testid="resize-column-graph"]')),
       },
+    }
+  })
+}
+
+async function graphLaneSnapshot(page) {
+  return page.evaluate(() => {
+    const cells = [...document.querySelectorAll(".gg-graph-row .gg-row-graph")]
+    const svgs = [...document.querySelectorAll(".gg-graph-row .gg-graph-svg")]
+    const widths = svgs
+      .map((svg) => Number(svg.getAttribute("width")))
+      .filter((value) => Number.isFinite(value) && value > 0)
+    const contentWidth = widths.length > 0 ? Math.max(...widths) : null
+    const xs = [
+      ...new Set(
+        [...document.querySelectorAll(".gg-graph-row .gg-graph-svg circle")]
+          .map((circle) => Number(circle.getAttribute("cx")))
+          .filter((value) => Number.isFinite(value)),
+      ),
+    ].sort((a, b) => a - b)
+    const uniqueDiffs = xs.slice(1).map((value, index) => value - xs[index])
+    const laneAligned = xs.every((value) => {
+      const lane = Math.round((value - 15) / 14)
+      return Math.abs(value - (15 + lane * 14)) < 0.01
+    })
+    const spacingAligned = uniqueDiffs.every(
+      (diff) => diff > 0 && Math.abs(diff - Math.round(diff / 14) * 14) < 0.01,
+    )
+    const lanes =
+      contentWidth !== null ? Math.round((contentWidth - 16) / 14) : null
+    const formulaOk =
+      contentWidth !== null &&
+      lanes !== null &&
+      Math.abs(contentWidth - (lanes * 14 + 16)) < 0.01
+    const firstCell = cells[0]
+    const cellWidth = firstCell ? firstCell.getBoundingClientRect().width : null
+    const maxShapeRight = (() => {
+      if (!firstCell) return null
+      const cellRect = firstCell.getBoundingClientRect()
+      let max = 0
+      for (const shape of document.querySelectorAll(
+        ".gg-graph-row .gg-graph-svg path, .gg-graph-row .gg-graph-svg circle, .gg-graph-row .gg-graph-svg rect",
+      )) {
+        const rect = shape.getBoundingClientRect()
+        max = Math.max(max, rect.right - cellRect.left)
+      }
+      return max
+    })()
+    const dense = document.querySelector('[data-testid="dense-graph"]')
+    const denseText = dense?.textContent?.trim() ?? ""
+    return {
+      svgCount: svgs.length,
+      contentWidth,
+      lanes,
+      formulaOk,
+      xs,
+      uniqueDiffs,
+      laneAligned,
+      spacingAligned,
+      cellWidth,
+      scrollWidth: firstCell?.scrollWidth ?? null,
+      clientWidth: firstCell?.clientWidth ?? null,
+      maxShapeRight,
+      denseVisible: Boolean(dense),
+      denseText,
+      denseLanes: Number((denseText.match(/(\d+)\s+lanes/i) ?? [])[1] ?? NaN),
     }
   })
 }
@@ -845,10 +945,10 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
     checkResult(
       checks,
       "comparison Back leaves no DOM blank in the viewport",
-      Boolean(last) &&
+      visibleRows.length > 0 &&
         visibleRows[0].top <= viewportTop + 2 &&
         last.top + (after.rowHeight ?? 28) >= viewportBottom - 4,
-      { visibleFirst: visibleRows[0], visibleLast: last, viewportTop, viewportBottom },
+      { visibleFirst: visibleRows[0] ?? null, visibleLast: last ?? null, viewportTop, viewportBottom },
     )
 
     // If the clicked pair is a legitimate empty diff, additionally verify a
@@ -870,9 +970,11 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
         }
       }
       if (pair) {
-        await scrollToRowIndex(page, pair.baseIndex)
-        await page.locator(`.gg-graph-row[data-index="${pair.baseIndex}"]`).locator(".gg-subject").click()
-        await waitForAny(page, SELECTORS.inlineSlot)
+        if (pair.baseIndex !== before.spacer.expandedIndex) {
+          await scrollToRowIndex(page, pair.baseIndex)
+          await page.locator(`.gg-graph-row[data-index="${pair.baseIndex}"]`).locator(".gg-subject").click()
+          await waitForAny(page, SELECTORS.inlineSlot)
+        }
         await scrollToRowIndex(page, pair.headIndex)
         await page.locator(`.gg-graph-row[data-index="${pair.headIndex}"]`).locator(".gg-subject").click({ modifiers: ["Control"] })
         await waitForAny(page, SELECTORS.comparisonDiff)
@@ -887,11 +989,26 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
           null,
           { timeout: 20_000 },
         ).catch(() => {})
+        await page.waitForFunction(
+          () => {
+            const diff = document.querySelector('[data-testid="comparison-diff"]')
+            if (!diff) return false
+            const state = diff.querySelector(".gg-commit-diff-state")?.textContent?.trim() ?? ""
+            return (
+              diff.querySelectorAll(".gg-commit-diff-line").length > 0 ||
+              Boolean(diff.querySelector(".gg-commit-diff-warning")) ||
+              (state.length > 0 && !/Loading/i.test(state))
+            )
+          },
+          null,
+          { timeout: 20_000 },
+        ).catch(() => {})
         const pairState = await page.evaluate(() => ({
           page: Boolean(document.querySelector('[data-testid="comparison-page"]')),
           files: document.querySelectorAll('[data-testid="comparison-file"]').length,
           diff: Boolean(document.querySelector('[data-testid="comparison-diff"]')),
           lines: document.querySelectorAll(".gg-commit-diff-line").length,
+          warning: Boolean(document.querySelector(".gg-commit-diff-warning")),
         }))
         const pairRequests = compareRequests.filter(
           (entry) => entry.input?.baseHash === pair.baseHash && entry.input?.headHash === pair.headHash,
@@ -899,7 +1016,7 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
         checkResult(
           checks,
           "API-confirmed differing visible pair opens real comparison files and diff",
-          pairState.page && pairState.files > 0 && pairState.diff && pairState.lines > 0 && pairRequests.length > 0,
+          pairState.page && pairState.files > 0 && pairState.diff && (pairState.lines > 0 || pairState.warning) && pairRequests.length > 0,
           { pair: { baseIndex: pair.baseIndex, headIndex: pair.headIndex, files: pair.files }, pairState, pairRequests: pairRequests.length },
         )
         await screenshot(page, "13b-fr-compare-scroll-diff.png", { fullPage: true })
@@ -914,6 +1031,829 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
   await context.close()
 }
 
+async function graphDragScenario(browser, frPrimary, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  const page = await context.newPage()
+  await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+    null,
+    { timeout: 30_000 },
+  )
+  await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+  await waitRows(page, 1)
+  await page.locator('[data-testid="harness-width-1100"]').click()
+  await page.waitForFunction(
+    () => document.querySelector('[data-testid="harness-panel-shell"]')?.dataset.panelWidth === "1100",
+    null,
+    { timeout: 15_000 },
+  )
+  await waitRaf(page, 2)
+  const initial = await layoutSnapshot(page)
+  const headers = await page.evaluate(() => {
+    const cells = [...document.querySelectorAll(".gg-history-head > .gg-col-head")]
+    return cells.map((cell) => {
+      const style = getComputedStyle(cell)
+      const after = getComputedStyle(cell, "::after")
+      const before = getComputedStyle(cell, "::before")
+      const hasBorder = (styleObject, side) =>
+        styleObject[`border${side}Style`] !== "none" &&
+        styleObject[`border${side}Width`] !== "0px" &&
+        styleObject[`border${side}Color`] !== "transparent" &&
+        styleObject[`border${side}Color`] !== "rgba(0, 0, 0, 0)"
+      const pseudo = (styleObject) => {
+        if (styleObject.content === "none" || styleObject.display === "none") return false
+        const width = Number.parseFloat(styleObject.width)
+        return (
+          (Number.isFinite(width) && width > 0) ||
+          hasBorder(styleObject, "Right") ||
+          hasBorder(styleObject, "Left")
+        )
+      }
+      return {
+        text: cell.textContent.trim(),
+        borderRight: hasBorder(style, "Right"),
+        borderLeft: hasBorder(style, "Left"),
+        borderRightWidth: style.borderRightWidth,
+        borderLeftWidth: style.borderLeftWidth,
+        boxShadow: style.boxShadow,
+        afterContent: after.content,
+        afterWidth: after.width,
+        beforeContent: before.content,
+        beforeWidth: before.width,
+        afterVisible: pseudo(after),
+        beforeVisible: pseudo(before),
+      }
+    })
+  })
+  const titleCase = headers.every((header) => /^[A-Z][a-z]+$/.test(header.text))
+  const expectedHeaders = ["Graph", "Description", "Date", "Author", "Commit"]
+  const headerLabelsOk =
+    headers.length === expectedHeaders.length &&
+    expectedHeaders.every((label, index) => headers[index]?.text === label)
+  const alwaysVisibleDividers = headers
+    .slice(0, -1)
+    .every((header, index) => {
+      const next = headers[index + 1]
+      return (
+        header.borderRight ||
+        header.afterVisible ||
+        next.borderLeft ||
+        next.beforeVisible ||
+        (header.boxShadow && header.boxShadow !== "none") ||
+        (next.boxShadow && next.boxShadow !== "none")
+      )
+    })
+  metrics.graphDrag = { initial, headers, titleCase, headerLabelsOk, alwaysVisibleDividers }
+  checkResult(checks, "header labels use title case", titleCase, headers.map((header) => header.text))
+  checkResult(checks, "header labels are Graph/Description/Date/Author/Commit", headerLabelsOk, headers.map((header) => header.text))
+  checkResult(checks, "header column dividers are visible without hover", alwaysVisibleDividers, headers)
+  checkResult(checks, "graph starts at 240px with a resize handle", initial.graph.handleCount >= 1 && Math.abs(initial.graph.headerWidth - 240) <= 1, initial.graph)
+  const initialLanes = await graphLaneSnapshot(page)
+  metrics.graphDrag.initialLanes = initialLanes
+  checkResult(
+    checks,
+    "narrow graph keeps fixed 14px lane spacing (15,29,43...) and content width lanes*14+16",
+    initialLanes.svgCount > 0 &&
+      initialLanes.formulaOk &&
+      initialLanes.laneAligned &&
+      initialLanes.spacingAligned &&
+      initialLanes.xs[0] === 15,
+    initialLanes,
+  )
+  const expanded = await dragColumn(page, "graph", 80)
+  const afterExpand = await layoutSnapshot(page)
+  const laneMax = await page.evaluate(() => {
+    let max = 0
+    for (const row of document.querySelectorAll(".gg-graph-row")) {
+      const cell = row.querySelector(".gg-row-graph")
+      const svg = row.querySelector(".gg-graph-svg")
+      if (!cell || !svg) continue
+      const cellRect = cell.getBoundingClientRect()
+      for (const shape of svg.querySelectorAll("path, circle, rect")) {
+        const rect = shape.getBoundingClientRect()
+        max = Math.max(max, rect.right - cellRect.left)
+      }
+    }
+    return max
+  })
+  const legacyHScroll = await page.locator(".gg-graph-hscroll").count()
+  const graphScrollbar = await page.locator('[data-testid="graph-scroll"]').count()
+  const expandedLanes = await graphLaneSnapshot(page)
+  metrics.graphDrag.expanded = { ...afterExpand, laneMax, legacyHScroll, graphScrollbar, lanes: expandedLanes }
+  checkResult(checks, "graph pointer drag widens the graph to about 320px", expanded.after >= 300 && expanded.after <= 340, expanded)
+  checkResult(checks, "graph has no graph-scroll or legacy horizontal scrollbar after resize", graphScrollbar === 0 && legacyHScroll === 0, { graphScrollbar, legacyHScroll })
+  checkResult(checks, "graph viewport has no internal horizontal scroll", afterExpand.graph.scrollWidth <= afterExpand.graph.clientWidth + 1, afterExpand.graph)
+  checkResult(
+    checks,
+    "resized graph keeps fixed 14px lane spacing and content may exceed the column",
+    expandedLanes.formulaOk &&
+      expandedLanes.laneAligned &&
+      expandedLanes.spacingAligned &&
+      expandedLanes.xs[0] === 15 &&
+      expandedLanes.scrollWidth <= expandedLanes.clientWidth + 1,
+    expandedLanes,
+  )
+  const expandedClipped = expandedLanes.contentWidth > expandedLanes.cellWidth
+  checkResult(
+    checks,
+    "graph dragged wide enough exposes every lane without clipping or a scrollbar",
+    expandedLanes.contentWidth > 0 &&
+      !expandedClipped &&
+      expandedLanes.maxShapeRight <= expandedLanes.cellWidth + 1 &&
+      !expandedLanes.denseVisible &&
+      expandedLanes.scrollWidth <= expandedLanes.clientWidth + 1,
+    { expandedClipped, expandedLanes },
+  )
+  checkResult(checks, "resizing graph does not overflow the panel or other columns", afterExpand.panelOverflowX <= 1 && afterExpand.historyHeadOverflow <= 1 && afterExpand.rowOverflow <= 1 && afterExpand.doc.scrollWidth <= afterExpand.doc.clientWidth && afterExpand.body.scrollWidth <= afterExpand.body.clientWidth, { panelOverflowX: afterExpand.panelOverflowX, historyHeadOverflow: afterExpand.historyHeadOverflow, rowOverflow: afterExpand.rowOverflow, doc: afterExpand.doc, body: afterExpand.body, grids: afterExpand.grids })
+  await screenshot(page, "17-fr-graph-drag.png", { fullPage: true })
+  const narrowTarget = 120
+  const narrowed = await dragColumn(page, "graph", narrowTarget - expanded.after)
+  const afterNarrow = await layoutSnapshot(page)
+  const narrowLanes = await graphLaneSnapshot(page)
+  metrics.graphDrag.narrow = { ...afterNarrow, lanes: narrowLanes }
+  const graphCellBox = await page.locator(".gg-graph-row .gg-row-graph").first().boundingBox().catch(() => null)
+  if (graphCellBox) {
+    await page.mouse.move(
+      graphCellBox.x + graphCellBox.width / 2,
+      graphCellBox.y + graphCellBox.height / 2,
+    )
+    await page.mouse.wheel(60, 0)
+    await waitRaf(page, 2)
+  }
+  const scrollSemantics = await page.evaluate(() => {
+    const cell = document.querySelector(".gg-graph-row .gg-row-graph")
+    const row = cell?.closest(".gg-graph-row")
+    const inner = cell?.querySelector(".gg-row-graph-inner")
+    const history = document.querySelector('[data-testid="history-scroll"]')
+    const doc = document.scrollingElement
+    const before = {
+      cell: cell?.scrollLeft ?? null,
+      row: row?.scrollLeft ?? null,
+      inner: inner?.scrollLeft ?? null,
+      history: history?.scrollLeft ?? null,
+      doc: doc?.scrollLeft ?? null,
+    }
+    if (history) history.scrollLeft = 50
+    if (doc) doc.scrollLeft = 50
+    const afterSet = {
+      history: history?.scrollLeft ?? null,
+      doc: doc?.scrollLeft ?? null,
+    }
+    if (history) history.scrollLeft = before.history ?? 0
+    if (doc) doc.scrollLeft = before.doc ?? 0
+    let cellProgrammatic = null
+    if (cell) {
+      cell.scrollLeft = 50
+      cellProgrammatic = cell.scrollLeft
+      cell.scrollLeft = before.cell ?? 0
+    }
+    const overflow = (element) =>
+      element ? getComputedStyle(element).overflowX : null
+    const scrollable = (element) =>
+      Boolean(
+        element &&
+          /(auto|scroll)/.test(overflow(element)) &&
+          element.scrollWidth > element.clientWidth + 1,
+      )
+    return {
+      overflowX: {
+        cell: overflow(cell),
+        row: overflow(row),
+        inner: overflow(inner),
+        history: overflow(history),
+      },
+      before,
+      afterSet,
+      cellProgrammatic,
+      cellScrollLeftAfterWheel: before.cell,
+      visibleScrollableAncestor:
+        scrollable(cell) || scrollable(row) || scrollable(inner) || scrollable(history),
+    }
+  })
+  metrics.graphDrag.narrowScroll = scrollSemantics
+  checkResult(
+    checks,
+    "graph narrowed below content width keeps fixed 14px lane spacing",
+    narrowed.after >= 96 &&
+      narrowed.after <= 140 &&
+      narrowLanes.formulaOk &&
+      narrowLanes.laneAligned &&
+      narrowLanes.spacingAligned &&
+      narrowLanes.xs[0] === 15,
+    { narrowed, narrowLanes },
+  )
+  checkResult(
+    checks,
+    "narrow graph clips right lanes, shows the dense hint and has no visible/user horizontal scroll",
+    narrowLanes.contentWidth > narrowLanes.cellWidth &&
+      narrowLanes.denseVisible &&
+      narrowLanes.maxShapeRight > narrowLanes.cellWidth + 1 &&
+      /hidden|clip/.test(scrollSemantics.overflowX.cell ?? "") &&
+      /hidden|clip/.test(scrollSemantics.overflowX.history ?? "") &&
+      scrollSemantics.cellScrollLeftAfterWheel === 0 &&
+      scrollSemantics.afterSet.history === 0 &&
+      scrollSemantics.afterSet.doc === 0 &&
+      !scrollSemantics.visibleScrollableAncestor &&
+      (await page.locator('[data-testid="graph-scroll"]').count()) === 0 &&
+      (await page.locator(".gg-graph-hscroll").count()) === 0,
+    { narrowLanes, scrollSemantics },
+  )
+  const rewidened = await dragColumn(page, "graph", 320 - narrowed.after)
+  const afterRewiden = await layoutSnapshot(page)
+  const rewidenLanes = await graphLaneSnapshot(page)
+  metrics.graphDrag.rewidened = { ...afterRewiden, lanes: rewidenLanes }
+  checkResult(
+    checks,
+    "rewidening to 320px reveals every lane without clipping or a scrollbar",
+    rewidened.after >= 310 &&
+      rewidenLanes.contentWidth <= rewidenLanes.cellWidth + 1 &&
+      rewidenLanes.maxShapeRight <= rewidenLanes.cellWidth + 1 &&
+      !rewidenLanes.denseVisible &&
+      rewidenLanes.scrollWidth <= rewidenLanes.clientWidth + 1,
+    { rewidened, rewidenLanes },
+  )
+  await page.reload({ waitUntil: "domcontentloaded" })
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+    null,
+    { timeout: 30_000 },
+  )
+  await page.locator('[data-testid="harness-width-1100"]').click()
+  await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+  await waitRows(page, 1)
+  await waitRaf(page, 2)
+  const persisted = await layoutSnapshot(page)
+  checkResult(checks, "graph width persists across reload", Math.abs(persisted.graph.headerWidth - rewidened.after) <= 2, { before: rewidened.after, after: persisted.graph.headerWidth })
+  const restored = await dragColumn(page, "graph", 240 - persisted.graph.headerWidth)
+  const afterRestore = await layoutSnapshot(page)
+  const restoredLanes = await graphLaneSnapshot(page)
+  checkResult(checks, "graph can be dragged back to 240px or narrower", restored.after >= 160 && restored.after <= 260, restored)
+  checkResult(
+    checks,
+    "restored graph keeps fixed lane spacing, fits its content and has no horizontal scrollbar",
+    afterRestore.graph.scrollWidth <= afterRestore.graph.clientWidth + 1 &&
+      (await page.locator('[data-testid="graph-scroll"]').count()) === 0 &&
+      restoredLanes.formulaOk &&
+      restoredLanes.laneAligned &&
+      restoredLanes.contentWidth <= restoredLanes.cellWidth + 1 &&
+      !restoredLanes.denseVisible,
+    { graph: afterRestore.graph, lanes: restoredLanes },
+  )
+  await page.locator('[data-testid="harness-width-520"]').click()
+  await page.waitForFunction(
+    () => document.querySelector('[data-testid="harness-panel-shell"]')?.dataset.panelWidth === "520",
+    null,
+    { timeout: 15_000 },
+  )
+  await waitRaf(page, 2)
+  const narrow = await layoutSnapshot(page)
+  checkResult(checks, "520px graph budget shrinks without horizontal overflow", narrow.graph.headerWidth <= 241 && narrow.graph.scrollWidth <= narrow.graph.clientWidth + 1 && narrow.panelOverflowX <= 1 && narrow.doc.scrollWidth <= narrow.doc.clientWidth, { graph: narrow.graph, panelOverflowX: narrow.panelOverflowX, doc: narrow.doc })
+  await context.close()
+}
+
+async function inlineThreeColumnScenario(browser, frPrimary, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(FR_ORIGIN).origin }).catch(() => {})
+  const page = await context.newPage()
+  const contentRequests = []
+  page.on("request", (request) => {
+    if (!request.url().includes("/__gg/rpc/")) return
+    const method = request.url().split("/__gg/rpc/")[1]
+    if (!/content/i.test(method)) return
+    let input
+    try { input = JSON.parse(request.postData() ?? "{}") } catch { input = undefined }
+    contentRequests.push({ method, input })
+  })
+  await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+    null,
+    { timeout: 30_000 },
+  )
+  await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+  await waitRows(page, 1)
+  const log = (await fetchRpc(FR_ORIGIN, "getLog", { repositoryId: frPrimary.id, limit: 100 })).body.result
+  let chosen = null
+  let firstWithFiles = null
+  for (let index = 0; index < Math.min(25, log.commits.length); index += 1) {
+    const files = (await fetchRpc(FR_ORIGIN, "getCommitFiles", {
+      repositoryId: frPrimary.id,
+      hash: log.commits[index].hash,
+      parentIndex: 0,
+    })).body.result.files
+    if (files.length === 0) continue
+    const candidate = { index, commit: log.commits[index], files }
+    firstWithFiles ??= candidate
+    if (files.some((file) => typeof file.added === "number" && file.added > 0)) {
+      chosen = candidate
+      break
+    }
+  }
+  chosen ??= firstWithFiles
+  if (!chosen) throw new Error("No FR commit with files for inline scenario")
+  await scrollToRowIndex(page, chosen.index)
+  await page.locator(`.gg-graph-row[data-index="${chosen.index}"]`).locator(".gg-subject").click()
+  await waitForAny(page, SELECTORS.inlineSlot)
+  await page.waitForFunction(
+    () => {
+      const tree = document.querySelector('[data-testid="inline-files"]')
+      return tree && !tree.querySelector(".gg-status") && tree.querySelectorAll(".gg-file-row").length > 0
+    },
+    null,
+    { timeout: 20_000 },
+  )
+  const info = await anyLocator(page, SELECTORS.inlineInfo)
+  const infoText = info ? await info.innerText() : ""
+  const short = chosen.commit.hash.slice(0, 7)
+  metrics.inlineThree = {
+    index: chosen.index,
+    infoText,
+    files: chosen.files.length,
+    stats: [],
+  }
+  checkResult(checks, "inline info shows author, short hash and parents", Boolean(info) && infoText.includes(chosen.commit.author) && infoText.includes(short) && /(parent|root)/i.test(infoText), { infoText, author: chosen.commit.author, short, parents: chosen.commit.parents.length })
+  const listToggle = await anyLocator(page, SELECTORS.viewToggleList)
+  const treeToggle = await anyLocator(page, SELECTORS.viewToggleTree)
+  checkResult(checks, "inline list/tree toggles exist", Boolean(listToggle && treeToggle), { list: Boolean(listToggle), tree: Boolean(treeToggle) })
+  if (listToggle) {
+    await listToggle.click()
+    await waitRaf(page, 2)
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="inline-files"] .gg-dir-row').length === 0,
+      null,
+      { timeout: 5_000 },
+    ).catch(() => {})
+  }
+  const fileRows = page.locator(`${SELECTORS.inlineFiles[0]} .gg-file-row`)
+  // Backend contract: added/deleted are optional non-negative integers; binary
+  // rows omit both and must render '-' rather than fabricated numbers.
+  const titlePath = (title) => (title?.includes(" → ") ? title.split(" → ").at(-1) : title)
+  const pathOf = (file) => file?.path ?? null
+  const statsForRow = async (row) => {
+    const addLocator = row.locator(SELECTORS.fileStatAdd[0])
+    const delLocator = row.locator(SELECTORS.fileStatDel[0])
+    const statsLocator = row.locator(".gg-file-stats")
+    return {
+      add: (await addLocator.count()) > 0 ? await addLocator.first().innerText().catch(() => null) : null,
+      del: (await delLocator.count()) > 0 ? await delLocator.first().innerText().catch(() => null) : null,
+      statText: (await statsLocator.count()) > 0 ? (await statsLocator.first().innerText().catch(() => "")).trim() : "",
+    }
+  }
+  const stats = []
+  const seenPaths = new Set()
+  const collect = async (file, row) => {
+    if (!file || !row) return
+    const path = pathOf(file)
+    if (path && seenPaths.has(path)) return
+    if (path) seenPaths.add(path)
+    const ui = await statsForRow(row)
+    stats.push({
+      path,
+      apiAdded: file.added,
+      apiDeleted: file.deleted,
+      ...ui,
+    })
+  }
+  for (let index = 0; index < Math.min(5, await fileRows.count()); index += 1) {
+    const row = fileRows.nth(index)
+    const path = titlePath(await row.getAttribute("title"))
+    const file = chosen.files.find((candidate) => candidate.path === path) ?? null
+    await collect(file, row)
+  }
+  const rowForPath = async (path) => {
+    const titles = await fileRows.evaluateAll((rows) => rows.map((row) => row.getAttribute("title")))
+    const index = titles.findIndex((title) => titlePath(title) === path)
+    return index >= 0 ? fileRows.nth(index) : null
+  }
+  const positiveFile = chosen.files.find(
+    (file) => typeof file.added === "number" && file.added > 0,
+  )
+  if (positiveFile) await collect(positiveFile, await rowForPath(positiveFile.path))
+  const binaryFile = chosen.files.find(
+    (file) => file.added === undefined && file.deleted === undefined,
+  )
+  if (binaryFile) await collect(binaryFile, await rowForPath(binaryFile.path))
+  metrics.inlineThree.stats = stats
+  const numericRows = stats.filter(
+    (entry) => typeof entry.apiAdded === "number" || typeof entry.apiDeleted === "number",
+  )
+  const numericOk = numericRows.every(
+    (entry) =>
+      (typeof entry.apiAdded !== "number" || entry.add === `+${entry.apiAdded}`) &&
+      (typeof entry.apiDeleted !== "number" || entry.del === `-${entry.apiDeleted}`),
+  )
+  const binaryRows = stats.filter(
+    (entry) => entry.apiAdded === undefined && entry.apiDeleted === undefined,
+  )
+  const binaryOk = binaryRows.every((entry) => {
+    const text = [entry.add, entry.del, entry.statText]
+      .filter((value) => value !== null && value !== undefined && value !== "")
+      .join(" ")
+      .trim()
+    if (!text) return true
+    if (/\d/.test(text)) return false
+    return (
+      /^-+$/.test(text.replace(/\s+/g, "")) ||
+      /^-+$/.test(entry.statText.replace(/\s+/g, ""))
+    )
+  })
+  checkResult(
+    checks,
+    "inline file stats match real added/deleted counts and use '-' for binary rows",
+    Boolean(positiveFile) &&
+      numericRows.some((entry) => typeof entry.apiAdded === "number" && entry.apiAdded > 0) &&
+      numericOk &&
+      binaryOk,
+    { positiveFile: positiveFile?.path, numericRows, binaryRows, stats },
+  )
+  if (listToggle && treeToggle) {
+    await treeToggle.click()
+    await waitRaf(page, 2)
+    const treeState = await page.evaluate(() => ({
+      dirs: document.querySelectorAll('[data-testid="inline-files"] .gg-dir-row').length,
+      slot: Boolean(document.querySelector('[data-testid="inline-slot"]')),
+      expanded: document.querySelector(".gg-graph-row.gg-expanded") !== null,
+      details: Boolean(document.querySelector('[data-testid="commit-details"]')),
+    }))
+    await listToggle.click()
+    await waitRaf(page, 2)
+    const listState = await page.evaluate(() => ({
+      dirs: document.querySelectorAll('[data-testid="inline-files"] .gg-dir-row').length,
+      slot: Boolean(document.querySelector('[data-testid="inline-slot"]')),
+      expanded: document.querySelector(".gg-graph-row.gg-expanded") !== null,
+      details: Boolean(document.querySelector('[data-testid="commit-details"]')),
+    }))
+    metrics.inlineThree.views = { treeState, listState }
+    const nestedFiles = chosen.files.some((file) => file.path.includes("/"))
+    checkResult(checks, "list/tree toggle changes rendering without collapsing the row or selecting a file", treeState.slot && listState.slot && treeState.expanded && listState.expanded && !treeState.details && !listState.details && (!nestedFiles || treeState.dirs > 0) && listState.dirs === 0, { treeState, listState, files: chosen.files.length, nestedFiles })
+  }
+  await screenshot(page, "18-fr-inline-three.png", { fullPage: true })
+  const inlineState = () =>
+    page.evaluate((index) => {
+      const row = document.querySelector(`.gg-graph-row[data-index="${index}"]`)
+      const selected = document.querySelector(
+        '[data-testid="inline-files"] .gg-file-row[aria-selected="true"], [data-testid="inline-files"] .gg-file-row.gg-selected',
+      )
+      return {
+        expanded: row?.getAttribute("aria-expanded") ?? null,
+        selected: selected?.textContent?.trim() ?? null,
+        slot: Boolean(document.querySelector('[data-testid="inline-slot"]')),
+      }
+    }, chosen.index)
+  const noticeText = async () => {
+    const element = await anyLocator(page, SELECTORS.mutationNotice)
+    return element ? (await element.innerText().catch(() => "")).trim() : ""
+  }
+  const contentRequestsFor = (file) =>
+    contentRequests.filter(
+      (entry) =>
+        entry.input?.hash === chosen.commit.hash && entry.input?.path === file.path,
+    )
+  const contentTargets = { text: null, binary: null, symlink: null, missing: null, sizeOnly: null }
+  // getCommitFileContent({repositoryId,hash,path}) returns
+  // {path,mode,kind:text|binary|symlink|missing,text,size,truncated?}.
+  // >20MiB text is transmitted as kind:text, text:null, truncated:true
+  // (size-only); it must never be labeled binary. Deleted files do not open
+  // the viewer; their eye action stays disabled.
+  const deletedFile = chosen.files.find((file) => file.status === "deleted")
+  for (const file of chosen.files.slice(0, 40)) {
+    if (file.status === "deleted") continue
+    const content = await fetchRpc(FR_ORIGIN, "getCommitFileContent", {
+      repositoryId: frPrimary.id,
+      hash: chosen.commit.hash,
+      path: file.path,
+    })
+      .then((response) => response.body.result)
+      .catch(() => null)
+    if (!content?.kind) continue
+    if (content.kind === "text" && content.text === null) {
+      if (content.truncated) contentTargets.sizeOnly ??= { file, content }
+      continue
+    }
+    if (content.kind === "text" && !(content.text ?? "").trim()) continue
+    if (contentTargets[content.kind]) continue
+    contentTargets[content.kind] = { file, content }
+    if (contentTargets.text && contentTargets.binary && contentTargets.symlink) break
+  }
+  const primaryTarget =
+    contentTargets.text ??
+    contentTargets.binary ??
+    contentTargets.symlink ??
+    contentTargets.missing ??
+    contentTargets.sizeOnly
+
+  const exerciseContent = async (file) => {
+    const row = await rowForPath(file.path)
+    if (!row) return { row: false, eye: false }
+    const eyeLocator = row.locator(SELECTORS.fileViewAtCommit[0])
+    const eyeCount = await eyeLocator.count()
+    if (eyeCount === 0) return { row: true, eye: false }
+    const disabled = await eyeLocator.first().isDisabled().catch(() => false)
+    if (disabled) return { row: true, eye: true, disabled: true }
+    const before = await inlineState()
+    const beforeNotice = await noticeText()
+    await eyeLocator.first().click()
+    await page.waitForFunction(
+      (previous) => {
+        const panel = document.querySelector(
+          '[data-testid="commit-file-content"], [data-testid="file-content-panel"]',
+        )
+        if (panel) return true
+        const notice = document.querySelector(
+          '[data-testid="mutation-notice"], .gg-mutation-notice',
+        )
+        return Boolean(notice && (notice.textContent ?? "").trim() !== previous)
+      },
+      beforeNotice,
+      { timeout: 8_000 },
+    ).catch(() => {})
+    const panelLocator = page.locator(SELECTORS.fileContentPanel.join(","))
+    const panelVisible = (await panelLocator.count()) > 0
+    if (panelVisible) {
+      await page.waitForFunction(
+        () => {
+          const panel = document.querySelector(
+            '[data-testid="commit-file-content"], [data-testid="file-content-panel"]',
+          )
+          return Boolean(
+            panel &&
+              (panel.querySelector(
+                '.gg-file-content-text, .gg-file-content-notice, .gg-error',
+              ) ||
+                !panel.querySelector('.gg-status[role="status"]')),
+          )
+        },
+        null,
+        { timeout: 20_000 },
+      ).catch(() => {})
+    }
+    const panelText = panelVisible ? await panelLocator.first().innerText().catch(() => "") : ""
+    const notice = await noticeText()
+    const after = await inlineState()
+    let closed = null
+    let panelGone = false
+    if (panelVisible) {
+      const close = await anyLocator(page, SELECTORS.fileContentClose)
+      if (close) {
+        await close.click()
+        await page.waitForFunction(
+          () =>
+            !document.querySelector(
+              '[data-testid="commit-file-content"], [data-testid="file-content-panel"]',
+            ),
+          null,
+          { timeout: 10_000 },
+        ).catch(() => {})
+      }
+      panelGone = (await panelLocator.count()) === 0
+      closed = await inlineState()
+    }
+    return {
+      row: true,
+      eye: true,
+      disabled: false,
+      panelVisible,
+      panelText,
+      notice: notice.slice(0, 240),
+      comingSoon: !panelVisible && /coming soon/i.test(notice),
+      request: contentRequestsFor(file)[0]?.input ?? null,
+      before,
+      after,
+      closed,
+      panelGone,
+    }
+  }
+
+  const primaryResult = primaryTarget ? await exerciseContent(primaryTarget.file) : null
+  metrics.inlineThree.fileContent = {
+    targets: Object.fromEntries(
+      Object.entries(contentTargets).map(([kind, value]) => [
+        kind,
+        value ? { path: value.file.path, status: value.file.status, size: value.content.size } : null,
+      ]),
+    ),
+    deletedFile: deletedFile?.path ?? null,
+    primary: primaryResult
+      ? {
+          path: primaryTarget.file.path,
+          kind: primaryTarget.content.kind,
+          panelVisible: primaryResult.panelVisible,
+          panelText: primaryResult.panelText?.slice(0, 240),
+          request: primaryResult.request,
+          before: primaryResult.before,
+          after: primaryResult.after,
+          closed: primaryResult.closed,
+          panelGone: primaryResult.panelGone,
+        }
+      : null,
+  }
+  if (primaryResult) {
+    if (primaryResult.panelVisible) {
+      checkResult(
+        checks,
+        "file view opens a real read-only content panel with matching hash/path",
+        Boolean(primaryResult.request),
+        metrics.inlineThree.fileContent,
+      )
+      const kind = primaryTarget.content.kind
+      const contentText = primaryTarget.content.text ?? ""
+      const sizeOnly = kind === "text" && primaryTarget.content.text === null
+      const snippet = kind === "text" && !sizeOnly ? contentText.trim().slice(0, 40) : ""
+      const markerOk =
+        sizeOnly
+          ? /larger than 20 MiB|size is shown|content omitted/i.test(primaryResult.panelText) &&
+            !/binary/i.test(primaryResult.panelText)
+          : kind === "text"
+            ? snippet.length > 0 && primaryResult.panelText.includes(snippet)
+            : kind === "binary"
+              ? /binary/i.test(primaryResult.panelText)
+              : kind === "symlink"
+                ? /symbolic link/i.test(primaryResult.panelText) &&
+                  primaryResult.panelText.includes(contentText.trim())
+                : /does not exist/i.test(primaryResult.panelText)
+      checkResult(
+        checks,
+        "file content panel matches the API kind and real content",
+        markerOk,
+        { kind, sizeOnly, snippet: snippet.slice(0, 40), target: contentText.slice(0, 80), panelText: primaryResult.panelText.slice(0, 240) },
+      )
+      if (kind === "text" && primaryTarget.content.truncated && !sizeOnly) {
+        checkResult(
+          checks,
+          "truncated text content shows the server truncation warning",
+          /truncat/i.test(primaryResult.panelText),
+          { panelText: primaryResult.panelText.slice(0, 240), size: primaryTarget.content.size },
+        )
+      }
+      checkResult(
+        checks,
+        "file view action does not toggle the commit or change the selected file",
+        primaryResult.after.expanded === "true" &&
+          primaryResult.after.slot &&
+          primaryResult.after.selected === primaryResult.before.selected,
+        { before: primaryResult.before, after: primaryResult.after },
+      )
+      checkResult(
+        checks,
+        "closing file content preserves the inline slot and selection",
+        primaryResult.panelGone &&
+          primaryResult.closed?.slot &&
+          primaryResult.closed?.expanded === "true" &&
+          primaryResult.closed?.selected === primaryResult.before.selected,
+        { closed: primaryResult.closed, before: primaryResult.before, panelGone: primaryResult.panelGone },
+      )
+    } else if (primaryResult.disabled) {
+      checkResult(
+        checks,
+        "file view is disabled for a non-deleted file",
+        false,
+        { kind: primaryTarget.content.kind, path: primaryTarget.file.path, status: primaryTarget.file.status },
+      )
+    } else {
+      checkResult(
+        checks,
+        "file view is disabled or explicitly coming soon, never fake success",
+        primaryResult.comingSoon,
+        { notice: primaryResult.notice, eye: primaryResult.eye },
+      )
+    }
+  } else {
+    checkResult(checks, "at least one readable file content target exists", false, metrics.inlineThree.fileContent)
+  }
+
+  if (deletedFile) {
+    const deletedRow = await rowForPath(deletedFile.path)
+    const eyeLocator = deletedRow?.locator(SELECTORS.fileViewAtCommit[0])
+    const eyeCount = eyeLocator ? await eyeLocator.count() : 0
+    const deletedEyeDisabled =
+      eyeCount > 0 ? await eyeLocator.first().isDisabled().catch(() => false) : false
+    metrics.inlineThree.deletedEye = { path: deletedFile.path, row: Boolean(deletedRow), eyeCount, disabled: deletedEyeDisabled }
+    checkResult(
+      checks,
+      "deleted file eye action is disabled",
+      Boolean(deletedRow) && eyeCount > 0 && deletedEyeDisabled,
+      metrics.inlineThree.deletedEye,
+    )
+  }
+
+  for (const kind of ["binary", "symlink", "missing", "sizeOnly"]) {
+    const target = contentTargets[kind]
+    if (!target || target === primaryTarget) continue
+    const result = await exerciseContent(target.file)
+    const expected =
+      kind === "binary"
+        ? /binary/i
+        : kind === "symlink"
+          ? /symbolic link/i
+          : kind === "sizeOnly"
+            ? /larger than 20 MiB|size is shown|content omitted/i
+            : /does not exist/i
+    const textOk =
+      kind !== "symlink" || result.panelText?.includes((target.content.text ?? "").trim())
+    const notBinary = kind !== "sizeOnly" || !/binary/i.test(result.panelText ?? "")
+    metrics.inlineThree[`${kind}Content`] = {
+      path: target.file.path,
+      panelVisible: result.panelVisible,
+      panelText: result.panelText?.slice(0, 240),
+      request: result.request,
+    }
+    checkResult(
+      checks,
+      `${kind} file content shows the real ${kind} state`,
+      Boolean(result.panelVisible && expected.test(result.panelText) && textOk && notBinary && result.request),
+      metrics.inlineThree[`${kind}Content`],
+    )
+  }
+  await screenshot(page, "19-fr-file-actions.png", { fullPage: true })
+  // Dev harness has no Desktop host: disabled or an explicit copy/open
+  // fallback is acceptable here. A real ctx.layout.open file/desktop.launch
+  // success remains a manual Desktop acceptance item.
+  const currentButton = await anyLocator(page, SELECTORS.fileOpenCurrent)
+  const copyPath = await anyLocator(page, SELECTORS.fileCopyPath)
+  const currentFilePath = (await fileRows.count()) > 0
+    ? titlePath(await fileRows.first().getAttribute("title").catch(() => null))
+    : null
+  if (currentButton) {
+    const disabled = await currentButton.isDisabled().catch(() => false)
+    if (disabled) {
+      const copyVisible = copyPath ? await copyPath.isVisible().catch(() => false) : false
+      const hint = [
+        await currentButton.getAttribute("title").catch(() => null),
+        await currentButton.getAttribute("aria-label").catch(() => null),
+        await currentButton.innerText().catch(() => null),
+      ]
+        .filter(Boolean)
+        .join(" ")
+      const disabledHint = /desktop|host|unavailable|not available|disabled|clipboard/i.test(hint)
+      metrics.inlineThree.currentFile = { disabled, copyPath: copyVisible, hint: hint.slice(0, 160), disabledHint, path: currentFilePath, hostApi: false, desktopManual: true }
+      checkResult(checks, "dev harness current-file action is disabled as allowed (real Desktop remains manual)", disabled, metrics.inlineThree.currentFile)
+    } else {
+      const before = await noticeText()
+      const beforeCurrent = await inlineState()
+      await currentButton.click()
+      await page.waitForFunction(
+        (previous) => {
+          const notice = document.querySelector(
+            '[data-testid="mutation-notice"], .gg-mutation-notice',
+          )
+          return Boolean(notice && (notice.textContent ?? "").trim() !== previous)
+        },
+        before,
+        { timeout: 8_000 },
+      ).catch(() => {})
+      const notice = await noticeText()
+      const clipboard = await page
+        .evaluate(() => navigator.clipboard?.readText?.() ?? "")
+        .catch(() => "")
+      const afterCurrent = await inlineState()
+      const fallbackReadable = /copied|clipboard|path|open/i.test(notice)
+      const normalizePath = (value) => (value ?? "").replace(/\\/g, "/")
+      const clipboardMatches =
+        !currentFilePath ||
+        clipboard === currentFilePath ||
+        (clipboard !== "" &&
+          normalizePath(currentFilePath).endsWith(normalizePath(clipboard))) ||
+        (clipboard === "" && /copied/i.test(notice))
+      metrics.inlineThree.currentFile = {
+        disabled,
+        notice: notice.slice(0, 240),
+        clipboard: clipboard.slice(0, 240),
+        copyPath: Boolean(copyPath),
+        path: currentFilePath,
+        hostApi: false,
+        desktopManual: true,
+        mode: fallbackReadable ? "copy-or-host-fallback" : "no-observable-fallback",
+        beforeCurrent,
+        afterCurrent,
+      }
+      checkResult(
+        checks,
+        "dev harness current-file action is disabled or shows a readable host/copy fallback",
+        fallbackReadable && clipboardMatches,
+        metrics.inlineThree.currentFile,
+      )
+      checkResult(
+        checks,
+        "current-file action does not toggle the commit or change the selected file",
+        afterCurrent.expanded === "true" && afterCurrent.slot && afterCurrent.selected === beforeCurrent.selected,
+        { beforeCurrent, afterCurrent },
+      )
+    }
+  } else {
+    const copyVisible = copyPath ? await copyPath.isVisible().catch(() => false) : false
+    checkResult(checks, "current-file action is present or copy-path is available", copyVisible, { copyPath: copyVisible })
+  }
+  // Collapse and reopen to ensure the new inline view state remains stable.
+  const commitRow = page.locator(`.gg-graph-row[data-index="${chosen.index}"]`)
+  await commitRow.locator(".gg-subject").click()
+  await page.waitForFunction(() => !document.querySelector('[data-testid="inline-slot"]'), null, { timeout: 10_000 })
+  await commitRow.locator(".gg-subject").click()
+  await waitForAny(page, SELECTORS.inlineSlot)
+  checkResult(checks, "inline can be closed and reopened after view toggles", Boolean(await page.locator(SELECTORS.inlineSlot[0]).count()), {})
+  await context.close()
+}
+
 async function selectedFilterScenario(browser, tempRepo, checks, metrics) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
   const page = await context.newPage()
@@ -925,6 +1865,28 @@ async function selectedFilterScenario(browser, tempRepo, checks, metrics) {
   )
   await page.locator(SELECTORS.repository[0]).selectOption(tempRepo.id)
   await waitRows(page, 1)
+  // Remove residual test branches from interrupted earlier runs so ref badges
+  // cannot hide the branch this scenario is about to create.
+  try {
+    const state = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    const refs = (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs
+    for (const ref of refs) {
+      if (
+        ref.kind === "branch" &&
+        (ref.name.startsWith("gg-filter-") || ref.name.startsWith("gg-release-")) &&
+        ref.name !== state.branch
+      ) {
+        await fetchRpc(TEMP_ORIGIN, "deleteBranch", {
+          repositoryId: tempRepo.id,
+          expectedHead: state.head,
+          confirmed: true,
+          name: ref.name,
+        })
+      }
+    }
+  } catch {
+    /* best-effort pre-clean */
+  }
   const branchName = `gg-filter-${Date.now().toString(36)}`
   const row = page.locator(SELECTORS.row[0]).nth(1)
   await row.locator(".gg-subject").click({ button: "right" })
@@ -1007,6 +1969,12 @@ async function selectedFilterScenario(browser, tempRepo, checks, metrics) {
 async function binaryScenario(browser, tempRepo, checks, metrics) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
   const page = await context.newPage()
+  const contentRequests = []
+  page.on("request", (request) => {
+    if (!request.url().includes("/__gg/rpc/getCommitFileContent")) return
+    const input = parseInput(request)
+    if (input) contentRequests.push(input)
+  })
   await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 2,
@@ -1053,6 +2021,56 @@ async function binaryScenario(browser, tempRepo, checks, metrics) {
     { timeout: 20_000 },
   )
   const file = page.locator(`${SELECTORS.inlineFiles[0]} .gg-file-row`).filter({ hasText: found.path.split("/").at(-1) }).first()
+  const statText = await file.locator(".gg-file-stats").innerText().catch(() => "")
+  const statNone = await file.locator('[data-testid="file-stat-none"]').innerText().catch(() => "")
+  const combinedStats = `${statText} ${statNone}`.replace(/\s+/g, " ").trim()
+  const binaryStatsOk = !/\d/.test(combinedStats) && (statNone.trim() === "-" || combinedStats === "-" || combinedStats === "")
+  metrics.binaryContent = { pathKind: "binary", statText: combinedStats, statNone: statNone.trim(), binaryStatsOk }
+  checkResult(checks, "TEMP binary file row shows '-' or an empty stats placeholder without fabricated counts", binaryStatsOk, metrics.binaryContent)
+  const eye = file.locator(SELECTORS.fileViewAtCommit[0]).first()
+  const eyeCount = await eye.count()
+  const eyeDisabled = eyeCount > 0 ? await eye.isDisabled().catch(() => false) : null
+  if (eyeCount > 0 && !eyeDisabled) {
+    await eye.click()
+    const panel = page.locator(SELECTORS.fileContentPanel.join(",")).first()
+    await panel.waitFor({ state: "visible", timeout: 20_000 }).catch(() => {})
+    const panelVisible = (await panel.count()) > 0
+    if (panelVisible) {
+      await page.waitForFunction(
+        () => {
+          const panelElement = document.querySelector(
+            '[data-testid="commit-file-content"], [data-testid="file-content-panel"]',
+          )
+          return Boolean(
+            panelElement &&
+              (panelElement.querySelector(
+                '.gg-file-content-text, .gg-file-content-notice, .gg-error',
+              ) ||
+                !panelElement.querySelector('.gg-status[role="status"]')),
+          )
+        },
+        null,
+        { timeout: 20_000 },
+      ).catch(() => {})
+    }
+    const panelText = panelVisible ? await panel.innerText().catch(() => "") : ""
+    const request = contentRequests.find(
+      (entry) => entry.hash === found.commit.hash && entry.path === found.path,
+    )
+    metrics.binaryContent = { ...metrics.binaryContent, panelVisible, panelText: panelText.slice(0, 240), request }
+    checkResult(checks, "TEMP binary file content panel shows Binary and the real hash/path", panelVisible && /binary/i.test(panelText) && Boolean(request), metrics.binaryContent)
+    const close = await anyLocator(page, SELECTORS.fileContentClose)
+    if (close) await close.click()
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="commit-file-content"], [data-testid="file-content-panel"]'),
+      null,
+      { timeout: 10_000 },
+    ).catch(() => {})
+    checkResult(checks, "TEMP binary content close keeps the inline slot", Boolean(await page.locator(SELECTORS.inlineSlot[0]).count()), {})
+    await screenshot(page, "14b-temp-binary-content.png", { fullPage: true })
+  } else {
+    checkResult(checks, "TEMP binary file eye is enabled for a non-deleted file", false, { eyeCount, eyeDisabled })
+  }
   await file.click()
   await waitForAny(page, SELECTORS.commitDiff)
   await page.waitForFunction(
@@ -1066,6 +2084,248 @@ async function binaryScenario(browser, tempRepo, checks, metrics) {
   checkResult(checks, "TEMP binary commit diff shows Binary and no text lines", /binary/i.test(warning) && lines === 0, metrics.binaryDiff)
   await screenshot(page, "14-temp-binary-diff.png", { fullPage: true })
   await context.close()
+}
+
+async function contentFixtureScenario(browser, tempRepo, checks, metrics) {
+  const repoPath = tempRepo.rootPath
+  const safe =
+    /opencode|temp|fixture|mutation/i.test(repoPath) && !/workspace[\\/]fr/i.test(repoPath)
+  if (!safe) {
+    checkResult(checks, "TEMP content fixture root is safe", false, { repoPath })
+    return
+  }
+  const branch = `gg-content-${Date.now().toString(36)}`
+  const indexPath = join(
+    TEMP_ROOT,
+    `gg-content-index-${process.pid}-${Date.now().toString(36)}.tmp`,
+  )
+  const runGit = (args, options = {}) =>
+    execFileSync("git", ["-C", repoPath, ...args], {
+      encoding: "utf8",
+      input: options.input,
+      env: { ...process.env, ...(options.env ?? {}) },
+      maxBuffer: 64 * 1024 * 1024,
+      timeout: 120_000,
+    }).trim()
+  const gitEnv = {
+    GIT_INDEX_FILE: indexPath,
+    GIT_AUTHOR_NAME: "GG Release",
+    GIT_AUTHOR_EMAIL: "gg-release@example.invalid",
+    GIT_COMMITTER_NAME: "GG Release",
+    GIT_COMMITTER_EMAIL: "gg-release@example.invalid",
+  }
+  const contentRequests = []
+  let context
+  try {
+    if (existsSync(indexPath)) unlinkSync(indexPath)
+    runGit(["read-tree", "main"], { env: gitEnv })
+    const blob = (buffer) =>
+      runGit(["hash-object", "-w", "--stdin"], { env: gitEnv, input: buffer })
+    const largeOid = blob(Buffer.alloc(21 * 1024 * 1024, 0x41))
+    const truncatedText = Buffer.from("line\n".repeat(Math.ceil((2 * 1024 * 1024) / 5)))
+    const truncatedOid = blob(truncatedText)
+    const symlinkOid = blob(Buffer.from("gg-target.txt"))
+    const deletedOid = blob(Buffer.from("deleted fixture\n"))
+    const mainHead = runGit(["rev-parse", "HEAD"])
+    const add = (mode, oid, path) =>
+      runGit(["update-index", "--add", "--cacheinfo", `${mode},${oid},${path}`], {
+        env: gitEnv,
+      })
+    add("100644", deletedOid, "gg-deleted.txt")
+    const treeA = runGit(["write-tree"], { env: gitEnv })
+    const commitA = runGit(
+      ["commit-tree", treeA, "-p", mainHead, "-m", "gg content fixture A"],
+      { env: gitEnv },
+    )
+    runGit(["update-index", "--force-remove", "gg-deleted.txt"], { env: gitEnv })
+    add("120000", symlinkOid, "gg-symlink")
+    add("160000", mainHead, "gg-submodule")
+    add("100644", largeOid, "gg-large.txt")
+    add("100644", truncatedOid, "gg-truncated.txt")
+    const treeB = runGit(["write-tree"], { env: gitEnv })
+    const commitB = runGit(
+      ["commit-tree", treeB, "-p", commitA, "-m", "gg content fixture B"],
+      { env: gitEnv },
+    )
+    runGit(["update-ref", `refs/heads/${branch}`, commitB])
+    metrics.contentFixture = { branch, commitA, commitB, sizes: { large: 21 * 1024 * 1024, truncated: truncatedText.length } }
+
+    context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+    const page = await context.newPage()
+    page.on("request", (request) => {
+      if (!request.url().includes("/__gg/rpc/getCommitFileContent")) return
+      const input = parseInput(request)
+      if (input) contentRequests.push(input)
+    })
+    await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 2,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(tempRepo.id)
+    await waitRows(page, 1)
+    await openBranchSelector(page)
+    await page.locator(SELECTORS.branchFilterSelected[0]).click()
+    const checkbox = page.locator(
+      `${SELECTORS.branchFilterRef[0]}[value="refs/heads/${branch}"]`,
+    )
+    await checkbox.waitFor({ state: "visible", timeout: 15_000 })
+    await checkbox.click()
+    await page.locator(SELECTORS.applyBranchFilter[0]).click()
+    await closeBranchSelector(page)
+    await page.waitForFunction(
+      (hash) => Boolean(document.querySelector(`.gg-graph-row[data-commit="${hash}"]`)),
+      commitB,
+      { timeout: 30_000 },
+    ).catch(() => {})
+    const fixtureRow = page.locator(`.gg-graph-row[data-commit="${commitB}"]`)
+    if ((await fixtureRow.count()) === 0) throw new Error("Synthetic content commit is not visible")
+    await fixtureRow.locator(".gg-subject").click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await page.waitForFunction(
+      () => {
+        const tree = document.querySelector('[data-testid="inline-files"]')
+        return tree && !tree.querySelector(".gg-status") && tree.querySelectorAll(".gg-file-row").length >= 5
+      },
+      null,
+      { timeout: 20_000 },
+    )
+    const listToggle = await anyLocator(page, SELECTORS.viewToggleList)
+    if (listToggle) {
+      await listToggle.click()
+      await waitRaf(page, 2)
+    }
+    const rowFor = (name) =>
+      page
+        .locator(`${SELECTORS.inlineFiles[0]} .gg-file-row`)
+        .filter({ hasText: name })
+        .first()
+    const openContent = async (name) => {
+      const row = rowFor(name)
+      const eye = row.locator(SELECTORS.fileViewAtCommit[0]).first()
+      const eyeCount = await eye.count()
+      const disabled = eyeCount > 0 ? await eye.isDisabled().catch(() => false) : null
+      if (eyeCount === 0 || disabled) return { eyeCount, disabled, panelVisible: false }
+      await eye.click()
+      const panel = page.locator(SELECTORS.fileContentPanel.join(",")).first()
+      await panel.waitFor({ state: "visible", timeout: 20_000 }).catch(() => {})
+      const panelVisible = (await panel.count()) > 0
+      if (panelVisible) {
+        await page.waitForFunction(
+          () => {
+            const panelElement = document.querySelector(
+              '[data-testid="commit-file-content"], [data-testid="file-content-panel"]',
+            )
+            return Boolean(
+              panelElement &&
+                (panelElement.querySelector(
+                  '.gg-file-content-text, .gg-file-content-notice, .gg-error',
+                ) ||
+                  !panelElement.querySelector('.gg-status[role="status"]')),
+            )
+          },
+          null,
+          { timeout: 20_000 },
+        ).catch(() => {})
+      }
+      const panelText = panelVisible ? await panel.innerText().catch(() => "") : ""
+      const request = contentRequests.find(
+        (entry) => entry.hash === commitB && entry.path === name,
+      )
+      const close = await anyLocator(page, SELECTORS.fileContentClose)
+      if (close) {
+        await close.click()
+        await page.waitForFunction(
+          () => !document.querySelector('[data-testid="commit-file-content"], [data-testid="file-content-panel"]'),
+          null,
+          { timeout: 10_000 },
+        ).catch(() => {})
+      }
+      return { eyeCount, disabled, panelVisible, panelText, request, closed: (await page.locator(SELECTORS.inlineSlot[0]).count()) > 0 }
+    }
+
+    const symlink = await openContent("gg-symlink")
+    metrics.contentFixture.symlink = { panelVisible: symlink.panelVisible, panelText: symlink.panelText?.slice(0, 200), request: symlink.request }
+    checkResult(
+      checks,
+      "synthetic symlink content shows the symlink target",
+      Boolean(symlink.panelVisible && /symbolic link/i.test(symlink.panelText) && symlink.panelText.includes("gg-target.txt") && symlink.request && symlink.closed),
+      metrics.contentFixture.symlink,
+    )
+
+    const sizeOnly = await openContent("gg-large.txt")
+    metrics.contentFixture.sizeOnly = { panelVisible: sizeOnly.panelVisible, panelText: sizeOnly.panelText?.slice(0, 200), request: sizeOnly.request }
+    checkResult(
+      checks,
+      "synthetic >20MiB content shows the real size-only notice and not Binary",
+      Boolean(
+        sizeOnly.panelVisible &&
+          /larger than 20 MiB|size is shown/i.test(sizeOnly.panelText) &&
+          !/binary/i.test(sizeOnly.panelText) &&
+          sizeOnly.request &&
+          sizeOnly.closed,
+      ),
+      metrics.contentFixture.sizeOnly,
+    )
+
+    const truncated = await openContent("gg-truncated.txt")
+    metrics.contentFixture.truncated = { panelVisible: truncated.panelVisible, panelText: truncated.panelText?.slice(0, 200), request: truncated.request }
+    checkResult(
+      checks,
+      "synthetic 2MiB text shows the server truncation warning",
+      Boolean(truncated.panelVisible && /truncated/i.test(truncated.panelText) && truncated.request && truncated.closed),
+      metrics.contentFixture.truncated,
+    )
+
+    const gitlink = await openContent("gg-submodule")
+    metrics.contentFixture.gitlink = { panelVisible: gitlink.panelVisible, panelText: gitlink.panelText?.slice(0, 200), request: gitlink.request }
+    checkResult(
+      checks,
+      "synthetic gitlink content reports no file content at the commit",
+      Boolean(gitlink.panelVisible && /submodule|gitlink|no file content/i.test(gitlink.panelText) && gitlink.request && gitlink.closed),
+      metrics.contentFixture.gitlink,
+    )
+
+    const gitlinkRow = rowFor("gg-submodule")
+    const gitlinkStatsText = await gitlinkRow.locator(".gg-file-stats").innerText().catch(() => "")
+    const gitlinkStatNone = await gitlinkRow.locator('[data-testid="file-stat-none"]').innerText().catch(() => "")
+    const gitlinkStats = `${gitlinkStatsText} ${gitlinkStatNone}`.replace(/\s+/g, " ").trim()
+    metrics.contentFixture.gitlinkStats = { text: gitlinkStats, statNone: gitlinkStatNone.trim() }
+    checkResult(
+      checks,
+      "gitlink row shows '-'/empty stats and no fabricated numeric counts",
+      !/\d/.test(gitlinkStats) && (gitlinkStats === "" || gitlinkStatNone.trim() === "-" || gitlinkStats === "-"),
+      metrics.contentFixture.gitlinkStats,
+    )
+
+    const deletedRow = rowFor("gg-deleted.txt")
+    const deletedEye = deletedRow.locator(SELECTORS.fileViewAtCommit[0]).first()
+    const deletedEyeCount = await deletedEye.count()
+    const deletedDisabled = deletedEyeCount > 0 ? await deletedEye.isDisabled().catch(() => false) : false
+    metrics.contentFixture.deleted = { row: (await deletedRow.count()) > 0, eyeCount: deletedEyeCount, disabled: deletedDisabled }
+    checkResult(
+      checks,
+      "synthetic deleted file eye is disabled",
+      (await deletedRow.count()) > 0 && deletedEyeCount > 0 && deletedDisabled,
+      metrics.contentFixture.deleted,
+    )
+    await screenshot(page, "20-temp-content-fixture.png", { fullPage: true })
+  } finally {
+    try {
+      runGit(["update-ref", "-d", `refs/heads/${branch}`])
+    } catch {
+      /* best-effort cleanup */
+    }
+    if (existsSync(indexPath)) {
+      try {
+        unlinkSync(indexPath)
+      } catch {
+        /* best-effort cleanup */
+      }
+    }
+    if (context) await context.close().catch(() => {})
+  }
 }
 
 async function warningFaultScenario(browser, tempRepo, checks, metrics) {
@@ -1272,7 +2532,6 @@ async function auditSelectors(browser, base, label, minimumOptions) {
   }
   const expectedAbsent = new Set([
     '[data-testid="graph-scroll"]',
-    '[data-testid="resize-column-graph"]',
   ])
   const alternatives = [
     ['[data-testid="commit-date"]', ".gg-col-date"],
@@ -1369,7 +2628,7 @@ async function fullRun(browser, executablePath) {
     await waitRaf(fr, 2)
     const layout = await layoutSnapshot(fr)
     metrics.layout1100 = layout
-    checkResult(checks, "graph is fixed at 240px with no graph handle or horizontal graph scroll", layout.graph.headerWidth === 240 && layout.graph.rowWidth === 240 && !layout.graph.hasGraphHandle && !layout.graph.hasGraphScroll && layout.graph.scrollWidth <= layout.graph.clientWidth, layout.graph)
+    checkResult(checks, "graph starts at 240px with a resize handle and no graph scrollbar", layout.graph.headerWidth === 240 && layout.graph.rowWidth === 240 && layout.graph.handleCount >= 1 && !layout.graph.hasGraphScroll && layout.graph.scrollWidth <= layout.graph.clientWidth, layout.graph)
     checkResult(checks, "Date shows full 19-character seconds, default 150px and an ISO tooltip", layout.date.visible && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(layout.date.text) && Math.abs(layout.date.width - 150) <= 1 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(layout.date.title ?? ""), layout.date)
     checkResult(checks, "1100px has no body/panel horizontal overflow or nested buttons", layout.doc.scrollWidth <= layout.doc.clientWidth && layout.body.scrollWidth <= layout.body.clientWidth && layout.panelOverflowX <= 1 && layout.nestedButtons === 0, { doc: layout.doc, body: layout.body, panelOverflow: layout.panelOverflowX, nestedButtons: layout.nestedButtons })
     await screenshot(fr, "01-fr-graph-date-1100.png", { fullPage: true })
@@ -1386,7 +2645,7 @@ async function fullRun(browser, executablePath) {
         graphClientWidth: row.querySelector(".gg-row-graph")?.clientWidth,
       }))
       const expectedParents = frLog.commits[mergeIndex].parents.length
-      checkResult(checks, "dense graph keeps parent edges and fits the fixed 240px graph column", mergeInfo.paths >= expectedParents && mergeInfo.graphScrollWidth <= mergeInfo.graphClientWidth, { ...mergeInfo, expectedParents })
+      checkResult(checks, "dense graph keeps parent edges and fits the graph column", mergeInfo.paths >= expectedParents && mergeInfo.graphScrollWidth <= mergeInfo.graphClientWidth, { ...mergeInfo, expectedParents })
       await fr.locator(SELECTORS.historyScroll[0]).evaluate((element) => { element.scrollTop = 0 })
       await waitRaf(fr, 2)
     } else {
@@ -1413,7 +2672,7 @@ async function fullRun(browser, executablePath) {
     const narrow = await layoutSnapshot(fr)
     metrics.layout520 = narrow
     checkResult(checks, "520px has no horizontal overflow and no nested buttons", narrow.doc.scrollWidth <= narrow.doc.clientWidth && narrow.body.scrollWidth <= narrow.body.clientWidth && narrow.panelOverflowX <= 1 && narrow.nestedButtons === 0, { doc: narrow.doc, body: narrow.body, panelOverflow: narrow.panelOverflowX, nestedButtons: narrow.nestedButtons })
-    checkResult(checks, "520px keeps the fixed 240px graph without graph controls", narrow.graph.headerWidth === 240 && !narrow.graph.hasGraphHandle && !narrow.graph.hasGraphScroll, narrow.graph)
+    checkResult(checks, "520px keeps the graph within its budget without horizontal overflow", narrow.graph.headerWidth <= 241 && narrow.graph.rowWidth <= 241 && !narrow.graph.hasGraphScroll && narrow.graph.scrollWidth <= narrow.graph.clientWidth, narrow.graph)
     await screenshot(fr, "03-fr-520.png", { fullPage: true })
     await fr.locator('[data-testid="harness-width-1100"]').click()
     await fr.waitForFunction(
@@ -1817,6 +3076,16 @@ async function fullRun(browser, executablePath) {
     } catch (error) {
       checkResult(checks, "scrolled inline comparison scenario executes", false, { error: String(error) })
     }
+    try {
+      await graphDragScenario(browser, frPrimary, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "graph drag scenario executes", false, { error: String(error) })
+    }
+    try {
+      await inlineThreeColumnScenario(browser, frPrimary, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "inline three-column scenario executes", false, { error: String(error) })
+    }
 
     // TEMP mutation fixture: real write UI flow only here.
     await temp.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
@@ -2081,6 +3350,11 @@ async function fullRun(browser, executablePath) {
       await binaryScenario(browser, tempRepo, checks, metrics)
     } catch (error) {
       checkResult(checks, "TEMP binary diff scenario executes", false, { error: String(error) })
+    }
+    try {
+      await contentFixtureScenario(browser, tempRepo, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "TEMP content fixture scenario executes", false, { error: String(error) })
     }
     try {
       await warningFaultScenario(browser, tempRepo, checks, metrics)

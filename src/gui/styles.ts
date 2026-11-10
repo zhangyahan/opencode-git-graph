@@ -457,7 +457,6 @@ export const GG_STYLES = `
   color: var(--color-textSecondary, #b0b0b0);
   font-size: 10.5px;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
 }
 .gg-history-head > div {
   min-width: 0;
@@ -465,6 +464,9 @@ export const GG_STYLES = `
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 0 7px;
+}
+.gg-history-head > div + div {
+  border-left: 1px solid var(--color-border, #444);
 }
 .gg-col-graph-head {
   position: relative;
@@ -519,12 +521,10 @@ export const GG_STYLES = `
 .gg-col-head-commit .gg-column-resize {
   right: 0;
 }
-/* The graph column has no resize handle: it is application-owned and never
-   participates in persisted widths. */
-.gg-graph-hscroll,
-.gg-graph-hscroll-row,
-.gg-graph-hspacer {
-  display: none !important;
+/* The graph column is user-resizable from its header edge, but the handle is
+   inset so the panel cannot gain a horizontal scrollbar. */
+.gg-graph-resize {
+  right: 0 !important;
 }
 .gg-history-scroll {
   position: relative;
@@ -564,11 +564,168 @@ export const GG_STYLES = `
 }
 .gg-row-slot-body {
   display: flex;
+  flex-direction: row;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.gg-inline-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 0 1 auto;
+  width: clamp(140px, 22%, 190px);
+  min-width: 96px;
+  max-width: 190px;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 7px;
+  border-right: 1px solid var(--color-border, #3a3a3a);
+  background: rgba(0, 0, 0, 0.06);
+  font-size: 10.5px;
+}
+.gg-inline-info-subject {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-textPrimary, #d4d4d4);
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gg-inline-info-row {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+.gg-inline-info-label {
+  flex: 0 0 42px;
+  color: var(--color-textMuted, #8a8a8a);
+  font-size: 9.5px;
+}
+.gg-inline-info-value {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-textSecondary, #b0b0b0);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gg-inline-info-mono {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+.gg-inline-parents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+.gg-inline-parent {
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.14);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 9.5px;
+}
+.gg-inline-info-details {
+  margin-top: 2px;
+  color: var(--color-textMuted, #8a8a8a);
+  font-size: 9.5px;
+}
+.gg-inline-info-details summary {
+  cursor: pointer;
+}
+.gg-inline-info-details .gg-inline-info-mono {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.gg-row-slot-files {
+  display: flex;
   flex-direction: column;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+}
+.gg-inline-view-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 28px;
+  width: 28px;
+  padding: 4px 2px;
+  border-left: 1px solid var(--color-border, #3a3a3a);
+  background: rgba(0, 0, 0, 0.06);
+}
+.gg-inline-view {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0 !important;
+  border: 1px solid transparent !important;
+  border-radius: 3px !important;
+  background: transparent !important;
+  color: var(--color-textMuted, #8a8a8a);
+}
+.gg-inline-view:hover {
+  background: var(--color-surfaceHover, #303030) !important;
+  color: var(--color-textPrimary, #d4d4d4);
+}
+.gg-inline-view.active {
+  border-color: rgba(122, 162, 247, 0.6) !important;
+  background: rgba(90, 130, 220, 0.22) !important;
+  color: var(--color-textPrimary, #d4d4d4);
+}
+.gg-file-list {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.gg-file-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 9.5px;
+}
+.gg-file-stat-add {
+  color: #7ddb88;
+}
+.gg-file-stat-del {
+  color: #ff8585;
+}
+.gg-file-stat-none {
+  color: var(--color-textMuted, #8a8a8a);
+}
+.gg-file-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  flex: 0 0 auto;
+}
+.gg-file-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0 !important;
+  border: 0 !important;
+  border-radius: 3px !important;
+  background: transparent !important;
+  color: var(--color-textMuted, #8a8a8a);
+}
+.gg-file-action:hover:not(:disabled) {
+  background: var(--color-surfaceHover, #303030) !important;
+  color: var(--color-textPrimary, #d4d4d4);
+}
+.gg-file-action:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 .gg-row-slot-head {
   display: flex;
@@ -581,7 +738,6 @@ export const GG_STYLES = `
   color: var(--color-textSecondary, #b0b0b0);
   font-size: 10.5px;
   letter-spacing: 0.03em;
-  text-transform: uppercase;
 }
 .gg-row-slot-title {
   font-weight: 600;
@@ -645,9 +801,14 @@ export const GG_STYLES = `
   opacity: 0.6;
   cursor: default;
 }
+.git-graph-panel .gg-file-row[aria-disabled="true"] {
+  opacity: 0.6;
+  cursor: default;
+}
 .gg-row-graph {
   position: relative;
   align-self: stretch;
+  min-width: 0;
   overflow: hidden;
 }
 .gg-row-graph-inner {
@@ -656,7 +817,7 @@ export const GG_STYLES = `
 }
 .gg-graph-svg {
   display: block;
-  overflow: visible;
+  overflow: hidden;
 }
 .gg-col-desc {
   display: flex;
@@ -1295,6 +1456,86 @@ export const GG_STYLES = `
   justify-content: flex-end;
   gap: 8px;
   padding-top: 4px;
+}
+
+/* ---------- historical file content ---------- */
+.gg-file-content {
+  display: flex;
+  flex-direction: column;
+  width: min(900px, 92vw);
+  height: min(80vh, 720px);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-border, #444);
+  border-radius: 8px;
+  background: var(--color-background, #1e1e1e);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  color: var(--color-textPrimary, #d4d4d4);
+  font-family: var(--font-sans, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif);
+  font-size: 12px;
+  pointer-events: auto;
+}
+.gg-file-content-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-border, #3a3a3a);
+}
+.gg-file-content-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.gg-file-content-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 11.5px;
+}
+.gg-file-content-hash {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+.gg-file-content-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.gg-file-content-text {
+  margin: 0;
+  padding: 8px 10px;
+  white-space: pre;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.gg-file-content-notice {
+  padding: 14px;
+  color: var(--color-textMuted, #8a8a8a);
+  font-size: 11.5px;
+}
+.gg-file-content .gg-dialog-actions {
+  padding: 8px 10px;
+  border-top: 1px solid var(--color-border, #3a3a3a);
+}
+.gg-file-content .gg-warning,
+.gg-file-content .gg-error,
+.gg-file-content .gg-status {
+  margin: 8px;
+}
+.gg-file-content button {
+  font: inherit;
+  color: inherit;
 }
 
 /* Portals live outside .git-graph-panel, so they cannot rely on a host global

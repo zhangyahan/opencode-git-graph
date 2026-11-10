@@ -7,12 +7,12 @@ import {
   detailsLayout,
   historyColumnTemplate,
   historyColumns,
+  HISTORY_COLUMN_LABELS,
   refBadgeCountForBudget,
   visibleRefCount,
 } from "../src/gui/history-columns.js"
 import {
   clampGraphColumnWidth,
-  DEFAULT_LANE_SPACING,
   graphContentWidth,
   graphLaneSpacing,
   graphLaneX,
@@ -20,7 +20,8 @@ import {
   GRAPH_COLUMN_MAX_WIDTH,
   GRAPH_COLUMN_MIN_WIDTH,
   GRAPH_COLUMN_WIDTH,
-  isDenseGraph,
+  isGraphClipped,
+  LANE_SPACING,
 } from "../src/gui/graph-geometry.js"
 import {
   repositoryOptionLabel,
@@ -78,6 +79,19 @@ describe("history column policy", () => {
     expect(historyColumns(AUTHOR_COLUMN_MIN_WIDTH - 1)).toEqual({ date: true, author: false })
     expect(historyColumns(AUTHOR_COLUMN_MIN_WIDTH)).toEqual({ date: true, author: true })
     expect(historyColumns(1100)).toEqual({ date: true, author: true })
+  })
+
+  it("uses Title Case for the visible header labels", () => {
+    expect(HISTORY_COLUMN_LABELS).toEqual({
+      graph: "Graph",
+      description: "Description",
+      date: "Date",
+      author: "Author",
+      commit: "Commit",
+    })
+    for (const value of Object.values(HISTORY_COLUMN_LABELS)) {
+      expect(value).not.toBe(value.toUpperCase())
+    }
   })
 
   it("builds one grid template that matches the visible columns", () => {
@@ -150,16 +164,26 @@ describe("graph geometry", () => {
     expect(clampGraphColumnWidth(171.6)).toBe(172)
   })
 
-  it("keeps 14px for common lane counts and fits every edge in the fixed column", () => {
-    expect(graphLaneSpacing(GRAPH_COLUMN_WIDTH, 15, 8)).toBe(DEFAULT_LANE_SPACING)
-    expect(graphLaneSpacing(GRAPH_COLUMN_WIDTH, 1, 8)).toBe(DEFAULT_LANE_SPACING)
-    const dense = graphLaneSpacing(GRAPH_COLUMN_WIDTH, 172, 8)
-    expect(dense).toBeLessThan(2)
-    expect(isDenseGraph(dense)).toBe(true)
-    const lastLane = 171
-    expect(graphLaneX(lastLane, dense, 8) + dense / 2).toBeLessThanOrEqual(
-      GRAPH_COLUMN_WIDTH - 8,
-    )
+  it("keeps the fixed 14px lane step at every column width", () => {
+    expect(graphLaneSpacing()).toBe(LANE_SPACING)
+    expect(graphLaneSpacing()).toBe(14)
+    for (const width of [GRAPH_COLUMN_WIDTH, 200, 120]) {
+      expect(graphLaneX(0, graphLaneSpacing(), 8)).toBe(15)
+      expect(graphLaneX(1, graphLaneSpacing(), 8)).toBe(29)
+      expect(graphLaneX(2, graphLaneSpacing(), 8)).toBe(43)
+      expect(graphContentWidth(15, graphLaneSpacing(), 8) > width).toBe(width < 226)
+    }
+  })
+
+  it("clips the right-hand lanes instead of compressing them in a narrow column", () => {
+    const contentWidth = (lanes: number): number =>
+      graphContentWidth(lanes, graphLaneSpacing(), 8)
+    expect(isGraphClipped(contentWidth(15), GRAPH_COLUMN_WIDTH)).toBe(false)
+    expect(isGraphClipped(contentWidth(16), GRAPH_COLUMN_WIDTH)).toBe(false)
+    expect(isGraphClipped(contentWidth(17), GRAPH_COLUMN_WIDTH)).toBe(true)
+    expect(isGraphClipped(contentWidth(15), 120)).toBe(true)
+    expect(isGraphClipped(contentWidth(15), GRAPH_COLUMN_MAX_WIDTH)).toBe(false)
+    expect(isGraphClipped(contentWidth(1), GRAPH_COLUMN_MIN_WIDTH)).toBe(false)
   })
 })
 

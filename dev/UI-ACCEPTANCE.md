@@ -1,76 +1,87 @@
 # Release UI acceptance (real browser)
 
-**Verdict: PASS — 93/93 checks passed, 0 failed.**
+**Verdict: PASS — 131/131 checks passed, 0 failed.**
 
-The frozen release build was tested against two real environments:
+The frozen release UI was tested against two real environments:
 
 - **FR**: read-only fixture, 16 repositories / 4 worktrees.
-- **TEMP**: isolated synthetic mutation fixture under the approved TEMP root.
+- **TEMP**: isolated synthetic mutation/content fixture.
 - Real production components and the real repository manager/RPC path; normal
   repository data was not mocked.
-- Fresh real-browser loads at the start of both environments; real pointer and
-  keyboard input.
+- Fresh real-browser loads, real pointer and keyboard input.
 
 This public summary is anonymized. Private repository names, absolute paths,
-hashes, source paths and private file/diff content are not included. Complete
-machine evidence and screenshots remain only in the operator TEMP
-`gg-ui-release-final-pass` directory. Earlier 70/70 evidence is retained
-separately.
+commit hashes, source paths and private file/diff content are not included.
+Complete machine evidence and screenshots remain only in the operator TEMP
+`gg-ui-release-frozen-final-20261110-1504` directory.
 
-## Results
+## Final result
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Existing core regression | PASS | All prior 70 checks passed again in this run: repository discovery, fixed 240 px graph, Date 150 px with 19-character seconds and ISO title, 520/1100 layouts, four non-graph column resizers, branch filters/refs, history controls, menus, context-menu compare, auto pagination, inline/Back, FR guard, TEMP writes, root, dirty/stale/unknown errors. |
-| FR loading gate | PASS | Initial load and Refresh held real `getStatus`/`getLog` responses. First-parent/remotes/tags/order were disabled or guarded while held; after release 100 loaded, rows/header/Refresh/repository select usable, no permanent busy. |
-| Scrolled plain + Ctrl/Cmd comparison | PASS | History at 900 px with inline slot open; plain first commit + Ctrl/Cmd second opened comparison. Real `getComparisonFiles`/`getComparisonDiff` carried the selected base/head. The files pane showed 152 files; selecting a file rendered a real text diff. |
-| Comparison Back | PASS | Vertical scroll remained 900 → 900 (≤1 px); expanded index and slot height were preserved; rendered DOM covered the viewport without a blank window. |
-| Selected-ref filters + mutation | PASS | Selected filter showed 3 loaded rows. Rename/delete left history usable with no invalid-ref error; secondary repository did not inherit the old filter. |
-| Badge keyboard | PASS | Enter and Space opened the ref menu without expanding the row; focus returned to the trigger after close. Ctrl+F/Enter and Ctrl+H/Escape worked. |
-| TEMP binary diff | PASS | Real binary file diff showed a Binary warning and zero text diff lines. |
-| Mutation warning fault | PASS | Isolated fault response carried a real status snapshot plus warning; UI showed it, one request, no automatic retry. Not mixed with normal success evidence. |
-| AfterServer mutation gate | PASS | Real checkout mutation executed, then its real response was held. Repository dropdown was busy-disabled, exactly one mutation request occurred, no abort/retry, and a newly opened dialog survived completion. |
-| FR read-only guard | PASS | Six invalid/guard probes returned 403 `rpc.method_forbidden`; HEAD and all refs unchanged. No valid confirmed FR mutation was sent. |
-| Refs failure isolation | PASS | Injected refs 502 showed a refs error while history stayed at 100 loaded / 30 rows. |
-| Console / network | PASS | FR and TEMP: 0 page errors, 0 unexpected console errors, 0 non-abort request failures, 0 unexpected HTTP ≥400. Only benign favicon 404s; expected aborts were separated; fault responses isolated. |
-| Source / HMR | PASS | Production source mtimes were identical before/after; no hot-update or page-reload events. |
+| Prior 93-check core regression | PASS | Repository discovery, history, filters, menus, comparison/Back, loading gate, FR guard, TEMP writes, binary diff, warning/afterServer paths. |
+| Graph fixed lane spacing | PASS | Narrow and wide drags keep lane centres at 15/29/43… with a fixed 14 px step; content width is `lanes * 14 + 16`. |
+| Graph clipping semantics | PASS | At 120 px the 170 px lane field is clipped by `overflow-x: hidden`; no graph-scroll/legacy hscroll, no visible scrollbar, horizontal wheel and scroller stay at scrollLeft 0, dense hint is shown. |
+| Graph wide reveal | PASS | Dragging to 320 px exposes every lane; dense hint disappears; reload persistence and 520 px budget pass. |
+| Header dividers / Title Case | PASS | Always-visible vertical separators; Graph/Description/Date/Author/Commit labels. |
+| Inline three-column layout | PASS | Info column, list/tree switching, row remains expanded, selection unchanged. |
+| Stat badges | PASS | Real `+N/-M` values from `getCommitFiles`; binary rows show `-`/empty placeholder; gitlink rows show `-` with no fabricated counts. |
+| File content panel | PASS | Real `getCommitFileContent`: text, binary, symlink, >20 MiB size-only, 2 MiB truncated, gitlink/missing; close preserves the inline slot and selection. |
+| Deleted file eye | PASS | Deleted row eye action is disabled. |
+| Open current file | PASS (dev harness) | No host: readable copy-path fallback; recorded `hostApi:false`, real Desktop remains manual. |
+| Console / network | PASS | 0 page errors, 0 unexpected console errors, 0 non-abort request failures, 0 unexpected HTTP >= 400; only benign favicon 404s. |
+| Source / HMR | PASS | Production source mtimes identical before/after; no HMR or reload events. |
+| TEMP cleanup | PASS | Returned to `main` with a clean worktree and no test branches/tags. |
+| FR read-only | PASS | HEAD and refs unchanged; no valid confirmed mutation was sent. |
+
+## Graph metric clarification
+
+`overflow: hidden` clipping is expected. The acceptance does **not** treat the
+clip container's `scrollWidth > clientWidth` as a failure. It verifies:
+
+- no graph scroll element or legacy horizontal scrollbar;
+- the graph cell and history scroller use `overflow-x: hidden`/`clip`;
+- horizontal wheel leaves `scrollLeft` at 0 and history/document `scrollLeft`
+  cannot be changed;
+- no scrollable ancestor with `auto`/`scroll` overflow;
+- lane centres remain fixed at 14 px spacing;
+- the right lane field extends beyond the column, proving clipping;
+- a wider 320 px column exposes every lane.
 
 ## Screenshots (basenames; private TEMP only)
 
-- `01-fr-graph-date-1100.png` — fixed graph and full Date.
-- `02-fr-columns-after-drag.png` — four non-graph columns after pointer drags.
-- `03-fr-520.png` — compact layout.
-- `04-fr-branch-filter.png` — branch selector and refs.
-- `05-fr-ref-menu.png` — ref menu.
-- `06-fr-compare.png` — context-menu comparison path.
-- `07-temp-checkout-dialog.png` — checkout confirmation.
-- `08-temp-checkout-success.png` — confirmed checkout.
-- `09-temp-branch-success.png` — created branch visible.
-- `10-temp-error-paths.png` — TEMP root/error context.
-- `11-fr-refs-failure.png` — refs failure with usable history.
-- `12-fr-loading-gate.png` — held status/log loading state.
-- `13-fr-compare-scroll.png` — scrolled inline plain + Ctrl comparison with real diff.
-- `14-temp-binary-diff.png` — binary diff warning.
-- `15-temp-warning-fault.png` — isolated mutation warning.
-- `16-temp-mutation-switch.png` — afterServer-held mutation with busy repository control.
-
-Complete private result and screenshots are under the operator TEMP
-`gg-ui-release-final-pass` directory. The earlier 70/70 baseline and 88/89
-failure evidence are retained separately. No private evidence is committed.
+- `01-fr-graph-date-1100.png`
+- `02-fr-columns-after-drag.png`
+- `03-fr-520.png`
+- `04-fr-branch-filter.png`
+- `05-fr-ref-menu.png`
+- `06-fr-compare.png`
+- `07-temp-checkout-dialog.png`
+- `08-temp-checkout-success.png`
+- `09-temp-branch-success.png`
+- `10-temp-error-paths.png`
+- `11-fr-refs-failure.png`
+- `12-fr-loading-gate.png`
+- `13-fr-compare-scroll.png`
+- `14-temp-binary-diff.png`
+- `14b-temp-binary-content.png`
+- `15-temp-warning-fault.png`
+- `16-temp-mutation-switch.png`
+- `17-fr-graph-drag.png`
+- `18-fr-inline-three.png`
+- `19-fr-file-actions.png`
+- `20-temp-content-fixture.png`
 
 ## Historical baseline
 
-The earlier 79/79 and 70/70 results remain historical baselines only; they are
-not the regression truth for this extended interaction matrix.
+The prior 93/93 PASS remains the historical baseline. This run revalidated that
+core subset and added the 0.2.0 graph, header, inline three-column and file
+content scenarios.
 
-## Not covered / unavailable
+## Not covered / manual
 
-- Real Desktop session/scope switching and host session/route changes:
-  explicitly outside this harness; no debug hooks or prod signal changes were
-  used.
-- Desktop window/panel chrome, `MenuItem` registration, host theme/event bus and
-  real Desktop panel resize.
-- Network push/fetch/reset-clean; unavailable and not invoked.
-- Mutation output-warning behavior was exercised only as an isolated fault, not
-  as a real successful mutation.
-- No product FAIL remains in the exercised harness matrix.
+- Real Desktop session/scope switching, window/panel chrome, `MenuItem`
+  registration, host theme/event bus and real Desktop panel resizing.
+- Real `ctx.layout.open file` / `desktop.launch` host success; the dev harness
+  only proved the readable copy-path fallback and records `hostApi:false`.
+- Network push/fetch/reset-clean and other unavailable remote operations.

@@ -11,6 +11,7 @@ import {
 } from "../../rpc.js"
 import type {
   ChangedFile,
+  CommitFileContent,
   FileDiff,
   GitMutationResult,
   GitRef,
@@ -20,6 +21,7 @@ import type {
 } from "../../shared/types.js"
 import { getComparisonDiff, getComparisonFiles } from "../git/compare.js"
 import { getCommitFiles, getDiff } from "../git/diff.js"
+import { getCommitFileContent } from "../git/file-content.js"
 import { git, GitError, type GitSignalOptions } from "../git/executor.js"
 import { getLog, type LogOptions, type LogResult } from "../git/log.js"
 import * as mutations from "../git/mutations.js"
@@ -124,6 +126,12 @@ export interface RepositoryManagerDeps {
     parentIndex?: number,
     options?: GitSignalOptions,
   ) => Promise<ChangedFile[]>
+  getCommitFileContent: (
+    repositoryPath: string,
+    hash: string,
+    filePath: string,
+    options?: GitSignalOptions,
+  ) => Promise<CommitFileContent>
   getDiff: (
     repositoryPath: string,
     target: GitTarget,
@@ -167,6 +175,7 @@ const DEFAULT_DEPS: RepositoryManagerDeps = {
   getLog,
   getRefs,
   getCommitFiles,
+  getCommitFileContent,
   getDiff,
   getComparisonFiles,
   getComparisonDiff,
@@ -403,6 +412,24 @@ export class RepositoryManager implements GitGraphManager {
       const repository = await this.requireRepository(repositoryId)
       this.throwIfAborted(signal)
       return this.deps.getCommitFiles(repository.rootPath, hash, parentIndex, { signal })
+    })
+  }
+
+  async getCommitFileContent(
+    repositoryId: string,
+    hash: string,
+    filePath: string,
+    options: GitSignalOptions = {},
+  ): Promise<CommitFileContent> {
+    return this.withSignal(options.signal, async (signal) => {
+      this.assertCommitHash(hash)
+      if (!isSafeRelativePath(filePath)) {
+        throw new RepositoryManagerError("invalid_input", "Invalid file path", { reason: "path" })
+      }
+
+      const repository = await this.requireRepository(repositoryId)
+      this.throwIfAborted(signal)
+      return this.deps.getCommitFileContent(repository.rootPath, hash, filePath, { signal })
     })
   }
 
@@ -905,6 +932,12 @@ export interface GitGraphManager {
     parentIndex?: number,
     options?: GitSignalOptions,
   ): Promise<ChangedFile[]>
+  getCommitFileContent(
+    repositoryId: string,
+    hash: string,
+    filePath: string,
+    options?: GitSignalOptions,
+  ): Promise<CommitFileContent>
   getDiff(
     repositoryId: string,
     target: GitTarget,
@@ -1248,6 +1281,44 @@ export function createGitGraphHandlers(
         return { files }
       } catch (error) {
         const mapped = mapError(error, "getCommitFiles")
+        if (mapped.type === "disposed") {
+          return context.error("disposed", "Git graph manager has been disposed", {})
+        }
+        if (context.signal.aborted || isAbortError(error)) {
+          return context.error("git_failed", SIGNAL_ABORTED, { operation: "cancelled" })
+        }
+        switch (mapped.type) {
+          case "repository_not_found":
+            return context.error("repository_not_found", "Repository not found", {
+              repositoryId: mapped.repositoryId,
+            })
+          case "invalid_input":
+            return context.error("invalid_input", "Invalid input", { reason: mapped.reason })
+          case "git_failed":
+            return context.error("git_failed", "Git operation failed", {
+              operation: mapped.operation,
+            })
+        }
+      }
+    },
+
+    getCommitFileContent: async (input, context) => {
+      if (context.signal.aborted) {
+        return context.error("git_failed", SIGNAL_BEFORE, { operation: "cancelled" })
+      }
+      try {
+        const content = await manager.getCommitFileContent(
+          input.repositoryId,
+          input.hash,
+          input.path,
+          { signal: context.signal },
+        )
+        if (context.signal.aborted) {
+          return context.error("git_failed", SIGNAL_AFTER, { operation: "cancelled" })
+        }
+        return content
+      } catch (error) {
+        const mapped = mapError(error, "getCommitFileContent")
         if (mapped.type === "disposed") {
           return context.error("disposed", "Git graph manager has been disposed", {})
         }

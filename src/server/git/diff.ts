@@ -1,6 +1,6 @@
 import { open } from "node:fs/promises"
 import type { ChangedFile, FileDiff, GitTarget } from "../../shared/types.js"
-import { git, type GitSignalOptions } from "./executor.js"
+import { git, GitError, type GitSignalOptions } from "./executor.js"
 import { filterOverrideArgs } from "./safety.js"
 import {
   assertCommitOid,
@@ -107,41 +107,116 @@ function parseNameStatus(output: string): ChangedFile[] {
   return files
 }
 
+export interface NumstatCount {
+  added: number
+  deleted: number
+}
+
+function isNumstatCount(value: string): boolean {
+  return /^\d+$/.test(value) && Number.isSafeInteger(Number(value))
+}
+
+/**
+ * Parse `--numstat -z` output.
+ *
+ * A normal record is a single NUL-terminated chunk with TAB-separated fields:
+ * `added\tdeleted\tpath\0`. Rename/copy records keep the two paths as separate
+ * NUL-terminated fields, immediately after an empty pathname field:
+ * `added\tdeleted\t\0old\0new\0`. Binary files report `-\t-` and are omitted
+ * (the counts are unknown, not zero).
+ */
+export function parseNumstat(output: string): Map<string, NumstatCount> {
+  const records = output.split("\0")
+  const counts = new Map<string, NumstatCount>()
+
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i]
+    if (!record) continue
+
+    const firstTab = record.indexOf("\t")
+    const secondTab = firstTab < 0 ? -1 : record.indexOf("\t", firstTab + 1)
+    if (firstTab < 0 || secondTab < 0) continue
+
+    const added = record.slice(0, firstTab)
+    const deleted = record.slice(firstTab + 1, secondTab)
+    let key = record.slice(secondTab + 1)
+    if (key === "") {
+      // Rename/copy: the next two NUL-separated fields are old and new paths.
+      i += 2 // skip old path, then use new path for matching
+      key = records[i] ?? ""
+      if (key === "") continue
+    }
+
+    if (!isNumstatCount(added) || !isNumstatCount(deleted)) continue
+    counts.set(key, { added: Number(added), deleted: Number(deleted) })
+  }
+
+  return counts
+}
+
+/**
+ * Attach numstat counts to name-status entries by their (new) path.
+ *
+ * Entries without a matching numeric numstat record keep their previous shape:
+ * binary files, submodules and anything git could not count stay `undefined`.
+ */
+export function withNumstat(
+  files: ChangedFile[],
+  counts: Map<string, NumstatCount>,
+): ChangedFile[] {
+  if (counts.size === 0) return files
+  return files.map((file) => {
+    const count = counts.get(file.path)
+    return count ? { ...file, added: count.added, deleted: count.deleted } : file
+  })
+}
+
+const NUMSTAT_SAFETY_ARGS = ["--no-color", "--no-ext-diff", "--no-textconv"] as const
+
+function commitDiffArgs(context: CommitContext, output: "--name-status" | "--numstat"): string[] {
+  const common = [
+    "--no-commit-id",
+    output,
+    "-r",
+    "-z",
+    "-M",
+    ...NUMSTAT_SAFETY_ARGS,
+    ...(output === "--numstat" ? ["--ignore-submodules=all"] : []),
+  ]
+  return context.parents.length === 0
+    ? ["diff-tree", "--root", ...common, context.oid]
+    : ["diff-tree", ...common, context.parents[context.parentIndex], context.oid]
+}
+
 async function readCommitFiles(
   repoPath: string,
   context: CommitContext,
   options: GitSignalOptions,
 ): Promise<ChangedFile[]> {
-  const args =
-    context.parents.length === 0
-      ? [
-          "diff-tree",
-          "--root",
-          "--no-commit-id",
-          "--name-status",
-          "-r",
-          "-z",
-          "-M",
-          "--no-color",
-          "--no-ext-diff",
-          "--no-textconv",
-          context.oid,
-        ]
-      : [
-          "diff-tree",
-          "--no-commit-id",
-          "--name-status",
-          "-r",
-          "-z",
-          "-M",
-          "--no-color",
-          "--no-ext-diff",
-          "--no-textconv",
-          context.parents[context.parentIndex],
-          context.oid,
-        ]
+  return parseNameStatus(await git(repoPath, commitDiffArgs(context, "--name-status"), options))
+}
 
-  return parseNameStatus(await git(repoPath, args, options))
+/**
+ * Attach numeric numstat counts to a commit's changed files.
+ *
+ * A numstat failure would make a previously working file list fail, so it is
+ * ignored unless the caller cancelled; entries simply keep no counts.
+ */
+async function readCommitNumstat(
+  repoPath: string,
+  context: CommitContext,
+  files: ChangedFile[],
+  options: GitSignalOptions,
+): Promise<ChangedFile[]> {
+  if (files.length === 0) return files
+  let output: string
+  try {
+    output = await git(repoPath, commitDiffArgs(context, "--numstat"), options)
+  } catch (error) {
+    if (options.signal?.aborted || !(error instanceof GitError)) throw error
+    return files
+  }
+  return withNumstat(files, parseNumstat(output))
 }
 
 /** List staged changes. Comparing tree/index never applies worktree filters. */
@@ -176,7 +251,8 @@ export async function getCommitFiles(
   options: GitSignalOptions = {},
 ): Promise<ChangedFile[]> {
   const context = await resolveCommitContext(repoPath, hash, parentIndex, options)
-  return readCommitFiles(repoPath, context, options)
+  const files = await readCommitFiles(repoPath, context, options)
+  return readCommitNumstat(repoPath, context, files, options)
 }
 
 function inferStatus(text: string, fallback: DiffStatus = "modified"): DiffStatus {
