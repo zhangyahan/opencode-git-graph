@@ -1,6 +1,6 @@
 import { realpath } from "node:fs/promises"
 import path from "node:path"
-import type { GitStatus } from "../../shared/types.js"
+import type { GitFetchResult, GitStatus } from "../../shared/types.js"
 import { git, GitError, GitWriteError, gitWrite } from "./executor.js"
 import { readFilterDrivers } from "./safety.js"
 import { getStatus } from "./status.js"
@@ -10,6 +10,7 @@ import {
   checkRefFormat,
   GitInputError,
   isValidBranchNameSyntax,
+  isValidRemoteNameSyntax,
   isValidTagNameSyntax,
 } from "./validation.js"
 
@@ -60,6 +61,21 @@ export interface DeleteBranchOptions extends MutationOptions {
 
 export interface DeleteTagOptions extends MutationOptions {
   name: string
+}
+
+/**
+ * A network fetch can legitimately take much longer than a local write. The
+ * process is never killed by an AbortSignal (writes have no signal); it is only
+ * bounded by this timeout, and a timeout is reported as `fetch_timeout` with an
+ * unknown/partial ref state.
+ */
+export const FETCH_TIMEOUT = 300_000
+
+export interface FetchRemoteOptions extends MutationOptions {
+  /** Remote name, or `null` to fetch every configured remote. */
+  remote: string | null
+  /** Delete remote-tracking refs whose upstream branch is gone (`--prune`). */
+  prune?: boolean
 }
 
 /**
@@ -1143,4 +1159,274 @@ export async function deleteTag(
 
   const refreshed = await refreshStatus(root, status)
   return buildResult(refreshed, true)
+}
+
+const FETCH_RULES: WriteFailureRule[] = [
+  {
+    pattern:
+      /Authentication failed|could not read Username|could not read Password|terminal prompts disabled|HTTP Basic: Access denied|Permission denied \(publickey|Permission denied, please try again/i,
+    reason: "auth_failed",
+    message: "The remote rejected the credentials; configure access and retry",
+  },
+  {
+    pattern:
+      /Could not resolve host|unable to access|Failed to connect|Connection (?:refused|reset|timed out)|Network is unreachable|No route to host|SSL certificate|RPC failed|TLS|early EOF|remote end hung up|unexpected disconnect/i,
+    reason: "network_failed",
+    message: "The remote could not be reached; check the network connection and retry",
+  },
+  {
+    pattern:
+      /does not appear to be a git repository|No such remote|not a git repository|Repository not found/i,
+    reason: "remote_not_found",
+    message: "The remote repository could not be found",
+  },
+]
+
+/**
+ * Map a failed fetch to a stable reason.
+ *
+ * A timeout means the ref state may be partially updated (the process is
+ * terminated by the executor), so it is never mapped to a retryable generic
+ * failure. Exported so the classifier can be exercised without waiting for a
+ * real network timeout.
+ */
+export function mapFetchFailure(error: unknown): GitMutationError {
+  if (error instanceof GitWriteError && error.timedOut) {
+    return new GitMutationError(
+      "fetch_timeout",
+      "The git fetch timed out; fetched refs may be partially updated. Refresh before retrying.",
+      { cause: error },
+    )
+  }
+  if (error instanceof GitError) {
+    for (const rule of FETCH_RULES) {
+      if (rule.pattern.test(error.stderr)) {
+        return new GitMutationError(rule.reason, rule.message, { cause: error })
+      }
+    }
+  }
+  return new GitMutationError(
+    "fetch_failed",
+    "The git fetch command failed; fetched refs may be partially updated. Refresh before retrying.",
+    { cause: error },
+  )
+}
+
+async function assertRemoteName(
+  root: string,
+  name: unknown,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (!isValidRemoteNameSyntax(name)) {
+    throw new GitMutationError("invalid_name", "Invalid remote name")
+  }
+  let valid: boolean
+  try {
+    valid = await checkRefFormat(root, `refs/remotes/${name}/HEAD`, { signal })
+  } catch (error) {
+    if (isAbortError(error)) throw error
+    throw unsafeRepository("Cannot validate the remote name")
+  }
+  if (!valid) throw new GitMutationError("invalid_name", "Invalid remote name")
+  return name
+}
+
+/** Resolve the configured remotes from `remote.<name>.url` keys. */
+async function listRemoteNames(root: string, signal?: AbortSignal): Promise<string[]> {
+  try {
+    const output = await git(root, ["remote"], { signal })
+    return output
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+  } catch (error) {
+    if (isAbortError(error)) throw error
+    throw new GitMutationError("unsafe_repository", "Cannot enumerate the configured remotes", {
+      cause: error,
+    })
+  }
+}
+
+/**
+ * Confirm a remote exists in the repository config.
+ *
+ * `git config` does not contact the network and `--get-all` exits 1 when the
+ * key is absent. The name has already passed syntax and `check-ref-format`
+ * validation, so it cannot inject a config key.
+ */
+async function remoteConfigured(
+  root: string,
+  name: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  try {
+    await git(root, ["config", "--get-all", `remote.${name}.url`], { signal })
+    return true
+  } catch (error) {
+    if (error instanceof GitError && error.code === 1) return false
+    if (isAbortError(error)) throw error
+    throw new GitMutationError("unsafe_repository", "Cannot read the remote configuration", {
+      cause: error,
+    })
+  }
+}
+
+const FETCH_REF_FORMAT = "%(refname)%00%(objectname)%00%(symref)"
+
+/**
+ * Snapshot every remote-tracking and tag ref.
+ *
+ * Symbolic refs (for example `refs/remotes/origin/HEAD`) are skipped: their
+ * object id follows their target, so counting both would double-count one
+ * update. Names are canonical refnames and cannot contain whitespace, so a
+ * NUL-separated record per line is unambiguous.
+ */
+async function snapshotFetchRefs(
+  root: string,
+  signal?: AbortSignal,
+): Promise<Map<string, string>> {
+  const output = await git(
+    root,
+    ["for-each-ref", `--format=${FETCH_REF_FORMAT}`, "refs/remotes/", "refs/tags/"],
+    { signal },
+  )
+
+  const refs = new Map<string, string>()
+  for (const line of output.split("\n")) {
+    if (!line) continue
+    const [refname, objectName, symref = ""] = line.split("\0")
+    if (!refname || !objectName) continue
+    if (symref.length > 0) continue
+    refs.set(refname, objectName)
+  }
+  return refs
+}
+
+/**
+ * Compare ref snapshots.
+ *
+ * `updated` counts new refs and refs whose object id changed; `deleted` counts
+ * refs removed by `--prune`. Deletions are kept separate so `refsUpdated`
+ * remains "how many refs the fetch wrote".
+ */
+function countFetchRefChanges(
+  before: Map<string, string>,
+  after: Map<string, string>,
+): { updated: number; deleted: number } {
+  let updated = 0
+  for (const [name, oid] of after) {
+    const previous = before.get(name)
+    if (previous === undefined || previous !== oid) updated++
+  }
+
+  let deleted = 0
+  for (const name of before.keys()) {
+    if (!after.has(name)) deleted++
+  }
+  return { updated, deleted }
+}
+
+/**
+ * Verify HEAD is still the commit the caller observed.
+ *
+ * `git fetch` never moves HEAD, so a change means another process switched
+ * branches or reset while the fetch was running. The write itself is left in
+ * place; the caller is told to refresh.
+ */
+async function assertHeadUnchanged(
+  root: string,
+  expectedHead: string | null,
+): Promise<void> {
+  if (expectedHead === null) return
+
+  let current: string | null = null
+  try {
+    const output = (await git(root, ["rev-parse", "--verify", "--quiet", "HEAD"])).trim()
+    current = output.length > 0 ? output.toLowerCase() : null
+  } catch {
+    current = null
+  }
+  if (current === null || current !== expectedHead) {
+    throw new GitMutationError(
+      "head_mismatch",
+      "The repository HEAD changed while fetching; refresh and retry",
+    )
+  }
+}
+
+/**
+ * Fetch one or all remotes and report how many refs the fetch wrote.
+ *
+ * This is a hardened write (`gitWrite`): hooks, auto-gc/maintenance, submodule
+ * recursion, replace refs and the filesystem monitor are disabled exactly like
+ * every other mutation. It deliberately has no AbortSignal, so a started fetch
+ * is never killed by UI cancellation or dispose; the process is only bounded by
+ * {@link FETCH_TIMEOUT} (5 minutes) because it is a network operation.
+ *
+ * Only `--prune` is forwarded as an argument array, never as free-form input.
+ * Filters are irrelevant here (fetch only writes refs and objects), so none are
+ * enumerated or disabled.
+ *
+ * `expectedHead` is checked before the fetch (via {@link prepare}) and again
+ * afterwards. A fetch that changes no refs resolves with `changed: false` and
+ * `refsUpdated: 0`; "up to date" is a successful outcome, not a rejection.
+ */
+export async function fetchRemote(
+  repoPath: string,
+  options: FetchRemoteOptions,
+): Promise<GitFetchResult> {
+  const requested = options?.remote
+  if (requested !== null && requested !== undefined && typeof requested !== "string") {
+    throw new GitInputError("Invalid remote: expected a string or null")
+  }
+  const remote = requested ?? null
+
+  const { root, status, expectedHead } = await prepare(repoPath, options)
+  const prune = options.prune === true
+  const signal = options.signal
+
+  let remotes: string[]
+  if (remote === null) {
+    remotes = await listRemoteNames(root, signal)
+    if (remotes.length === 0) {
+      throw new GitMutationError("no_remotes", "No remotes are configured for this repository")
+    }
+    // Names come from repository config: validate each one before it is passed
+    // to git so a hostile config cannot inject an option.
+    for (const name of remotes) await assertRemoteName(root, name, signal)
+  } else {
+    const name = await assertRemoteName(root, remote, signal)
+    if (!(await remoteConfigured(root, name, signal))) {
+      throw new GitMutationError("remote_not_found", "The requested remote is not configured")
+    }
+    remotes = [name]
+  }
+
+  const before = await snapshotFetchRefs(root, signal)
+  throwIfAborted(signal)
+
+  for (const name of remotes) {
+    const args = ["fetch"]
+    if (prune) args.push("--prune")
+    args.push(name)
+    try {
+      await gitWrite(root, args, { timeout: FETCH_TIMEOUT })
+    } catch (error) {
+      throw mapFetchFailure(error)
+    }
+  }
+
+  await assertHeadUnchanged(root, expectedHead)
+
+  const after = await snapshotFetchRefs(root)
+  const { updated, deleted } = countFetchRefChanges(before, after)
+  const refreshed = await refreshStatus(root, status)
+
+  const result: GitFetchResult = {
+    status: refreshed.status,
+    changed: updated > 0 || deleted > 0,
+    refsUpdated: updated,
+  }
+  if (refreshed.warning) result.warning = refreshed.warning
+  return result
 }

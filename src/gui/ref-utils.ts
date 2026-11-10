@@ -355,6 +355,36 @@ export interface MutationResult {
   readonly warning?: string
 }
 
+/** Reasons the server may attach to a rejected fetch (`mutation_rejected`). */
+export type FetchRemoteErrorReason =
+  | "no_remotes"
+  | "remote_not_found"
+  | "auth_failed"
+  | "network_failed"
+  | "fetch_timeout"
+  | "head_mismatch"
+  | "invalid_name"
+  | "fetch_failed"
+  | "partial_failure"
+
+export interface FetchRemoteInput {
+  readonly repositoryId: string
+  /** Remote name, or null/undefined for All remotes. */
+  readonly remote: string | null
+  readonly prune: boolean
+  /** Full HEAD captured when the confirmation dialog opened. */
+  readonly expectedHead: string | null
+  readonly confirmed: true
+}
+
+export interface FetchRemoteResult {
+  /** Post-fetch repository status from the server. */
+  readonly status: GitStatus
+  readonly refsUpdated: number
+  readonly changed: boolean
+  readonly warning?: string
+}
+
 export interface MutationBaseInput {
   readonly repositoryId: string
   /** Full 40/64-character HEAD captured when the dialog opens. */
@@ -426,6 +456,7 @@ export interface ExtendedGitGraphRpc {
     options?: RequestOptionsLike,
   ): Promise<MutationResult>
   deleteTag?(input: DeleteTagInput, options?: RequestOptionsLike): Promise<MutationResult>
+  fetchRemote?(input: FetchRemoteInput, options?: RequestOptionsLike): Promise<FetchRemoteResult>
 }
 
 export function extendedClient(rpc: unknown): ExtendedGitGraphRpc {
@@ -540,6 +571,41 @@ export function detectCommitFileContentSupport(
     return false
   }
   return methodPresent(client, definition, "getCommitFileContent")
+}
+
+/**
+ * Fetch is landing separately as `fetchRemote`. It is a real server mutation,
+ * so the toolbar button stays disabled until the connected client exposes it.
+ */
+export function detectFetchRemoteSupport(
+  client: unknown,
+  definition?: DefinitionLike,
+): boolean {
+  return methodPresent(client, definition, "fetchRemote")
+}
+
+/**
+ * Unique remote names from the loaded typed refs (`origin/main` -> `origin`).
+ * The refs API is the only remote inventory this GUI has without a new RPC.
+ */
+export function remoteNamesFromRefs(refs: readonly GitRef[]): string[] {
+  const names = new Set<string>()
+  for (const ref of refs) {
+    if (ref.kind !== "remote") continue
+    const name = ref.name.split("/")[0]
+    if (name) names.add(name)
+  }
+  return Array.from(names).sort((left, right) => left.localeCompare(right))
+}
+
+/** Extract `data.reason` (or a top-level reason) from a rejected RPC error. */
+export function rpcErrorReason(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined
+  const direct = (error as { readonly reason?: unknown }).reason
+  if (typeof direct === "string" && direct.length > 0) return direct
+  const data = (error as { readonly data?: { readonly reason?: unknown } }).data
+  const nested = data?.reason
+  return typeof nested === "string" && nested.length > 0 ? nested : undefined
 }
 
 export interface ChangedFileStats {

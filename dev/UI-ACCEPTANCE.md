@@ -1,8 +1,8 @@
 # Release UI acceptance (real browser)
 
-**Verdict: PASS — 131/131 checks passed, 0 failed.**
+**Verdict: PASS — 172/172 checks passed, 0 failed.**
 
-The frozen release UI was tested against two real environments:
+The frozen 0.2.1 release UI was tested against two real environments:
 
 - **FR**: read-only fixture, 16 repositories / 4 worktrees.
 - **TEMP**: isolated synthetic mutation/content fixture.
@@ -10,29 +10,36 @@ The frozen release UI was tested against two real environments:
   repository data was not mocked.
 - Fresh real-browser loads, real pointer and keyboard input.
 
+This run revalidated the historical core subset (128 of the 131 historical
+checks still apply; the three checks that asserted first-parent / Jump-HEAD
+behavior are intentionally replaced by absence assertions in this build) and
+added the next UI slice: inline slot resizing, the Uncommitted history row with
+four working-tree groups, and the fetch confirmation/remote flow. Total: 172
+checks.
+
 This public summary is anonymized. Private repository names, absolute paths,
 commit hashes, source paths and private file/diff content are not included.
 Complete machine evidence and screenshots remain only in the operator TEMP
-`gg-ui-release-frozen-final-20261110-1504` directory.
+`gg-ui-release-extended-20261110-195711` directory.
 
 ## Final result
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Prior 93-check core regression | PASS | Repository discovery, history, filters, menus, comparison/Back, loading gate, FR guard, TEMP writes, binary diff, warning/afterServer paths. |
-| Graph fixed lane spacing | PASS | Narrow and wide drags keep lane centres at 15/29/43… with a fixed 14 px step; content width is `lanes * 14 + 16`. |
-| Graph clipping semantics | PASS | At 120 px the 170 px lane field is clipped by `overflow-x: hidden`; no graph-scroll/legacy hscroll, no visible scrollbar, horizontal wheel and scroller stay at scrollLeft 0, dense hint is shown. |
-| Graph wide reveal | PASS | Dragging to 320 px exposes every lane; dense hint disappears; reload persistence and 520 px budget pass. |
-| Header dividers / Title Case | PASS | Always-visible vertical separators; Graph/Description/Date/Author/Commit labels. |
-| Inline three-column layout | PASS | Info column, list/tree switching, row remains expanded, selection unchanged. |
-| Stat badges | PASS | Real `+N/-M` values from `getCommitFiles`; binary rows show `-`/empty placeholder; gitlink rows show `-` with no fabricated counts. |
-| File content panel | PASS | Real `getCommitFileContent`: text, binary, symlink, >20 MiB size-only, 2 MiB truncated, gitlink/missing; close preserves the inline slot and selection. |
-| Deleted file eye | PASS | Deleted row eye action is disabled. |
-| Open current file | PASS (dev harness) | No host: readable copy-path fallback; recorded `hostApi:false`, real Desktop remains manual. |
-| Console / network | PASS | 0 page errors, 0 unexpected console errors, 0 non-abort request failures, 0 unexpected HTTP >= 400; only benign favicon 404s. |
+| Historical core regression | PASS | 128 of the 131 historical checks still apply and pass; the three first-parent / Jump-HEAD checks are superseded by the absence assertions. Repository discovery, history/filters/menus, comparison/Back, loading gate, FR guard, TEMP writes, binary/content fixtures, warning/afterServer paths. |
+| Inline slot resize | PASS | Real `slot-resize-handle` pointer drag: clamps to 96 px; grows to the dynamic maximum computed from the live scroller (560 px at the 900 px viewport); bottom-follow keeps the scroller pinned (distance 0) while scrollHeight/scrollTop grow together; drags away from the bottom preserve scrollTop and slot top within 1 px; height survives collapse/reopen in the same session. |
+| Uncommitted history row | PASS | The special row is above commit rows and carries no commit index/data; its counts badge matches real `getStatus` counts; a clean FR repo shows 0 files; expanding the TEMP dirty fixture reveals Staged / Unstaged / Untracked / Conflicted groups with real file rows. |
+| Index / working-tree diff | PASS | A staged file requests `getDiff` with `target.type="index"`; an unstaged file requests `target.type="working-tree"`; both open the full-page diff whose `data-diff-source` matches, and Back returns to the Uncommitted row. |
+| Legacy Changes section | PASS | The standalone `changes`/`.gg-changes-section` surface is absent in both FR and TEMP. |
+| Toolbar removal + Ctrl+H | PASS | `first-parent` and `jump-head` are absent; Ctrl+H sends no history request and opens no menu/dialog. |
+| Fetch dialog | PASS | The fetch button is enabled when remotes exist; the dialog exposes remote selector, prune, expected HEAD, cancel and confirm; cancel sends zero fetch RPCs. |
+| Local bare fetch | PASS | A real fetch against a local bare remote returns `refsUpdated: 1`, `changed: true`, an unchanged HEAD status, and refreshes the new remote-tracking ref in refs/history. |
+| Fetch failure reason | PASS | An injected 409 surfaces only the bounded `fetch_failed` reason; the injected private path never reaches the UI. |
+| FR fetch guard | PASS | A direct confirmed FR fetch returns HTTP 403 and leaves HEAD/refs unchanged; the FR UI confirmation cannot reach a valid write (the dev client hides mutation methods and the bridge still rejects the method). |
+| Console / network | PASS | 0 page errors, 0 unexpected console errors (only benign favicon 404s), 0 non-abort request failures, 0 unexpected HTTP >= 400. |
 | Source / HMR | PASS | Production source mtimes identical before/after; no HMR or reload events. |
-| TEMP cleanup | PASS | Returned to `main` with a clean worktree and no test branches/tags. |
-| FR read-only | PASS | HEAD and refs unchanged; no valid confirmed mutation was sent. |
+| TEMP cleanup | PASS | Returned to `main` with a clean worktree, no test branches/tags/remotes and no file-protocol override. |
+| FR read-only | PASS | HEAD and refs unchanged; no guard branch/tag was created. |
 
 ## Graph metric clarification
 
@@ -68,15 +75,38 @@ clip container's `scrollWidth > clientWidth` as a failure. It verifies:
 - `15-temp-warning-fault.png`
 - `16-temp-mutation-switch.png`
 - `17-fr-graph-drag.png`
+- `17-fr-slot-resize.png`
+- `17b-temp-slot-bottom-follow.png`
 - `18-fr-inline-three.png`
+- `18-fr-uncommitted-clean.png`
 - `19-fr-file-actions.png`
+- `19-temp-uncommitted-index.png`
+- `19-temp-uncommitted-working-tree.png`
 - `20-temp-content-fixture.png`
+- `20-temp-fetch-dialog.png`
+- `21-temp-fetch-success.png`
+- `22-temp-fetch-failure.png`
+- `23-fr-fetch-forbidden.png`
+
+## Test-harness notes
+
+Only the acceptance script was adjusted before this final run; no product GUI or
+backend source changed (source mtimes were stable during the run).
+
+- The local bare fetch remote is seeded by pushing the fixture HEAD, because a
+  freshly `init --bare` repository has no objects to reference.
+- Bottom-follow is measured on the small TEMP fixture in a short viewport so the
+  expanded slot is genuinely visible at a stable bottom; the paginated FR list
+  keeps extending its bottom while auto-loading.
+- The inline Back assertion waits for the scheduled frame restore before
+  sampling scrollTop.
 
 ## Historical baseline
 
-The prior 93/93 PASS remains the historical baseline. This run revalidated that
-core subset and added the 0.2.0 graph, header, inline three-column and file
-content scenarios.
+The prior 0.2.1 run remains **131/131 PASS**. In this run, 128 of those checks
+still apply and passed; the three checks that asserted first-parent / Jump-HEAD
+behavior are intentionally obsolete in the frozen build and are replaced by the
+absence and Ctrl+H assertions above. This run totals 172 checks.
 
 ## Not covered / manual
 
@@ -84,4 +114,6 @@ content scenarios.
   registration, host theme/event bus and real Desktop panel resizing.
 - Real `ctx.layout.open file` / `desktop.launch` host success; the dev harness
   only proved the readable copy-path fallback and records `hostApi:false`.
-- Network push/fetch/reset-clean and other unavailable remote operations.
+- Network push/pull/reset-clean, credential prompts, SSH/HTTPS authentication
+  and interactive prune confirmation. The fetch acceptance is a local bare
+  remote, not a network/authentication test.

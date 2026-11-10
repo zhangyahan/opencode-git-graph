@@ -10,6 +10,8 @@ import {
   CreateTagInputSchema,
   DeleteBranchInputSchema,
   DeleteTagInputSchema,
+  FetchRemoteInputSchema,
+  FetchRemoteOutputSchema,
   FileDiffSchema,
   FullCommitHashSchema,
   GetCommitFileContentInputSchema,
@@ -52,6 +54,7 @@ import type {
   CommitFileContent,
   FileDiff,
   GitCommit,
+  GitFetchResult,
   GitMutationResult,
   GitRef,
   GitRepository,
@@ -146,6 +149,7 @@ const mutationResult: GitMutationResult = {
 }
 
 type _MutationResult = Assert<Equal<z.infer<typeof GitMutationResultSchema>, GitMutationResult>>
+type _FetchResult = Assert<Equal<z.infer<typeof FetchRemoteOutputSchema>, GitFetchResult>>
 type _CheckoutInput = Assert<
   Equal<
     z.infer<typeof CheckoutBranchInputSchema>,
@@ -179,6 +183,7 @@ describe("git-graph RPC contract", () => {
       "renameBranch",
       "deleteBranch",
       "deleteTag",
+      "fetchRemote",
     ])
     expect(Object.keys(GitGraphRpc.events)).toEqual([])
   })
@@ -206,6 +211,7 @@ describe("git-graph RPC contract", () => {
       "renameBranch",
       "deleteBranch",
       "deleteTag",
+      "fetchRemote",
     ] as const) {
       expect(Object.keys(GitGraphRpc.methods[name].errors ?? {}).sort()).toEqual(mutationExpected)
     }
@@ -504,6 +510,51 @@ describe("git-graph RPC contract", () => {
     expect(
       GitGraphMutationErrorSchemas.mutation_rejected.safeParse({ reason: "rejected" }).success,
     ).toBe(true)
+  })
+
+  it("validates fetchRemote input and output", () => {
+    const base = {
+      repositoryId: repository.id,
+      expectedHead: FULL_HASH,
+      confirmed: true as const,
+    }
+
+    expect(FetchRemoteInputSchema.parse(base)).toEqual(base)
+    expect(FetchRemoteInputSchema.parse({ ...base, remote: null })).toEqual({
+      ...base,
+      remote: null,
+    })
+    expect(FetchRemoteInputSchema.parse({ ...base, remote: "upstream", prune: true })).toEqual({
+      ...base,
+      remote: "upstream",
+      prune: true,
+    })
+    expect(FetchRemoteInputSchema.safeParse({ ...base, prune: "yes" }).success).toBe(false)
+    for (const remote of ["--all", "-x", "../x", "a b", "refs/heads/x"]) {
+      expect(FetchRemoteInputSchema.safeParse({ ...base, remote }).success).toBe(false)
+    }
+    expect(
+      FetchRemoteInputSchema.safeParse({ ...base, confirmed: false }).success,
+    ).toBe(false)
+
+    const fetchResult: GitFetchResult = {
+      status,
+      refsUpdated: 2,
+      changed: true,
+    }
+    expect(FetchRemoteOutputSchema.parse(fetchResult)).toEqual(fetchResult)
+    expect(
+      FetchRemoteOutputSchema.parse({ ...fetchResult, warning: "cached" }).warning,
+    ).toBe("cached")
+    expect(FetchRemoteOutputSchema.safeParse({ ...fetchResult, refsUpdated: -1 }).success).toBe(
+      false,
+    )
+    expect(FetchRemoteOutputSchema.safeParse({ ...fetchResult, changed: "yes" }).success).toBe(
+      false,
+    )
+    expect(
+      FetchRemoteOutputSchema.safeParse({ status, refsUpdated: 0 }).success,
+    ).toBe(false)
   })
 
 

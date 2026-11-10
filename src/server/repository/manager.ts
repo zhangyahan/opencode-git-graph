@@ -13,6 +13,7 @@ import type {
   ChangedFile,
   CommitFileContent,
   FileDiff,
+  GitFetchResult,
   GitMutationResult,
   GitRef,
   GitRepository,
@@ -105,6 +106,10 @@ export interface MutationEngine {
     repositoryPath: string,
     options: { name: string } & MutationEngineOptions,
   ): Promise<MutationEngineResult>
+  fetchRemote(
+    repositoryPath: string,
+    options: { remote: string | null; prune?: boolean } & MutationEngineOptions,
+  ): Promise<GitFetchResult>
 }
 
 /** The canonical working tree and git common dir a write is bound to. */
@@ -618,6 +623,37 @@ export class RepositoryManager implements GitGraphManager {
     )
   }
 
+  /**
+   * Fetch one remote (or all remotes) of an allowlisted repository.
+   *
+   * Runs through the same common-dir write lock as every other mutation, so a
+   * fetch cannot race a local write in any worktree. A successful fetch
+   * invalidates the discovery snapshot and updates the cached repository entry
+   * from the returned status.
+   */
+  async fetchRemote(
+    repositoryId: string,
+    input: { remote?: string | null; prune?: boolean; expectedHead: string | null },
+    options: WriteCallOptions = {},
+  ): Promise<GitFetchResult> {
+    const remote = input.remote ?? null
+    if (remote !== null && !isSafeShortRefName(remote)) {
+      throw new RepositoryManagerError("invalid_input", "Invalid remote name", { reason: "remote" })
+    }
+    if (input.prune !== undefined && typeof input.prune !== "boolean") {
+      throw new RepositoryManagerError("invalid_input", "Invalid prune option", {
+        reason: "prune",
+      })
+    }
+    return this.runMutation(repositoryId, input.expectedHead, options, (engine, repository) =>
+      engine.fetchRemote(repository.rootPath, {
+        remote,
+        ...(input.prune === undefined ? {} : { prune: input.prune }),
+        expectedHead: input.expectedHead,
+      }),
+    )
+  }
+
   private mutationRejected(reason: string): RepositoryManagerError {
     return new RepositoryManagerError("mutation_rejected", "Mutation rejected", { reason })
   }
@@ -630,15 +666,15 @@ export class RepositoryManager implements GitGraphManager {
     }
   }
 
-  private async runMutation(
+  private async runMutation<T extends MutationEngineResult>(
     repositoryId: string,
     expectedHead: string | null,
     options: WriteCallOptions,
     operation: (
       engine: MutationEngine,
       repository: GitRepository,
-    ) => Promise<MutationEngineResult>,
-  ): Promise<MutationEngineResult> {
+    ) => Promise<T>,
+  ): Promise<T> {
     this.assertExpectedHead(expectedHead)
     this.throwIfWriteAborted(options.signal)
 
@@ -656,7 +692,7 @@ export class RepositoryManager implements GitGraphManager {
       }
 
       const engine = this.deps.mutations
-      let result: MutationEngineResult
+      let result: T
       try {
         // Deliberately no signal: once the write starts it must complete and
         // its success must be reported even if the UI cancels or disposes.
@@ -992,6 +1028,11 @@ export interface GitGraphManager {
     input: { name: string; expectedHead: string | null },
     options?: WriteCallOptions,
   ): Promise<GitMutationResult>
+  fetchRemote(
+    repositoryId: string,
+    input: { remote?: string | null; prune?: boolean; expectedHead: string | null },
+    options?: WriteCallOptions,
+  ): Promise<GitFetchResult>
 }
 
 const SIGNAL_BEFORE =
@@ -1567,6 +1608,28 @@ export function createGitGraphHandlers(
         return await manager.deleteTag(
           input.repositoryId,
           { name: input.name, expectedHead: input.expectedHead },
+          { signal: context.signal },
+        )
+      } catch (error) {
+        return reportMutationError(context, error)
+      }
+    },
+
+    fetchRemote: async (input, context) => {
+      if (input.confirmed !== true) {
+        return context.error("invalid_input", "Invalid input", { reason: "confirmation" })
+      }
+      if (context.signal.aborted) {
+        return context.error("git_failed", SIGNAL_BEFORE, { operation: "cancelled" })
+      }
+      try {
+        return await manager.fetchRemote(
+          input.repositoryId,
+          {
+            remote: input.remote ?? null,
+            ...(input.prune === undefined ? {} : { prune: input.prune }),
+            expectedHead: input.expectedHead,
+          },
           { signal: context.signal },
         )
       } catch (error) {

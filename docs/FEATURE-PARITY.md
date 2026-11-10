@@ -9,7 +9,7 @@
 | ✅ 已实现 | 当前基线已有能力，真实 UI/读写路径已验收；括号内注明子集或范围限制。 |
 | ⬜ 未实现 | 当前没有对应能力，也没有可验收路径；不得打勾。 |
 
-最终 release UI 验收为 **131/131 PASS**（FR 只读 + 隔离 TEMP mutation/content fixture，真实浏览器与真实生产路径），记录在 `dev/UI-ACCEPTANCE.md`。0.2.0 的 93/93 仅作为历史基线；本文件所列已实现项（含本轮 Graph 列拖拽、内联三栏与 commit 文件内容查看）均已纳入 131/131；“完成度”不按上游功能数量折算；同一组里可能只实现了子集，不能把子集等同于上游全量能力。131/131 不覆盖原生 Desktop 宿主集成（会话/scope 切换、窗口 chrome、MenuItem、主题/事件总线、真实面板 resize）。
+`0.2.2` 的最终 release UI 验收为 **172/172 PASS**（FR 只读 + 隔离 TEMP mutation/content fixture，真实浏览器与真实生产路径），记录在 `dev/UI-ACCEPTANCE.md`。历史 131 项中 128 项仍适用并通过，3 项 First parent / Jump HEAD 断言由本轮“控件不存在 + `Ctrl+H` 不发请求”的断言替代；已发布 `0.2.1` 的 131/131 与 0.2.0 的 93/93 仅作为历史基线。“完成度”不按上游功能数量折算；同一组里可能只实现了子集，不能把子集等同于上游全量能力。172/172 不覆盖原生 Desktop 宿主集成（会话/scope 切换、窗口 chrome、MenuItem、主题/事件总线、真实面板 resize）。
 
 ## 2. 公开来源与许可
 
@@ -36,13 +36,14 @@ Marketplace 页面当前列出的上游版本为 1.30.0。上游后续更新不�
 
 | 功能组 | 上游公开能力（摘要） | 状态 | 本插件边界 / 本轮范围 | 来源 | 可验收标准 |
 | --- | --- | --- | --- | --- | --- |
-| 图 / refs / 未提交 | 提交图；本地与远程分支；heads/tags/remotes；未提交变更；顶点 tooltip | ✅ 已实现（只读子集） | 已有提交 DAG、commit ref badge、Staged/Unstaged/Untracked/Conflicted 分组和单文件 diff。未提交变更不是图上的节点；没有顶点 tooltip（HEAD 包含关系、分支归属等）；没有 stash 行。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) | 加载含 merge/tag/remote 的 fixture：图行与 ref 对齐；Changes 可展开并打开 index 或 working-tree diff；不得宣称图中已存在未提交节点。 |
+| 图 / refs / 未提交 | 提交图；本地与远程分支；heads/tags/remotes；未提交变更；顶点 tooltip | ✅ 已实现（UI 验收通过） | 已有提交 DAG、commit ref badge。未提交变更现在是 History 列表顶部的特殊行：空心虚线圆、总文件数 `(N)` 与 staged/unstaged/untracked/conflicted 计数 badge；不占 commit 索引、不是图节点。单击展开 Staged/Unstaged/Untracked/Conflicted 分组，点击文件打开 index 或 working-tree 整页 diff；clean 仓库显示 `(0)` / “No changes”。旧独立 Changes 区块已移除。没有顶点 tooltip（HEAD 包含关系、分支归属等）；没有 stash 行。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) | 加载含 merge/tag/remote 的 fixture：图行与 ref 对齐；顶部 Uncommitted 行无 commit index/hash，clean 时显示 0；展开后四组可用，staged 文件请求 `target.type="index"`、unstaged/untracked 请求 working-tree；旧 Changes 区块不存在；不得宣称图中存在未提交节点。 |
 | Branches 历史过滤（All / 多选） | 顶部 Branches 下拉：Show All、单选或多选分支、自定义 glob 模式 | ✅ 已实现（UI 验收通过） | 已实现 All、多选本地/远程/tag ref、ref 搜索以及 Include remotes / Include tags；显式 ref 优先于 show 开关。自定义 glob 输入未实现。131/131 最终验收覆盖 All/Selected/单 ref 流程。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Extension Settings](https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings) | 选择分支只改变历史加载/显示，不改 HEAD、不写仓库；切回 All 恢复完整已加载历史；过滤后 checkout 仍需独立确认。 |
 | Show remote / tags 等开关 | 独立控制是否显示远程分支、远程 HEAD、标签、stash、未提交变更等 | ✅ 已实现（UI 验收通过） | 已实现 All 模式下的 Remotes / Tags 工具栏开关和 Branches 对话框内同名开关；显式 ref 选择优先。没有 stash、未提交变更、远程 HEAD 的独立显示开关。 | [Extension Settings](https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings) | 开关切换后对应历史/ref 显示变化；同一次会话内 Refresh 后保持，跨宿主会话持久化未实现；不改变 HEAD；本轮无 stash/未提交显示开关的验收路径。 |
-| Order / first-parent | date、author-date、topo 三种顺序；only follow first parent | ✅ 已实现（UI 验收通过） | 已实现 `Date`（`--date-order`）与 `Topo`（`--topo-order`）顺序，以及 First parent。未实现 author-date-order 和 UI 上的自定义排序组合。 | [Extension Settings](https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings) | 切换 order 后首批与后续分页顺序一致；first-parent 开启后 side parent 不进入图；merge 详情仍保留完整 parent 列表。 |
+| Order / first-parent | date、author-date、topo 三种顺序；only follow first parent | ✅ 已实现（UI 验收通过） | 已实现 `Date`（`--date-order`）与 `Topo`（`--topo-order`）顺序。**First parent 切换控件已从工具栏移除**，first-parent 遍历不再作为可切换 UI 能力；未实现 author-date-order 和 UI 上的自定义排序组合。 | [Extension Settings](https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings) | 切换 order 后首批与后续分页顺序一致；UI 中不存在 first-parent 控件；merge 详情仍保留完整 parent 列表。 |
 | 提交搜索（Find） | Find Widget；在 message/date/author/hash/branch/tag 中查找 | ✅ 已实现（只读子集） | 仅搜索已经加载的 commit：subject、hash、author、refs；高亮匹配、淡化其余，Enter 跳到首匹配，Esc 清空。不是服务端全历史搜索。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) | 输入查询只影响已加载行的高亮，不改变拓扑或行数；Enter 滚动到首匹配；Esc 清空；界面不得暗示已搜索未加载历史。 |
-| HEAD 跳转 / 键盘快捷键 | Ctrl/Cmd+F、H、R、S；提交详情 Up/Down；Enter/Esc | ✅ 已实现（UI 验收通过） | 已实现 Ctrl/Cmd+F 搜索、Ctrl/Cmd+H 或 HEAD 按钮跳转、Ctrl/Cmd+R 刷新、Shift+F10 打开 commit 菜单、Esc 关闭活动层；commit 行支持 Enter/Space 展开和 Ctrl/Cmd+click 比较。未实现 Ctrl/Cmd+S stash 跳转、提交详情 Up/Down 或父子提交导航。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Extension Settings](https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings) | 快捷键不抢占宿主冲突键；Ctrl/Cmd+H 定位已加载 HEAD；Esc 关闭菜单/Branches/比较/整页 diff；未实现项无入口。 |
+| HEAD 跳转 / 键盘快捷键 | Ctrl/Cmd+F、H、R、S；提交详情 Up/Down；Enter/Esc | ✅ 已实现（UI 验收通过） | 已实现 Ctrl/Cmd+F 搜索、Ctrl/Cmd+R 刷新、Shift+F10 打开 commit 菜单、Esc 关闭活动层；commit 行支持 Enter/Space 展开和 Ctrl/Cmd+click 比较。**Jump HEAD 按钮与 Ctrl/Cmd+H 绑定已移除**；未实现 Ctrl/Cmd+S stash 跳转、提交详情 Up/Down 或父子提交导航。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Extension Settings](https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings) | 快捷键不抢占宿主冲突键；Ctrl/Cmd+H 不发历史请求、UI 无 jump-head；Esc 关闭菜单/Branches/Fetch/比较/整页 diff；未实现项无入口。 |
 | Commit details：文件树 / diff / root / merge | 文件树或文件列表；VS Code Diff；打开当前文件；复制路径；root 与 merge 处理 | ✅ 已实现（独立 diff 子集） | 已有同行内联三栏：左提交信息（author/date/hash/parents）、中文件列表（内部滚动）、右 list/tree 切换；文件行 status + 文件名 + `+N -M`，binary 或无 numstat 显示 `-`。eye 通过 `getCommitFileContent` 查看该 commit 版本（text/binary/symlink/submodule missing；1 MiB 截断；>20 MiB 仅显示大小）；open current 优先 `ctx.layout.open` 的 `file:` 目标，失败走系统默认应用，再失败复制仓库相对路径。没有宿主原生 diff，没有独立复制路径菜单；有 4000 行渲染上限以及 binary/truncated 提示。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 点击 commit 展开三栏且文件区内部滚动；点击文件名只显示该 commit 与其所选 parent 的 patch；eye 不改变选中并按 kind 正确提示；open current 按三层回退；merge 切换 parent 后重载；root 不请求不存在的父提交；Back 恢复滚动和展开状态。 |
+| 内联展开高度 | 上游没有独立的内联槽高度手柄 | ✅ 已实现（UI 验收通过） | commit 内联槽与 Uncommitted 槽底部都有拖拽手柄；范围为 **96 .. max(96, min(560, viewport - 80))**，短视口不会低于 96；高度只在当前面板会话内记忆（不写 `localStorage`）；未调整时按内容取高并以 260px 为默认上限。 | 本项目独立实现 | 拖拽可把槽缩到 96、增长到动态上限；折叠/重开同一槽恢复会话高度；滚动位置在非底部拖拽时保持稳定；重载后不保留。 |
 | 两个 commit 比较 | 选一个 commit 后 Ctrl/Cmd 点击另一个 commit，进入比较视图 | ✅ 已实现（UI 验收通过） | 已实现 commit-pair 只读比较页：context menu 选择 base 后 Ctrl/Cmd+click 另一行，或从 commit 菜单比较。`getComparisonFiles` / `getComparisonDiff` 只比较 `base..head`，不读取索引或工作区；文件列表在 numstat 可用时附带可选 `added` / `deleted`，binary 不伪造计数。131/131 最终验收覆盖 context-menu 与 Ctrl/Cmd+click 比较路径。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) | 选中 A 后 Ctrl/Cmd 点击 B 进入 compare；文件列表和 patch 的目标为 A..B；取消/返回不改变 HEAD；不包含 working tree。 |
 | ref 类型化菜单 | 分支、远程分支、标签等右键菜单 | ✅ 已实现（UI 验收通过） | 已实现 branch / remote / tag / synthetic HEAD 的类型化菜单与安全动作：View history、Copy、Create branch here；branch 另有 Checkout / Rename / Delete；tag 另有 Delete。完整上游菜单动作（archive、PR、push 等）不在本轮范围。 | [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 单击/右键各类型 ref 时菜单标题和动作匹配类型；写动作先确认；当前分支不显示 checkout/delete；未实现动作无入口。 |
 | commit 菜单 | Add Tag、Create Branch、Checkout、Cherry Pick、Revert、Drop、Merge、Rebase、Reset、Copy 等 | ✅ 已实现（UI 验收通过） | 已实现只读与安全创建子集：View changes、Copy hash、Copy subject、Select for comparison、Create branch here、Create tag here。没有 Checkout commit、Cherry Pick、Revert、Drop、Merge、Rebase、Reset。 | [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 右键 commit 出现上述只读/创建动作；写动作先确认；破坏性或未实现动作无入口。 |
@@ -55,8 +56,9 @@ Marketplace 页面当前列出的上游版本为 1.30.0。上游后续更新不�
 | 本地分支 rename / delete | Rename Branch、Delete Branch（含 force delete 选项） | ✅ 已实现（UI 验收通过） | 已实现 `git branch -m` 重命名（不 force），以及 `git branch -d` 删除已完全合并的本地分支。当前分支、其他 worktree 占用、未合并分支会被拒绝。**没有 force delete / `-D`。** | [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 取消确认时不发写 RPC；rename 只接受新名称并保持当前分支绑定正确；delete 只删除已合并分支；未合并/当前/占用分支返回明确拒绝且 refs 不变。 |
 | 创建 tag | Add Tag：annotated / lightweight，可选 push | ✅ 已实现（UI 验收通过） | 已实现确认式 create tag：无 message 为 lightweight，有 message 为 annotated；固定 `--no-sign`；不 push。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 取消时不发写 RPC；确认后 temp fixture 出现指向目标 commit 的 tag；annotated 携带 message；不默认 push；不签名。 |
 | 删除 tag | Delete Tag、Push Tag | ✅ 已实现（UI 验收通过） | 已实现 `git tag -d` 删除 tag；不 force、不 push。上游的 Push Tag 未实现。 | [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 取消时不发写 RPC；确认后 tag 从 refs 消失；不存在/失败返回明确错误；不 push。 |
-| 网络与 remote 管理 | Fetch、Pull、Push；remote add/edit/delete/fetch/prune；fetch into local branch；创建 PR | ⬜ 未实现 | 当前没有网络写 RPC 或按钮，也没有 Repository Settings Widget。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 未来网络动作必须确认、明确 remote/ref，并给出可恢复错误；本轮无验收路径。 |
-| Stash | Stash uncommitted changes；apply/pop/drop；从 stash 创建分支 | ⬜ 未实现 | 当前只读展示 Changes，不创建/应用/删除 stash，也不在图中显示 stash 行。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 未来 stash 动作确认后执行；include untracked、reinstate index（恢复索引）等选项按后续结论；本轮无验收路径。 |
+| Fetch（下载 remote 更新） | Fetch、fetch --prune；fetch into local branch | ✅ 已实现（UI 验收通过） | 已实现确认式 `fetchRemote`：All remotes 或单个 remote、可选 `--prune`、打开时捕获的 expected HEAD；成功返回 `refsUpdated` 并刷新 refs/history；失败返回有界 reason；取消零 RPC。remote 列表由已加载的 remote refs 推导，尚无 remote-tracking ref 的 remote 需先在外部配置/首次 fetch；列表为空时按钮禁用。fetch 不 merge、不 rebase、不改工作区/HEAD；不实现 fetch into local branch。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 取消不发 fetch RPC；确认后 TEMP bare remote 的 remote-tracking/tag refs 按预期更新/删除，`refsUpdated` 与 `changed` 正确；认证/网络失败显示有界 reason；FR 始终 403，不向 FR 写入。 |
+| Pull / Push / remote 管理与 PR | Pull、Push；remote add/edit/delete；fetch into local branch；创建 PR | ⬜ 未实现 | pull/push、remote add/edit/delete、fetch into local branch 与 PR 均未实现；没有 Repository Settings Widget。Fetch 已单独列在上方。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 未来网络动作必须确认、明确 remote/ref，并给出可恢复错误；本轮无验收路径。 |
+| Stash | Stash uncommitted changes；apply/pop/drop；从 stash 创建分支 | ⬜ 未实现 | 未提交变更已在 History 顶部行只读展示；不创建/应用/删除 stash，也不在图中显示 stash 行。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 未来 stash 动作确认后执行；include untracked、reinstate index（恢复索引）等选项按后续结论；本轮无验收路径。 |
 | Merge / Rebase / Reset / Cherry-pick / Revert | 分支与提交的 merge、rebase、reset、cherry-pick、revert、drop | ⬜ 未实现 | 未实现。安全策略明确禁止 force、reset --hard、clean -fd、discard、autostash；未来也不提供破坏性默认值。 | [Context Menus](https://github.com/mhutchie/vscode-git-graph/wiki/Context-Menus) | 未来只在 temp fixture、确认后验收；不得默认 force 或 hard reset；本轮无验收路径。 |
 
 ### C. 集成与配置
@@ -66,6 +68,7 @@ Marketplace 页面当前列出的上游版本为 1.30.0。上游后续更新不�
 | Review 标记 | 标记已审阅文件；未审阅加粗；跨会话保留，90 天不活跃后关闭 | ⬜ 未实现 | 没有 review 状态、持久化或过期清理。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) | 未来标记文件取消加粗、跨会话保留、90 天过期；本轮无验收路径。 |
 | 签名 / avatars / mailmap / emoji / issue 与 PR link | 签名状态；作者头像；`.mailmap`；emoji shortcode；issue/PR 链接 | ⬜ 未实现 | 均未实现。当前 log 关闭签名显示以避免触发外部 GPG 程序，写操作也固定关闭签名，这是安全设置，不是签名状态 UI；没有 avatar、mailmap、emoji、issue 或 PR 链接。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) / [Extension Settings](https://github.com/mhutchie/vscode-git-graph/wiki/Extension-Settings) | 未来逐项可关闭；avatar 发送邮箱前需显式同意；签名失败不得阻塞日志；本轮无验收路径。 |
 | 设置入口 / 导入 / 导出 | Repository Settings / 导出/导入 repository configuration 文件，供团队复用 | ⬜ 未实现 | 没有 Repository Settings 入口，只有列宽偏好存在 `localStorage`；没有仓库配置文件的导入/导出。 | [Features](https://marketplace.visualstudio.com/items?itemName=mhutchie.git-graph) | 未来导出文件可审阅，导入不得执行任意命令；本轮无验收路径。 |
+| 入口图标 | 宿主菜单/标签图标 | ✅ 已实现（UI 验收通过） | `MenuItem`、侧栏 tab label 与 mobile tab 统一使用宿主 `branch` 图标；不新增自有图标资源。 | 本项目独立实现 | 菜单项、侧栏 tab 与 mobile tab 都显示 `branch` 图标；面板标题不变。 |
 
 ### D. 本轮布局与日期
 
@@ -76,10 +79,10 @@ Marketplace 页面当前列出的上游版本为 1.30.0。上游后续更新不�
 
 ## 5. 本轮实现与验收口径
 
-本轮已经落地的实现包括：
+`0.2.2` 已落地的实现包括；`0.2.1` 已验收项沿用历史结论，本轮变更项均已完成新的 UI 验收：
 
 - Branches history filter（All / 多选 local、remote、tag；无自定义 glob）
-- Show remotes / tags、Date/Topo 顺序与 First parent
+- Show remotes / tags、Date/Topo 顺序；First parent 控件已移除
 - 两个 commit 比较（context menu + Ctrl/Cmd+click）
 - 类型化 ref 菜单与 commit 菜单的安全子集
 - 本地分支 checkout / create / rename / delete（delete 仅已合并，无 force）
@@ -89,29 +92,36 @@ Marketplace 页面当前列出的上游版本为 1.30.0。上游后续更新不�
 - Title Case 列头与常显列分隔线，其余列可拖并持久化
 - 内联三栏（提交信息 / 文件列表 / list·tree 切换）与文件行 `+N -M`
 - commit 版本文件查看（`getCommitFileContent`）与打开工作区当前文件
+- Uncommitted 顶部特殊行（无 commit 索引、空心虚线圆、四类计数 badge、clean 0、内联分组与 index/working-tree 整页 diff）；旧独立 Changes 区块已移除
+- 内联槽底部拖拽手柄，96 .. `max(96, min(560, viewport - 80))`，会话内记忆
+- 确认式 Fetch（All/单 remote、`--prune`、expected HEAD、`refsUpdated`、有界失败 reason、取消零 RPC）
+- MenuItem / tab label / mobile tab 统一 branch 图标
+- 移除 Jump HEAD 按钮与 `Ctrl/Cmd+H` 绑定
 
 验收口径：
 
-1. 最终 release UI 验收为 **131/131 PASS，0 failed**（FR 只读 + 隔离 TEMP mutation/content fixture，真实浏览器、真实生产路径），覆盖 0.2.0 的 93/93 基线子集与本轮 Graph 列拖拽、内联三栏、commit 文件内容查看增量；93/93 与 70/70 仅保留为历史基线。
-2. 补充验收（含比较滚动/返回、ref 键盘、loading gate、binary diff、warning fault、afterServer mutation gate、refs 失败隔离）已执行并通过，记录在 `dev/UI-ACCEPTANCE.md`。
-3. 写操作只在批准 TEMP fixture 中通过真实 mutation 验收；FR 环境始终只读，六个 mutation 请求返回 403。
-4. 131/131 只代表该 harness 矩阵；原生 Desktop 宿主集成（会话/scope 切换、窗口/面板 chrome、`MenuItem` 注册、主题/事件总线、真实面板 resize）未覆盖，需用户在实际 Desktop 中 `/reload` 后确认。
-5. 未实现项保持 ⬜，不给未实现功能打勾；branch rename/delete 与 tag delete 已实现并完成 UI 验收。
+1. `0.2.2` 的最终 release UI 验收为 **172/172 PASS，0 failed**（FR 只读 + 隔离 TEMP mutation/content fixture，真实浏览器、真实生产路径）。历史 131 项中 128 项仍适用并通过；3 项 First parent / Jump HEAD 断言由本轮“控件不存在 + `Ctrl+H` 不发请求”的断言替代。已发布 `0.2.1` 的 131/131、0.2.0 的 93/93 与更早的 70/70 仅保留为历史基线。
+2. 本轮新增场景（Uncommitted 顶部行、内联槽高度拖拽、Fetch、branch 图标、移除 First parent/Jump HEAD/`Ctrl+H`）已冻结并完整运行，结论记录在 `dev/UI-ACCEPTANCE.md`。
+3. 写操作（含 Fetch）只在批准 TEMP fixture 中通过真实 mutation 验收；FR 环境始终只读，七个 mutation 请求（含 `fetchRemote`）返回 403。
+4. 172/172（以及历史 131/131）只代表该 harness 矩阵；原生 Desktop 宿主集成（会话/scope 切换、窗口/面板 chrome、`MenuItem` 注册、主题/事件总线、真实面板 resize）未覆盖，需用户在实际 Desktop 中 `/reload` 后确认。
+5. 未实现项保持 ⬜，不给未实现功能打勾；未完成 UI 验收的实现不得写成 ✅。
 
 ## 6. 安全与写操作策略
 
 - **真实仓库只读**：所有真实功能调研和真实数据验收只读；本文件的任务本身也不修改真实仓库内容。
 - **allowlist 与防误触**：Server 只在会话目录发现仓库并维护 allowlist；RPC 不接受任意仓库路径。`confirmed: true` + expected HEAD 校验用于防误触和 stale write，**不是认证或授权**。
 - **写入绑定与串行化**：写前重新校验 realpath、top-level 与 git common dir；同一 common dir 串行写入（worktree 共享锁）。缓存路径或 symlink 替换会拒绝。
-- **写操作仅 temp fixtures**：checkout、create/rename/delete branch、create/delete tag 只在临时 fixture 中执行真实写验收；真实仓库不执行写操作。
-- **GUI 确认后才调用**：写动作必须先展示目标 ref/commit 和动作类型，用户明确确认后才发 RPC；取消时不发写请求。
-- **禁止破坏性快捷方式**：不提供 force、`reset --hard`、`clean -fd`、discard、autostash；delete branch 只用 `git branch -d`，delete tag 不 push。
-- **hooks / 签名 / 外部 filter 不执行**：写命令固定禁用 hooks、replace refs、auto gc/maintenance、submodule recurse 与签名。checkout 目标树若实际选择 clean/smudge/process filter，会拒绝；metadata-only 操作允许，不因全局安装但未实际选择的 LFS driver 一概阻断。
+- **写操作仅 temp fixtures**：checkout、create/rename/delete branch、create/delete tag 以及 Fetch 只在临时 fixture 中执行真实写验收；真实仓库不执行写操作，Fetch 只指向 TEMP 的本地 bare remote。
+- **GUI 确认后才调用**：写动作必须先展示目标 ref/commit、remote 与动作类型，用户明确确认后才发 RPC；取消时不发写请求，取消 Fetch 不发送任何 fetch RPC。
+- **禁止破坏性快捷方式**：不提供 force、`reset --hard`、`clean -fd`、discard、autostash；delete branch 只用 `git branch -d`，delete tag 不 push。Fetch 只下载并更新 remote-tracking refs/tags（可选 prune），不 merge、不 rebase、不改工作区/HEAD。
+- **hooks / 签名 / 外部 filter 不执行**：所有写操作（含 Fetch）使用统一 hardened `gitWrite` 配置，固定禁用 hooks、fsmonitor、replace refs、auto gc/maintenance、submodule recurse 与签名。checkout 目标树若实际选择 clean/smudge/process filter，会拒绝；metadata-only 操作允许，不因全局安装但未实际选择的 LFS driver 一概阻断。
+- **Fetch 的名称与网络边界**：只执行 `git fetch [--prune] <remote>` 参数数组；remote 名先通过 refname 语法与 `git check-ref-format` 校验，All 模式逐个校验配置中的 remote；`--prune` 不作为自由文本拼接。认证必须在启动前通过 credential helper / SSH agent 配置，`GIT_TERMINAL_PROMPT=0` 不交互式索取凭据。
+- **Fetch 不可中止与未知状态**：fetch 进程不接收 AbortSignal，开始后不会因 UI 取消/关闭而中断，只有 300 秒超时；超时或中途失败时 remote-tracking refs 可能已部分更新，必须 Refresh 后由用户决定，不自动 retry。expected HEAD 在 fetch 前后各校验一次。
 - **工作区与路径保护**：checkout 拒绝 tracked 变更、冲突、其他 worktree 占用、ignored/untracked 碰撞；UTF-8 replacement 或无法无损 round-trip 的路径保守拒绝。
-- **超时未知不自动重试**：写命令超时表示仓库状态未知，必须 Refresh 后由用户决定，绝不自动 retry。
+- **超时未知不自动重试**：写命令（含 Fetch）超时表示仓库状态未知，必须 Refresh 后由用户决定，绝不自动 retry。
 - **读 diff/status 保持 filter override**：已实现枚举并空覆盖 clean/process/required，禁止执行外部 filter；无法安全枚举时明确失败。
 - **残余 TOCTOU**：校验与 git 写命令之间仍存在外部 Git 进程或文件系统变更的竞态窗口，本插件不持有仓库全局锁。
-- **dev harness 不是生产认证**：FR 5178 只读且六个写方法 403；TEMP 5179 仅接受 marker 批准、位于批准 TEMP 子树下的两个临时仓真实 mutation。该桥只用于本地验收，不能当作生产认证。
+- **dev harness 不是生产认证**：FR 5178 只读且七个写方法（含 `fetchRemote`）403；TEMP 5179 仅接受 marker 批准、位于批准 TEMP 子树下的两个临时仓真实 mutation。该桥只用于本地验收，不能当作生产认证。
 
 ## 7. Diff 能力边界
 
@@ -119,7 +129,7 @@ Marketplace 页面当前列出的上游版本为 1.30.0。上游后续更新不�
 
 - 历史 diff 使用本项目独立实现的只读 patch viewer，不声称使用宿主原生 Diff。
 - 独立 patch viewer 支持 **commit 与其 parent**，以及 **两个 commit 配对**。
-- 不把 working-tree/index diff 混入历史 commit 或 commit-pair diff。
+- 不把 working-tree/index diff 混入历史 commit 或 commit-pair diff；Uncommitted 顶部行的文件点击单独生成 **index** 或 **working-tree** 的整页只读 diff。
 - 面板内 diff 是侧栏内容替换，不是宿主全窗口主页面。
 - 当前 viewer 的 4000 行上限、binary 和 truncated 提示属于独立实现限制，不是上游行为等价承诺。
 

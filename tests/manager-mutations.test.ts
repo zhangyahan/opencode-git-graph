@@ -7,7 +7,7 @@ import {
   type MutationEngineResult,
   type RepositoryWriteBinding,
 } from "../src/server/repository/manager.js"
-import type { GitRepository, GitStatus } from "../src/shared/types.js"
+import type { GitFetchResult, GitRepository, GitStatus } from "../src/shared/types.js"
 import { commit, initRepo, mkTmpDir, runGit } from "./helpers.js"
 
 function deferred<T>(): {
@@ -64,6 +64,7 @@ function fakeEngine(overrides: Partial<MutationEngine> = {}): MutationEngine {
     renameBranch: fallback,
     deleteBranch: fallback,
     deleteTag: fallback,
+    fetchRemote: vi.fn(async () => ({ ...mutationResult("c:\\workspace\\repo"), refsUpdated: 0 })),
     ...overrides,
   }
 }
@@ -343,8 +344,92 @@ describe("RepositoryManager writes", () => {
     manager.dispose()
   })
 
-  it("forwards every log option to the engine", async () => {
+  it("forwards fetch options and returns the ref count", async () => {
     const a = fakeRepo("a")
+    const fetchRemote = vi.fn(async (): Promise<GitFetchResult> => ({
+      ...mutationResult(a.id, { branch: "main", head: "b".repeat(40) }),
+      refsUpdated: 2,
+    }))
+    const manager = fakeManager({
+      repositories: [a],
+      engine: fakeEngine({ fetchRemote }),
+      commonDir: () => "C:\\shared\\.git",
+    })
+    await manager.listRepositories()
+
+    const result = await manager.fetchRemote(a.id, {
+      remote: "origin",
+      prune: true,
+      expectedHead: a.head,
+    })
+
+    expect(result.refsUpdated).toBe(2)
+    expect(result.status.head).toBe("b".repeat(40))
+    expect(fetchRemote).toHaveBeenCalledWith(a.rootPath, {
+      remote: "origin",
+      prune: true,
+      expectedHead: a.head,
+    })
+
+    await manager.fetchRemote(a.id, { expectedHead: null })
+    expect(fetchRemote).toHaveBeenLastCalledWith(a.rootPath, {
+      remote: null,
+      expectedHead: null,
+    })
+    manager.dispose()
+  })
+
+  it("rejects unsafe fetch inputs before touching the engine", async () => {
+    const a = fakeRepo("a")
+    const fetchRemote = vi.fn(async (): Promise<GitFetchResult> => ({
+      ...mutationResult(a.id),
+      refsUpdated: 0,
+    }))
+    const manager = fakeManager({
+      repositories: [a],
+      engine: fakeEngine({ fetchRemote }),
+      commonDir: () => "C:\\shared\\.git",
+    })
+    await manager.listRepositories()
+
+    for (const remote of ["--all", "-x", "../x", "refs/heads/x", "x y"]) {
+      await expect(
+        manager.fetchRemote(a.id, { remote, expectedHead: null }),
+      ).rejects.toMatchObject({ type: "invalid_input", data: { reason: "remote" } })
+    }
+    await expect(
+      manager.fetchRemote(a.id, { prune: "yes" as never, expectedHead: null }),
+    ).rejects.toMatchObject({ type: "invalid_input", data: { reason: "prune" } })
+
+    expect(fetchRemote).not.toHaveBeenCalled()
+    manager.dispose()
+  })
+
+  it("lets an in-flight fetch finish when the manager is disposed", async () => {
+    const a = fakeRepo("a")
+    const gate = deferred<GitFetchResult>()
+    const fetchRemote = vi.fn(() => gate.promise)
+    const manager = fakeManager({
+      repositories: [a],
+      engine: fakeEngine({ fetchRemote }),
+      commonDir: () => "C:\\shared\\.git",
+    })
+    await manager.listRepositories()
+
+    const pending = manager.fetchRemote(a.id, { remote: "origin", expectedHead: null })
+    await vi.waitFor(() => expect(fetchRemote).toHaveBeenCalledTimes(1))
+
+    manager.dispose()
+    gate.resolve({ ...mutationResult(a.id), refsUpdated: 0 })
+    await expect(pending).resolves.toMatchObject({ refsUpdated: 0 })
+
+    await expect(
+      manager.fetchRemote(a.id, { remote: "origin", expectedHead: null }),
+    ).rejects.toMatchObject({ type: "disposed" })
+    expect(fetchRemote).toHaveBeenCalledTimes(1)
+  })
+
+  it("forwards every log option to the engine", async () => {    const a = fakeRepo("a")
     const getLog = vi.fn(async () => ({ commits: [], hasMore: false }))
     const manager = new RepositoryManager("C:\\workspace", {
       ttlMs: 60_000,

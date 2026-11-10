@@ -10,6 +10,7 @@ import {
   GetLogOutputSchema,
   GetRefsOutputSchema,
   GetStatusOutputSchema,
+  FetchRemoteOutputSchema,
   GitMutationResultSchema,
   ListRepositoriesOutputSchema,
 } from "../src/rpc.js"
@@ -123,6 +124,11 @@ function fakeManager(overrides: Partial<GitGraphManager> = {}): GitGraphManager 
     deleteTag: vi.fn(async () => ({
       status: statusFixture,
       changed: true,
+    })),
+    fetchRemote: vi.fn(async () => ({
+      status: statusFixture,
+      refsUpdated: 0,
+      changed: false,
     })),
     ...overrides,
   }
@@ -378,6 +384,85 @@ describe("git-graph RPC handlers", () => {
     )
 
     expect(result).toMatchObject({ changed: true, status: { branch: "feature" } })
+  })
+
+  it("forwards fetch options, defaults remote to all remotes and validates confirmation", async () => {
+    const manager = fakeManager()
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext()
+
+    const result = FetchRemoteOutputSchema.parse(
+      await handlers.fetchRemote(
+        {
+          repositoryId: statusFixture.repositoryId,
+          expectedHead: null,
+          confirmed: true,
+        },
+        context as never,
+      ),
+    )
+    expect(result).toMatchObject({ changed: false, refsUpdated: 0 })
+    expect(manager.fetchRemote).toHaveBeenCalledWith(
+      statusFixture.repositoryId,
+      { remote: null, expectedHead: null },
+      { signal: expect.anything() },
+    )
+
+    await handlers.fetchRemote(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        confirmed: true,
+        remote: "origin",
+        prune: true,
+      },
+      context as never,
+    )
+    expect(manager.fetchRemote).toHaveBeenLastCalledWith(
+      statusFixture.repositoryId,
+      { remote: "origin", prune: true, expectedHead: null },
+      { signal: expect.anything() },
+    )
+
+    const missing = (await handlers.fetchRemote(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        remote: "origin",
+      } as never,
+      context as never,
+    )) as unknown as TestError
+    expect(missing).toMatchObject({ type: "invalid_input", data: { reason: "confirmation" } })
+    expect(manager.fetchRemote).toHaveBeenCalledTimes(2)
+  })
+
+  it("maps fetch failures to a bounded mutation reason", async () => {
+    const manager = fakeManager({
+      fetchRemote: vi.fn(async () => {
+        throw Object.assign(new Error("C:\\secret\\repo network down"), {
+          name: "GitMutationError",
+          reason: "network_failed",
+        })
+      }),
+    })
+    const handlers = createGitGraphHandlers(manager)
+    const { context } = makeContext()
+
+    const result = (await handlers.fetchRemote(
+      {
+        repositoryId: statusFixture.repositoryId,
+        expectedHead: null,
+        confirmed: true,
+        remote: "origin",
+      },
+      context as never,
+    )) as unknown as TestError
+
+    expect(result).toMatchObject({
+      type: "mutation_rejected",
+      data: { reason: "network_failed" },
+    })
+    expect(JSON.stringify(result)).not.toContain("secret")
   })
 
   it("does not start a write when the signal is already aborted", async () => {

@@ -47,6 +47,9 @@ const WRITE_METHODS = [
   "renameBranch",
   "deleteBranch",
   "deleteTag",
+  // Network write shipped with the mutation engine; gated like the local
+  // mutations so FR mode stays strictly read-only.
+  "fetchRemote",
 ] as const
 
 const TEST_TIMEOUT = 20_000
@@ -66,6 +69,9 @@ describe("harness method gating", () => {
 
     expect([...exposed].sort()).toEqual([...FR_READ_METHODS].sort())
     expect(exposed.size).toBe(FR_READ_METHODS.length)
+    // fetchRemote is a network write: it must never be part of the FR read set.
+    expect(FR_READ_METHODS).not.toContain("fetchRemote")
+    expect(exposed.has("fetchRemote")).toBe(false)
     for (const method of WRITE_METHODS) {
       expect(MUTATION_METHODS).toContain(method)
       expect(exposed.has(method)).toBe(false)
@@ -83,13 +89,18 @@ describe("harness method gating", () => {
     expect(portForMode(unknown)).toBe(FR_PORT)
   })
 
-  it("exposes exactly the six known writes plus the reads in mutation mode", () => {
+  it("exposes exactly the seven known writes plus the reads in mutation mode", () => {
     const exposed = methodsForMode("mutation-fixture")
     const expected = [...FR_READ_METHODS, ...MUTATION_METHODS]
 
     expect(MUTATION_METHODS).toEqual([...WRITE_METHODS])
+    expect(WRITE_METHODS).toHaveLength(7)
+    expect(MUTATION_METHODS).toHaveLength(7)
     expect(exposed.size).toBe(expected.length)
     for (const method of expected) expect(exposed.has(method)).toBe(true)
+    // fetchRemote is mutation-only and never leaks into the FR read set.
+    expect(exposed.has("fetchRemote")).toBe(true)
+    expect(methodsForMode("fr").has("fetchRemote")).toBe(false)
     for (const method of ["push", "reset", "forcePush", "deleteRepository", "rm"]) {
       expect(exposed.has(method)).toBe(false)
     }

@@ -14,6 +14,17 @@ export interface RowLayoutInput {
   /** Fixed height of every commit row. Values below 1 are clamped to 1. */
   readonly rowHeight: number
   /**
+   * Optional fixed special rows above the commit list (for example the
+   * working-tree "Uncommitted changes" row). They share the commit row height
+   * and never receive a commit index. Defaults to 0.
+   */
+  readonly leadingRows?: number
+  /**
+   * Height of the expansion slot directly below the leading special rows.
+   * Ignored when `leadingRows` is 0. Defaults to 0.
+   */
+  readonly leadingSlotHeight?: number
+  /**
    * Index of the commit that owns the expansion slot. The slot is ignored
    * unless this is a finite integer in `[0, count)`.
    */
@@ -26,31 +37,42 @@ export interface RowLayoutInput {
 }
 
 export interface RowLayout {
-  /** `count * rowHeight` plus the slot height when the slot exists. */
+  /**
+   * Height of the leading special rows, excluding their optional slot.
+   * 0 when `leadingRows` is 0.
+   */
+  readonly leadingHeight: number
+  /** Top of the leading special slot, or `undefined` when there are no leading rows. */
+  readonly leadingSlotTop: number | undefined
+  /** Sanitized leading slot height; 0 when there are no leading rows. */
+  readonly leadingSlotHeight: number
+  /** `leadingRows * rowHeight + leadingSlotHeight + count * rowHeight` plus the commit slot. */
   readonly totalHeight: number
-  /** Top of the slot in pixels, or `undefined` when there is no slot. */
+  /** Top of the commit slot in pixels, or `undefined` when there is no commit slot. */
   readonly slotTop: number | undefined
-  /** Sanitized slot height; 0 when there is no slot. */
+  /** Sanitized commit slot height; 0 when there is no commit slot. */
   readonly slotHeight: number
   /**
    * Top of a commit row in pixels. `index` is truncated and clamped to
    * `[0, count]`, so `rowTop(count) === totalHeight`. Rows after the expanded
-   * commit include `slotHeight`.
+   * commit include `slotHeight`; every commit row includes the leading block.
    */
   rowTop(index: number): number
   /**
-   * Commit index at a pixel offset. Returns `-1` when there are no commits.
-   * Offsets inside the slot map to the expanded commit so the slot can always
-   * be associated with its owner; offsets after the slot map to the following
+   * Commit index at a pixel offset. Returns `-1` when there are no commits or
+   * when the offset lies inside the leading special rows/slot. Offsets inside
+   * the commit slot map to the expanded commit so the slot can always be
+   * associated with its owner; offsets after the slot map to the following
    * commit (or the last commit when past the end).
    */
   indexAtOffset(y: number): number
   /**
    * Commit rows to render for a viewport. The returned range is half-open
-   * `[start, end)` and never includes the slot as a pseudo-row. It contains
-   * the visible rows plus `overscan` rows on each side; when the viewport
-   * touches the slot the expanded commit stays inside the range so the slot
-   * can be associated with it. Defaults match `computeVirtualRange`.
+   * `[start, end)` and never includes the leading rows or either slot as a
+   * pseudo-row. It contains the visible rows plus `overscan` rows on each side;
+   * when the viewport touches the commit slot the expanded commit stays inside
+   * the range so the slot can be associated with it. Defaults match
+   * `computeVirtualRange` when there is no leading block or expansion slot.
    */
   range(scrollTop: number, viewportHeight: number, overscan?: number): VirtualRange
 }
@@ -60,16 +82,24 @@ const DEFAULT_OVERSCAN = 4
 export function createRowLayout(input: RowLayoutInput): RowLayout {
   const count = Math.max(0, Math.trunc(finite(input.count, 0)))
   const rowHeight = Math.max(1, finite(input.rowHeight, 1))
+  const leadingRows = Math.max(0, Math.trunc(finite(input.leadingRows ?? 0, 0)))
+  const leadingHeight = leadingRows * rowHeight
+  const leadingSlotHeight =
+    leadingRows === 0 ? 0 : Math.max(0, finite(input.leadingSlotHeight ?? 0, 0))
+  const leadingSlotTop = leadingRows === 0 ? undefined : leadingHeight
+  const leadingBlockHeight = leadingHeight + leadingSlotHeight
   const expandedIndex = validExpandedIndex(input.expandedIndex, count)
   const slotHeight =
     expandedIndex === undefined ? 0 : Math.max(0, finite(input.expandedHeight ?? 0, 0))
   const slotStart = expandedIndex === undefined ? 0 : (expandedIndex + 1) * rowHeight
-  const slotTop = expandedIndex === undefined ? undefined : slotStart
-  const totalHeight = count * rowHeight + slotHeight
+  const slotTop = expandedIndex === undefined ? undefined : leadingBlockHeight + slotStart
+  const commitTotalHeight = count * rowHeight + slotHeight
+  const totalHeight = leadingBlockHeight + commitTotalHeight
 
   function rowTop(index: number): number {
     const safeIndex = clampIndex(index, count)
     return (
+      leadingBlockHeight +
       safeIndex * rowHeight +
       (expandedIndex !== undefined && safeIndex > expandedIndex ? slotHeight : 0)
     )
@@ -79,20 +109,22 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
     if (count === 0) return -1
 
     const offset = Number.isNaN(y) ? 0 : Math.max(0, y)
+    if (offset < leadingBlockHeight) return -1
+    const local = offset - leadingBlockHeight
 
     if (expandedIndex === undefined) {
-      if (!Number.isFinite(offset)) return count - 1
-      return Math.min(count - 1, Math.floor(offset / rowHeight))
+      if (!Number.isFinite(local)) return count - 1
+      return Math.min(count - 1, Math.floor(local / rowHeight))
     }
 
-    if (offset < slotStart) {
-      return Math.min(count - 1, Math.floor(offset / rowHeight))
+    if (local < slotStart) {
+      return Math.min(count - 1, Math.floor(local / rowHeight))
     }
-    if (offset < slotStart + slotHeight) {
+    if (local < slotStart + slotHeight) {
       return expandedIndex
     }
 
-    const base = offset - slotHeight
+    const base = local - slotHeight
     if (!Number.isFinite(base)) return count - 1
     return Math.min(
       count - 1,
@@ -107,11 +139,25 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
   ): VirtualRange {
     if (count === 0) return { start: 0, end: 0 }
 
+    const rawTop = Math.max(0, finite(scrollTop, 0))
+    const viewport = Math.max(0, finite(viewportHeight, 0))
+
+    // The viewport may be entirely above the commit list. In that case no
+    // commit row is visible (the leading special row is rendered separately).
+    if (leadingBlockHeight > 0 && rawTop + viewport <= leadingBlockHeight) {
+      return { start: 0, end: 0 }
+    }
+
+    const top = Math.max(0, rawTop - leadingBlockHeight)
+    const viewportStart = Math.max(rawTop, leadingBlockHeight)
+    const localViewport = Math.max(0, rawTop + viewport - viewportStart)
+    const localBottom = top + localViewport
+
     // Without a slot the behavior is exactly the existing virtual list.
     if (expandedIndex === undefined) {
       return computeVirtualRange({
-        scrollTop,
-        viewportHeight,
+        scrollTop: top,
+        viewportHeight: localViewport,
         rowHeight,
         total: count,
         overscan,
@@ -119,13 +165,11 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
     }
 
     const extra = Math.max(0, Math.trunc(finite(overscan ?? DEFAULT_OVERSCAN, 0)))
-    const top = Math.max(0, finite(scrollTop, 0))
-    const viewport = Math.max(0, finite(viewportHeight, 0))
-    const bottom = top + viewport
+    const bottom = localBottom
 
     // Fully over-scrolled content behaves like the old virtual window: an
     // empty range at the very end.
-    if (top >= totalHeight) return { start: count, end: count }
+    if (top >= commitTotalHeight) return { start: count, end: count }
 
     const slotBottom = slotStart + slotHeight
     let start: number | undefined
@@ -140,7 +184,7 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
 
     // Rows after the slot are shifted down by the slot height.
     const postTop = Math.max(top, slotBottom)
-    const postBottom = Math.min(bottom, totalHeight)
+    const postBottom = Math.min(bottom, commitTotalHeight)
     if (postBottom > postTop) {
       const first = Math.max(
         expandedIndex + 1,
@@ -154,7 +198,7 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
     if (start === undefined || end === undefined || end <= start) {
       // The viewport only overlaps the slot: render the owner plus overscan
       // rather than inventing a commit index for the slot.
-      const anchor = indexAtOffset(top)
+      const anchor = indexAtOffset(top + leadingBlockHeight)
       start = Math.max(0, anchor - extra)
       end = Math.min(count, anchor + 1 + extra)
     } else {
@@ -174,6 +218,9 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
   }
 
   return {
+    leadingHeight,
+    leadingSlotTop,
+    leadingSlotHeight,
     totalHeight,
     slotTop,
     slotHeight,

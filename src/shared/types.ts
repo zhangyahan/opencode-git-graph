@@ -99,3 +99,16 @@ export interface GitMutationResult {
   changed: boolean
   warning?: string
 }
+
+/**
+ * Result of `fetchRemote`.
+ *
+ * `refsUpdated` counts refs under `refs/remotes/` and `refs/tags/` that were
+ * created or moved by the fetch. Deleted refs (`prune`) still set `changed` but
+ * are not included in `refsUpdated`. A fetch that changes nothing resolves with
+ * `refsUpdated: 0` and `changed: false` (an up-to-date repository is not an
+ * error).
+ */
+export interface GitFetchResult extends GitMutationResult {
+  refsUpdated: number
+}

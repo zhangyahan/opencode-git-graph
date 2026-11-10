@@ -25,7 +25,7 @@
 
 import { createRequire } from "node:module"
 import { execFileSync } from "node:child_process"
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -50,8 +50,16 @@ const MUTATION_METHODS = new Set([
   "renameBranch",
   "deleteBranch",
   "deleteTag",
+  "fetchRemote",
 ])
+const FETCH_METHOD = process.env.GG_FETCH_METHOD ?? "fetchRemote"
 const COMPARISON_METHODS = new Set(["getComparisonFiles", "getComparisonDiff"])
+const SLOT_MIN_HEIGHT = 96
+const SLOT_HANDLE_SELECTOR = '[data-testid="slot-resize-handle"]'
+const UNCOMMITTED_ROW_SELECTOR =
+  '[data-testid="uncommitted-row"], [data-testid="uncommitted-changes"], .gg-uncommitted-row'
+const LEGACY_CHANGES_SELECTOR = '[data-testid="changes"], .gg-changes-section'
+const FORBIDDEN_TOOLBAR_SELECTORS = ['[data-testid="first-parent"]', '[data-testid="jump-head"]']
 const SOURCE_FILES = [
   "src/gui/panel.tsx",
   "src/gui/styles.ts",
@@ -73,6 +81,11 @@ const SOURCE_FILES = [
   "src/gui/file-content-view.tsx",
   "src/gui/graph-geometry.ts",
   "src/gui/history-columns.ts",
+  "src/gui/changes.ts",
+  "src/gui/fetch-dialog.tsx",
+  "src/gui/slot-size.ts",
+  "src/server/git/mutations.ts",
+  "src/server/git/fetch.ts",
 ]
 
 const screenshots = []
@@ -85,7 +98,7 @@ const SELECTORS = {
   search: ['[data-testid="search-commits"]'],
   history: ['[data-testid="history"]'],
   historyScroll: ['[data-testid="history-scroll"]'],
-  row: [".gg-graph-row"],
+  row: [".gg-graph-row:not(.gg-uncommitted-row)"],
   dateCell: ['[data-testid="commit-date"]', ".gg-col-date"],
   denseGraph: ['[data-testid="dense-graph"]'],
   graphResize: ['[data-testid="resize-column-graph"]'],
@@ -107,6 +120,49 @@ const SELECTORS = {
   firstParent: ['[data-testid="first-parent"]'],
   historyOrder: ['[data-testid="history-order"]'],
   jumpHead: ['[data-testid="jump-head"]'],
+  fetchButton: ['[data-testid="fetch-button"]'],
+  fetchConfirm: ['[data-testid="fetch-confirm"]'],
+  fetchCancel: ['[data-testid="fetch-cancel"]'],
+  fetchDialog: [
+    '[data-testid="fetch-dialog"]',
+    '[data-testid="fetch-confirm-dialog"]',
+    '[data-testid="confirm-dialog"]',
+  ],
+  fetchRemote: ['[data-testid="fetch-remote-select"]', '[data-testid="fetch-remote"]', 'select[name="remote"]'],
+  fetchPrune: ['[data-testid="fetch-prune"]', 'input[name="prune"]'],
+  fetchExpectedHead: [
+    '[data-testid="fetch-expected-head"]',
+    '[data-testid="fetch-head"]',
+    '[data-testid="fetch-dialog"] .gg-dialog-facts dd:nth-of-type(2)',
+  ],
+  fetchError: [
+    '[data-testid="fetch-error"]',
+    '[data-testid="mutation-warning"]',
+    '[data-testid="mutation-notice"]',
+    ".gg-mutation-warning",
+    ".gg-mutation-notice",
+  ],
+  slotResizeHandle: [SLOT_HANDLE_SELECTOR],
+  uncommittedRow: [UNCOMMITTED_ROW_SELECTOR],
+  uncommittedCounts: [
+    '[data-testid="uncommitted-total"]',
+    '[data-testid="uncommitted-counts"]',
+    '[data-testid="uncommitted-count"]',
+    '[data-testid^="uncommitted-count-"]',
+  ],
+  uncommittedBody: [
+    '[data-testid="uncommitted-slot"]',
+    '[data-testid="uncommitted-body"]',
+    '[data-testid="uncommitted-groups"]',
+    '[data-testid="uncommitted-files"]',
+    ".gg-uncommitted-body",
+  ],
+  legacyChanges: [LEGACY_CHANGES_SELECTOR],
+  statusDiffPage: [
+    '[data-testid="commit-diff-page"]',
+    '[data-testid="diff-page"]',
+    '[data-testid="status-diff-page"]',
+  ],
   refBadge: ['[data-testid="ref-badge"]', ".gg-ref-badge:not(.gg-ref-more)"],
   refMenu: ['[data-testid="ref-menu"]', '[data-testid="ref-context-menu"]'],
   commitMenu: ['[data-testid="commit-context-menu"]'],
@@ -251,7 +307,7 @@ async function waitLoaded(page, count, timeout = 20_000) {
 
 async function waitRows(page, minimum = 1, timeout = 20_000) {
   await page.waitForFunction(
-    (expected) => document.querySelectorAll(".gg-graph-row").length >= expected,
+    (expected) => document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)").length >= expected,
     minimum,
     { timeout },
   )
@@ -283,13 +339,17 @@ async function currentScrollTop(page) {
 async function scrollToRowIndex(page, index) {
   await page.evaluate((wanted) => {
     const scroller = document.querySelector('[data-testid="history-scroll"]')
-    const rows = [...document.querySelectorAll(".gg-graph-row")]
+    const rows = [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)")]
     const rowHeight =
       rows.length > 1
         ? Number(rows[1].dataset.rowTop) - Number(rows[0].dataset.rowTop)
         : rows[0]?.getBoundingClientRect().height || 28
+    const leadingOffset =
+      rows.length > 0
+        ? Number(rows[0].dataset.rowTop) - Number(rows[0].dataset.index) * rowHeight
+        : 0
     scroller.scrollTop = Math.min(
-      Math.max(0, wanted * rowHeight),
+      Math.max(0, wanted * rowHeight + leadingOffset),
       Math.max(0, scroller.scrollHeight - scroller.clientHeight),
     )
   }, index)
@@ -306,7 +366,7 @@ async function firstVisibleHash(page) {
 }
 
 async function visibleRowHashes(page) {
-  return page.locator(".gg-graph-row").evaluateAll((rows) =>
+  return page.locator(".gg-graph-row:not(.gg-uncommitted-row)").evaluateAll((rows) =>
     rows.map((row) => row.getAttribute("data-commit")),
   )
 }
@@ -326,7 +386,7 @@ async function layoutSnapshot(page) {
     const qa = (selector, root = document) => [...root.querySelectorAll(selector)]
     const panel = q(".git-graph-panel")
     const scroller = q('[data-testid="history-scroll"]')
-    const rows = qa(".gg-graph-row")
+    const rows = qa(".gg-graph-row:not(.gg-uncommitted-row)")
     const firstRow = rows[0]
     const firstDate = firstRow?.querySelector(".gg-col-date")
     const headerCells = qa(".gg-history-head > .gg-col-head")
@@ -425,15 +485,15 @@ async function layoutSnapshot(page) {
 
 async function graphLaneSnapshot(page) {
   return page.evaluate(() => {
-    const cells = [...document.querySelectorAll(".gg-graph-row .gg-row-graph")]
-    const svgs = [...document.querySelectorAll(".gg-graph-row .gg-graph-svg")]
+    const cells = [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row) .gg-row-graph")]
+    const svgs = [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row) .gg-graph-svg")]
     const widths = svgs
       .map((svg) => Number(svg.getAttribute("width")))
       .filter((value) => Number.isFinite(value) && value > 0)
     const contentWidth = widths.length > 0 ? Math.max(...widths) : null
     const xs = [
       ...new Set(
-        [...document.querySelectorAll(".gg-graph-row .gg-graph-svg circle")]
+        [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row) .gg-graph-svg circle")]
           .map((circle) => Number(circle.getAttribute("cx")))
           .filter((value) => Number.isFinite(value)),
       ),
@@ -459,7 +519,7 @@ async function graphLaneSnapshot(page) {
       const cellRect = firstCell.getBoundingClientRect()
       let max = 0
       for (const shape of document.querySelectorAll(
-        ".gg-graph-row .gg-graph-svg path, .gg-graph-row .gg-graph-svg circle, .gg-graph-row .gg-graph-svg rect",
+        ".gg-graph-row:not(.gg-uncommitted-row) .gg-graph-svg path, .gg-graph-row:not(.gg-uncommitted-row) .gg-graph-svg circle, .gg-graph-row:not(.gg-uncommitted-row) .gg-graph-svg rect",
       )) {
         const rect = shape.getBoundingClientRect()
         max = Math.max(max, rect.right - cellRect.left)
@@ -548,7 +608,7 @@ async function applyHistoryFilter(page, configure) {
 
 async function openMenuAt(page, selector, button = "right") {
   const badge = await waitForAny(page, selector)
-  const beforeRows = await page.locator(".gg-graph-row").count()
+  const beforeRows = await page.locator(".gg-graph-row:not(.gg-uncommitted-row)").count()
   await badge.click({ button })
   return { badge, beforeRows }
 }
@@ -665,6 +725,280 @@ async function columnWidth(page, id) {
     ]
     return cell ? cell.getBoundingClientRect().width : null
   }, id)
+}
+
+/* ---------- release extension helpers (WIP selectors are documented in README) ---------- */
+
+function runGit(cwd, args, { allowFailure = false } = {}) {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_ASKPASS: "",
+        SSH_ASKPASS: "",
+        LC_ALL: "C",
+      },
+    }).trim()
+  } catch (error) {
+    if (allowFailure) return { ok: false, stdout: String(error?.stdout ?? ""), stderr: String(error?.stderr ?? "") }
+    const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : ""
+    throw new Error(`git ${args.join(" ")} failed in ${cwd}${stderr ? `: ${stderr}` : ""}`)
+  }
+}
+
+function runGitAllowFailure(cwd, args) {
+  return runGit(cwd, args, { allowFailure: true })
+}
+
+function localFileUrl(path) {
+  return `file:///${path.replace(/\\/g, "/").replace(/^\/+/, "")}`
+}
+
+/**
+ * Create a private bare remote under the approved TEMP tree and point the TEMP
+ * fixture at it. The remote starts with one branch pointing at the current HEAD
+ * so a successful fetch must update at least one remote-tracking ref.
+ */
+function setupFetchRemote(tempRepo, tempStatus) {
+  const remoteName = `gg-release-${Date.now().toString(36)}`
+  const remoteDir = join(TEMP_ROOT, "gg-ui-release-remote", `${remoteName}.git`)
+  mkdirSync(remoteDir, { recursive: true })
+  runGit(remoteDir, ["init", "--bare"])
+  const head = tempStatus.head
+  if (!head) throw new Error("TEMP fixture has no HEAD for the fetch remote")
+  const previousFileProtocol = runGitAllowFailure(tempRepo.rootPath, ["config", "--get", "protocol.file.allow"])
+  runGit(tempRepo.rootPath, ["config", "protocol.file.allow", "always"])
+  // A fresh bare repository has no objects, so a ref cannot be created with
+  // update-ref. Push the fixture HEAD so the remote owns the commit and the
+  // subsequent fetch has a real object to advertise.
+  runGit(tempRepo.rootPath, ["push", "--force", localFileUrl(remoteDir), `${head}:refs/heads/fetch-target`])
+  runGit(tempRepo.rootPath, ["remote", "add", remoteName, localFileUrl(remoteDir)])
+  // The GUI lists remotes from loaded refs, so seed one remote-tracking ref on
+  // an older commit. The fetch then visibly advances it to the remote HEAD.
+  const previousHead = runGitAllowFailure(tempRepo.rootPath, ["rev-parse", `${head}~1`])
+  if (previousHead) {
+    runGit(tempRepo.rootPath, ["update-ref", `refs/remotes/${remoteName}/fetch-target`, previousHead])
+  }
+  return {
+    remoteName,
+    remoteDir,
+    head,
+    cleanup() {
+      runGitAllowFailure(tempRepo.rootPath, ["remote", "remove", remoteName])
+      if (typeof previousFileProtocol === "string" && previousFileProtocol.length > 0) {
+        runGitAllowFailure(tempRepo.rootPath, ["config", "protocol.file.allow", previousFileProtocol])
+      } else {
+        runGitAllowFailure(tempRepo.rootPath, ["config", "--unset", "protocol.file.allow"])
+      }
+      try {
+        rmSync(remoteDir, { recursive: true, force: true })
+      } catch {
+        /* best-effort TEMP cleanup */
+      }
+    },
+  }
+}
+
+async function slotSnapshot(page) {
+  return page.evaluate(() => {
+    const q = (selector, root = document) => root.querySelector(selector)
+    const scroller = q('[data-testid="history-scroll"]')
+    const slot = q('[data-testid="inline-slot"]')
+    const handle = q('[data-testid="slot-resize-handle"]')
+    const spacer = q(".gg-history-spacer")
+    const expanded = q(".gg-graph-row.gg-expanded")
+    const rect = (element) => {
+      if (!element) return null
+      const r = element.getBoundingClientRect()
+      return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }
+    }
+    const visible = [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)")].map((row) => row.dataset.commit)
+    return {
+      slotPresent: Boolean(slot),
+      slot: rect(slot),
+      handle: rect(handle),
+      handleCount: document.querySelectorAll('[data-testid="slot-resize-handle"]').length,
+      slotHeight:
+        slot ? slot.getBoundingClientRect().height : null,
+      slotStyleHeight: slot ? Number.parseFloat(slot.style.height) : null,
+      spacerSlotHeight: spacer ? Number(spacer.dataset.slotHeight ?? NaN) : null,
+      expandedIndex: expanded ? Number(expanded.dataset.index) : null,
+      expandedHash: expanded ? expanded.dataset.commit : null,
+      scrollTop: scroller ? scroller.scrollTop : null,
+      scrollHeight: scroller ? scroller.scrollHeight : null,
+      clientHeight: scroller ? scroller.clientHeight : null,
+      distanceToBottom: scroller
+        ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+        : null,
+      visibleHashes: visible,
+    }
+  })
+}
+
+async function waitSlotHeightSettled(page, previousHeight) {
+  await page.waitForFunction(
+    (height) => {
+      const slot = document.querySelector('[data-testid="inline-slot"]')
+      const spacer = document.querySelector(".gg-history-spacer")
+      if (!slot || !spacer) return false
+      const current = slot.getBoundingClientRect().height
+      return Math.abs(current - height) > 0.5 || Number(spacer.dataset.slotHeight) === current
+    },
+    previousHeight,
+    { timeout: 10_000 },
+  ).catch(() => {})
+  await waitRaf(page, 3)
+}
+
+async function dragSlotHandle(page, deltaY) {
+  const handle = page.locator(SLOT_HANDLE_SELECTOR).first()
+  await handle.waitFor({ state: "visible", timeout: 10_000 })
+  const box = await handle.boundingBox()
+  if (!box) throw new Error("slot resize handle has no box")
+  const before = await slotSnapshot(page)
+  const viewport = page.viewportSize() ?? { width: 1280, height: 900 }
+  const x = box.x + box.width / 2
+  const y = box.y + box.height / 2
+  const targetY = Math.max(2, Math.min(viewport.height - 2, y + deltaY))
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  await page.mouse.move(x, targetY, { steps: 10 })
+  await page.mouse.up()
+  await waitSlotHeightSettled(page, before.slotHeight)
+  const after = await slotSnapshot(page)
+  return { before, after, deltaY: targetY - y }
+}
+
+async function uncommittedSnapshot(page) {
+  return page.evaluate(() => {
+    const row = document.querySelector(
+      '[data-testid="uncommitted-row"], [data-testid="uncommitted-changes"], .gg-uncommitted-row',
+    )
+    if (!row) return { present: false }
+    const body = row.querySelector(
+      '[data-testid="uncommitted-slot"], [data-testid="uncommitted-body"], [data-testid="uncommitted-groups"], [data-testid="uncommitted-files"], .gg-uncommitted-body',
+    )
+    const buttons = body ? [...body.querySelectorAll("button")] : []
+    const countText = [...row.querySelectorAll(
+      '[data-testid="uncommitted-total"], [data-testid="uncommitted-counts"], [data-testid="uncommitted-count"], [data-testid^="uncommitted-count-"]',
+    )]
+      .map((element) => element.textContent.replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .join(" ")
+    const countsByKind = Object.fromEntries(
+      [...row.querySelectorAll('[data-testid^="uncommitted-count-"]')].map((element) => [
+        element.getAttribute("data-testid").replace("uncommitted-count-", ""),
+        Number(element.getAttribute("data-count") ?? element.textContent.trim()),
+      ]),
+    )
+    return {
+      present: true,
+      text: row.textContent.replace(/\s+/g, " ").trim(),
+      expanded: row.getAttribute("aria-expanded") === "true",
+      isCommitRow: row.hasAttribute("data-commit") || row.hasAttribute("data-index"),
+      commitIndexCount: document.querySelectorAll(".gg-graph-row[data-index]").length,
+      counts: countText || null,
+      countsByKind,
+      groups: buttons.map((button) => button.textContent.replace(/\s+/g, " ").trim()),
+      files: body ? [...body.querySelectorAll(".gg-file-row")].map((file) => file.textContent.replace(/\s+/g, " ").trim()) : [],
+      fileCount: body ? body.querySelectorAll(".gg-file-row").length : 0,
+      hasLegacyChanges: Boolean(
+        document.querySelector('[data-testid="changes"], .gg-changes-section'),
+      ),
+    }
+  })
+}
+
+function uncommittedGroupButton(page, label) {
+  return page
+    .locator(
+      '[data-testid="uncommitted-slot"] button, [data-testid="uncommitted-files"] button, [data-testid="uncommitted-body"] button, [data-testid="uncommitted-groups"] button, .gg-uncommitted-body button',
+    )
+    .filter({ hasText: new RegExp(`(?:^|[\\s▾▸])${label}(?:\\s|\\d|$)`, "i") })
+    .first()
+}
+
+async function openUncommitted(page) {
+  const row = page.locator(UNCOMMITTED_ROW_SELECTOR).first()
+  await row.waitFor({ state: "visible", timeout: 15_000 })
+  if ((await row.getAttribute("aria-expanded")) !== "true") {
+    await row.click()
+    await waitRaf(page, 2)
+  }
+  return row
+}
+
+async function prepareDirtyTempFixture(tempRepo) {
+  const root = tempRepo.rootPath
+  const initialStatus = runGit(root, ["status", "--porcelain"])
+  if (initialStatus !== "") {
+    return { ok: false, reason: "TEMP fixture is not clean before uncommitted setup", initialStatus }
+  }
+  const branch = runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"])
+  const baseHead = runGit(root, ["rev-parse", "HEAD"])
+  const tracked = runGit(root, ["ls-files"]).split(/\r?\n/).filter(Boolean)
+  if (tracked.length < 2) return { ok: false, reason: "TEMP fixture needs two tracked files for index/worktree diff coverage" }
+  const stagedPath = tracked[0]
+  const unstagedPath = tracked[1]
+  const readmePath = tracked.find((path) => /readme\.md$/i.test(path)) ?? stagedPath
+  const original = new Map()
+  for (const path of new Set([stagedPath, unstagedPath, readmePath])) {
+    original.set(path, readFileSync(join(root, path)))
+  }
+  const untrackedName = `gg-release-untracked-${Date.now().toString(36)}.txt`
+  const conflictName = `gg-release-conflict-${Date.now().toString(36)}.txt`
+  const conflictBranch = `gg-release-conflict-branch-${Date.now().toString(36)}`
+  const cleanup = () => {
+    runGitAllowFailure(root, ["merge", "--abort"])
+    runGitAllowFailure(root, ["checkout", "-f", branch])
+    runGitAllowFailure(root, ["reset", "--hard", baseHead])
+    runGitAllowFailure(root, ["branch", "-D", conflictBranch])
+    try {
+      unlinkSync(join(root, untrackedName))
+    } catch {
+      /* already gone */
+    }
+    try {
+      unlinkSync(join(root, conflictName))
+    } catch {
+      /* already gone */
+    }
+    for (const [path, bytes] of original) {
+      try {
+        writeFileSync(join(root, path), bytes)
+      } catch {
+        /* best-effort TEMP cleanup */
+      }
+    }
+  }
+  try {
+    // Real conflicted state: commit the same path on two branches and merge.
+    runGit(root, ["checkout", "-b", conflictBranch])
+    writeFileSync(join(root, conflictName), "conflict branch\n")
+    runGit(root, ["add", "--", conflictName])
+    runGit(root, ["commit", "-m", "release conflict branch fixture"])
+    runGit(root, ["checkout", branch])
+    writeFileSync(join(root, conflictName), "base branch\n")
+    runGit(root, ["add", "--", conflictName])
+    runGit(root, ["commit", "-m", "release conflict base fixture"])
+    runGitAllowFailure(root, ["merge", "--no-edit", conflictBranch])
+
+    // Staged + unstaged + untracked after the conflicted merge state exists.
+    writeFileSync(join(root, stagedPath), `${readFileSync(join(root, stagedPath), "utf8")}\nrelease staged fixture\n`)
+    runGit(root, ["add", "--", stagedPath])
+    writeFileSync(join(root, unstagedPath), `${readFileSync(join(root, unstagedPath), "utf8")}\nrelease unstaged fixture\n`)
+    writeFileSync(join(root, untrackedName), "release untracked fixture\n")
+
+    return { ok: true, cleanup, stagedPath, unstagedPath, untrackedName, conflictName, conflictBranch, baseHead }
+  } catch (error) {
+    cleanup()
+    return { ok: false, reason: String(error), cleanup }
+  }
 }
 
 function makeGate() {
@@ -1125,7 +1459,7 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
   const afterExpand = await layoutSnapshot(page)
   const laneMax = await page.evaluate(() => {
     let max = 0
-    for (const row of document.querySelectorAll(".gg-graph-row")) {
+    for (const row of document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)")) {
       const cell = row.querySelector(".gg-row-graph")
       const svg = row.querySelector(".gg-graph-svg")
       if (!cell || !svg) continue
@@ -1183,7 +1517,7 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
   }
   const scrollSemantics = await page.evaluate(() => {
     const cell = document.querySelector(".gg-graph-row .gg-row-graph")
-    const row = cell?.closest(".gg-graph-row")
+    const row = cell?.closest(".gg-graph-row:not(.gg-uncommitted-row)")
     const inner = cell?.querySelector(".gg-row-graph-inner")
     const history = document.querySelector('[data-testid="history-scroll"]')
     const doc = document.scrollingElement
@@ -1913,7 +2247,7 @@ async function selectedFilterScenario(browser, tempRepo, checks, metrics) {
   await page.waitForFunction(
     () => {
       const footer = document.querySelector(".gg-history-footer")?.innerText ?? ""
-      return /[1-9]\d* loaded/.test(footer) && document.querySelectorAll(".gg-graph-row").length > 0
+      return /[1-9]\d* loaded/.test(footer) && document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)").length > 0
     },
     null,
     { timeout: 20_000 },
@@ -2457,6 +2791,714 @@ async function mutationSwitchScenario(browser, tempRepo, checks, metrics) {
   await context.close()
 }
 
+async function slotResizeScenario(browser, frPrimary, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  try {
+    const page = await context.newPage()
+    await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+    await waitLoaded(page, 100)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+
+    const frLog = (await fetchRpc(FR_ORIGIN, "getLog", { repositoryId: frPrimary.id, limit: 100 })).body.result
+    let candidate = -1
+    let fallbackCandidate = -1
+    const floor = Math.max(0, frLog.commits.length - 40)
+    const startIndex = Math.max(floor, frLog.commits.length - 15)
+    for (let index = startIndex; index >= floor; index -= 1) {
+      const files = await fetchRpc(FR_ORIGIN, "getCommitFiles", {
+        repositoryId: frPrimary.id,
+        hash: frLog.commits[index].hash,
+        parentIndex: 0,
+      })
+      const fileCount = files.body?.result?.files?.length ?? 0
+      if (fileCount > 0 && fallbackCandidate < 0) fallbackCandidate = index
+      if (fileCount >= 4) {
+        candidate = index
+        break
+      }
+    }
+    if (candidate < 0) candidate = fallbackCandidate
+    if (candidate < 0) {
+      checkResult(checks, "slot resize fixture has a late commit with files", false, { commits: frLog.commits.length })
+      return
+    }
+    await scrollToRowIndex(page, candidate)
+    await page.locator(`.gg-graph-row[data-index="${candidate}"] .gg-subject`).click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await page.waitForFunction(
+      () => {
+        const tree = document.querySelector('[data-testid="inline-files"]')
+        return Boolean(tree) && !tree.querySelector(".gg-status")
+      },
+      null,
+      { timeout: 20_000 },
+    ).catch(() => {})
+    await waitRaf(page, 2)
+
+    const initial = await slotSnapshot(page)
+    checkResult(
+      checks,
+      "inline slot exposes a bottom resize handle outside the scroll area",
+      initial.slotPresent && initial.handleCount === 1 && Boolean(initial.handle),
+      initial,
+    )
+
+    const minDrag = await dragSlotHandle(page, -4000)
+    const minHeight = minDrag.after.slotHeight
+    checkResult(
+      checks,
+      "slot drag clamps to the 96px minimum height",
+      minHeight !== null && minHeight >= SLOT_MIN_HEIGHT - 0.5 && minHeight <= SLOT_MIN_HEIGHT + 1.5,
+      { before: minDrag.before.slotHeight, after: minHeight, deltaY: minDrag.deltaY },
+    )
+
+    // Return to the expanded commit at the top; this position is away from the
+    // bottom, so a small drag must not move the virtual scroll window.
+    await scrollToRowIndex(page, candidate)
+    await waitRaf(page, 2)
+    const preserveBefore = await slotSnapshot(page)
+    const preserveDrag = await dragSlotHandle(page, 48)
+    const preserveAfter = preserveDrag.after
+    checkResult(
+      checks,
+      "slot drag away from the bottom preserves virtual scroll position",
+      preserveBefore.scrollTop !== null &&
+        preserveAfter.scrollTop !== null &&
+        Math.abs(preserveAfter.scrollTop - preserveBefore.scrollTop) <= 1 &&
+        preserveBefore.slot &&
+        preserveAfter.slot &&
+        Math.abs(preserveAfter.slot.top - preserveBefore.slot.top) <= 1,
+      { before: preserveBefore, after: preserveAfter },
+    )
+
+    // Move the handle near the top, then drag to the viewport edge to reach the
+    // dynamic maximum. No fixed maximum is assumed.
+    await page.evaluate(() => {
+      const scroller = document.querySelector('[data-testid="history-scroll"]')
+      const handle = document.querySelector('[data-testid="slot-resize-handle"]')
+      if (!scroller || !handle) return
+      const scrollerRect = scroller.getBoundingClientRect()
+      const handleRect = handle.getBoundingClientRect()
+      const target = handleRect.top - scrollerRect.top + scroller.scrollTop - 80
+      scroller.scrollTop = Math.max(0, target)
+    })
+    await waitRaf(page, 2)
+    const maxDrag = await dragSlotHandle(page, 2000)
+    const maxHeight = maxDrag.after.slotHeight
+    const viewportHeight = maxDrag.after.clientHeight ?? 0
+    const expectedMax = Math.max(SLOT_MIN_HEIGHT, Math.min(560, viewportHeight - 80))
+    checkResult(
+      checks,
+      "slot drag grows to the dynamic viewport maximum",
+      maxHeight !== null &&
+        maxHeight > minHeight + 1 &&
+        Math.abs(maxHeight - expectedMax) <= 1,
+      { minHeight, maxHeight, expectedMax, viewportHeight, deltaY: maxDrag.deltaY },
+    )
+
+    const savedHeight = maxHeight
+    await page.locator(`.gg-graph-row[data-index="${candidate}"] .gg-subject`).click()
+    await page.waitForFunction(() => !document.querySelector('[data-testid="inline-slot"]'), null, { timeout: 10_000 })
+    await page.locator(`.gg-graph-row[data-index="${candidate}"] .gg-subject`).click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await waitRaf(page, 2)
+    const reopened = await slotSnapshot(page)
+    checkResult(
+      checks,
+      "slot height persists for the session after collapse/reopen",
+      savedHeight !== null && reopened.slotHeight !== null && Math.abs(reopened.slotHeight - savedHeight) <= 1,
+      { savedHeight, reopened: reopened.slotHeight },
+    )
+
+    metrics.slotResize = {
+      candidate,
+      initial: initial.slotHeight,
+      minHeight,
+      maxHeight,
+      reopened: reopened.slotHeight,
+      preserve: { before: preserveBefore, after: preserveAfter },
+    }
+    await screenshot(page, "17-fr-slot-resize.png", { fullPage: true })
+  } catch (error) {
+    checkResult(checks, "slot resize scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+  }
+}
+
+/**
+ * Bottom-follow needs the expanded slot to actually sit at the real bottom.
+ * The FR history auto-paginates, which keeps moving that bottom, so this uses
+ * the small TEMP fixture (6 rows, hasMore=false) in a short viewport: the
+ * content still overflows, but parking at the bottom is stable.
+ */
+async function slotBottomFollowScenario(browser, tempRepo, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 420 }, locale: "en-US" })
+  try {
+    const page = await context.newPage()
+    await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(tempRepo.id)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    const log = (await fetchRpc(TEMP_ORIGIN, "getLog", { repositoryId: tempRepo.id, limit: 100 })).body.result
+    let bottomCandidate = -1
+    for (let index = log.commits.length - 1; index >= 0; index -= 1) {
+      const files = await fetchRpc(TEMP_ORIGIN, "getCommitFiles", {
+        repositoryId: tempRepo.id,
+        hash: log.commits[index].hash,
+        parentIndex: 0,
+      })
+      if ((files.body?.result?.files?.length ?? 0) > 0) {
+        bottomCandidate = index
+        break
+      }
+    }
+    checkResult(checks, "bottom-follow fixture has a file-bearing tail commit", bottomCandidate >= 0, { bottomCandidate, commits: log.commits.length })
+    if (bottomCandidate < 0) return
+    await scrollToRowIndex(page, bottomCandidate)
+    await page.locator(`.gg-graph-row[data-index="${bottomCandidate}"] .gg-subject`).click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await page.waitForFunction(
+      () => {
+        const tree = document.querySelector('[data-testid="inline-files"]')
+        return Boolean(tree) && !tree.querySelector(".gg-status")
+      },
+      null,
+      { timeout: 20_000 },
+    ).catch(() => {})
+    await waitRaf(page, 2)
+    await scrollToBottom(page)
+    const before = await slotSnapshot(page)
+    const minDrag = await dragSlotHandle(page, -4000)
+    await scrollToBottom(page)
+    const shrunk = await slotSnapshot(page)
+    const growDrag = await dragSlotHandle(page, 120)
+    const after = growDrag.after
+    const viewport = page.viewportSize() ?? { width: 1280, height: 420 }
+    const handleVisible =
+      Boolean(before.handle) &&
+      before.handle.top >= 0 &&
+      shrunk.handle !== null &&
+      shrunk.handle.top >= 0 &&
+      shrunk.handle.bottom <= viewport.height
+    checkResult(checks, "bottom-follow handle is actually visible at the scroller bottom", handleVisible, { before: before.handle, shrunk: shrunk.handle, viewportHeight: viewport.height })
+    checkResult(
+      checks,
+      "slot drag clamps to the 96px minimum height at the bottom",
+      shrunk.slotHeight !== null && shrunk.slotHeight >= SLOT_MIN_HEIGHT - 0.5 && shrunk.slotHeight <= SLOT_MIN_HEIGHT + 1.5,
+      { minHeight: shrunk.slotHeight, deltaY: minDrag.deltaY },
+    )
+    checkResult(
+      checks,
+      "slot resize at the bottom keeps the scroller pinned to the bottom",
+      after.distanceToBottom !== null && Math.abs(after.distanceToBottom) <= 1.5,
+      { before: shrunk, after },
+    )
+    checkResult(
+      checks,
+      "slot grow at the bottom follows the content instead of jumping",
+      after.scrollTop !== null &&
+        shrunk.scrollTop !== null &&
+        after.scrollTop >= shrunk.scrollTop - 1 &&
+        after.scrollHeight > shrunk.scrollHeight,
+      { scrollTopBefore: shrunk.scrollTop, scrollTopAfter: after.scrollTop, scrollHeightBefore: shrunk.scrollHeight, scrollHeightAfter: after.scrollHeight },
+    )
+    metrics.slotBottomFollow = {
+      candidate: bottomCandidate,
+      before: shrunk.slotHeight,
+      after: after.slotHeight,
+      scrollTop: { before: shrunk.scrollTop, after: after.scrollTop },
+      scrollHeight: { before: shrunk.scrollHeight, after: after.scrollHeight },
+      distanceToBottom: after.distanceToBottom,
+    }
+    await screenshot(page, "17b-temp-slot-bottom-follow.png", { fullPage: true })
+  } catch (error) {
+    checkResult(checks, "slot bottom-follow scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+  }
+}
+
+async function uncommittedCleanScenario(browser, frPrimary, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  try {
+    const page = await context.newPage()
+    await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+    await waitLoaded(page, 100)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    const status = (await fetchRpc(FR_ORIGIN, "getStatus", { repositoryId: frPrimary.id })).body.result
+    const snapshot = await uncommittedSnapshot(page)
+    const legacyCount = await page.locator(LEGACY_CHANGES_SELECTOR).count()
+    const counts = status.counts
+    const clean = counts.staged === 0 && counts.unstaged === 0 && counts.untracked === 0 && counts.conflicted === 0
+    checkResult(checks, "FR history exposes an Uncommitted changes row", snapshot.present, snapshot)
+    checkResult(
+      checks,
+      "Uncommitted changes row is outside commit indexing",
+      snapshot.present && snapshot.isCommitRow === false && snapshot.commitIndexCount > 0,
+      { isCommitRow: snapshot.isCommitRow, commitIndexCount: snapshot.commitIndexCount },
+    )
+    checkResult(
+      checks,
+      "clean Uncommitted changes row shows zero counts",
+      clean && snapshot.present && /\b0\b/.test(snapshot.text) && snapshot.fileCount === 0,
+      { statusCounts: counts, text: snapshot.text, fileCount: snapshot.fileCount },
+    )
+    checkResult(checks, "legacy standalone Changes section is absent", legacyCount === 0, { legacyCount })
+    metrics.uncommittedClean = { counts, snapshot, legacyCount }
+    await screenshot(page, "18-fr-uncommitted-clean.png", { fullPage: true })
+  } catch (error) {
+    checkResult(checks, "clean uncommitted row scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+  }
+}
+
+async function uncommittedScenario(browser, tempRepo, checks, metrics) {
+  const fixture = await prepareDirtyTempFixture(tempRepo)
+  if (!fixture.ok) {
+    checkResult(checks, "TEMP uncommitted fixture can be prepared safely", false, fixture)
+    return
+  }
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  try {
+    const page = await context.newPage()
+    await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 2,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(tempRepo.id)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    const status = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    const counts = status.counts
+    const snapshot = await uncommittedSnapshot(page)
+    const legacyCount = await page.locator(LEGACY_CHANGES_SELECTOR).count()
+    checkResult(
+      checks,
+      "TEMP dirty fixture reaches all four Uncommitted groups",
+      counts.staged > 0 && counts.unstaged > 0 && counts.untracked > 0 && counts.conflicted > 0,
+      { counts, files: status.files.map((file) => ({ path: file.path, status: file.status, staged: file.staged })) },
+    )
+    checkResult(checks, "Uncommitted changes row shows a counts badge", snapshot.present && typeof snapshot.counts === "string" && snapshot.counts.length > 0, snapshot)
+    checkResult(
+      checks,
+      "Uncommitted counts badge matches the real status counts",
+      snapshot.present &&
+        ["staged", "unstaged", "untracked", "conflicted"].every(
+          (kind) => counts[kind] === 0 || snapshot.countsByKind?.[kind] === counts[kind],
+        ),
+      { counts, countsByKind: snapshot.countsByKind },
+    )
+    checkResult(checks, "legacy standalone Changes section is absent in TEMP", legacyCount === 0, { legacyCount })
+    await openUncommitted(page)
+    const opened = await uncommittedSnapshot(page)
+    checkResult(
+      checks,
+      "Uncommitted row expands Staged/Unstaged/Untracked/Conflicted groups",
+      ["Staged", "Unstaged", "Untracked", "Conflicted"].every((label) =>
+        opened.groups.some((text) => new RegExp(`(?:^|[\\s▾▸])${label}(?:\\s|\\d|$)`, "i").test(text)),
+      ),
+      { groups: opened.groups },
+    )
+    checkResult(
+      checks,
+      "Uncommitted group File rows are real changed files",
+      opened.fileCount >= 4 && opened.files.some((text) => text.includes(fixture.stagedPath)) && opened.files.some((text) => text.includes(fixture.unstagedPath)),
+      { fileCount: opened.fileCount, files: opened.files },
+    )
+
+    const verifyDiff = async (label, path, expectedTarget) => {
+      const group = uncommittedGroupButton(page, label)
+      if ((await group.count()) === 0) {
+        checkResult(checks, `Uncommitted ${label} group is reachable`, false, {})
+        return
+      }
+      if ((await group.getAttribute("aria-expanded")) !== "true") {
+        await group.click()
+        await waitRaf(page, 2)
+      }
+      const fileRow = page
+        .locator(
+          '[data-testid="uncommitted-slot"] .gg-file-row, [data-testid="uncommitted-files"] .gg-file-row, [data-testid="uncommitted-body"] .gg-file-row, [data-testid="uncommitted-groups"] .gg-file-row, .gg-uncommitted-body .gg-file-row',
+        )
+        .filter({ hasText: path })
+        .first()
+      if ((await fileRow.count()) === 0) {
+        checkResult(checks, `Uncommitted ${label} file row is reachable`, false, { path })
+        return
+      }
+      const requestPromise = page.waitForRequest(
+        (request) => request.url().endsWith("/__gg/rpc/getDiff"),
+        { timeout: 20_000 },
+      )
+      await fileRow.click()
+      const input = parseInput(await requestPromise)
+      await waitForAny(page, SELECTORS.statusDiffPage)
+      const fullPageSource = await page
+        .locator('[data-testid="commit-diff-page"]')
+        .getAttribute("data-diff-source")
+        .catch(() => null)
+      checkResult(
+        checks,
+        `Uncommitted ${label} file opens the ${expectedTarget} full-page diff`,
+        input?.target?.type === expectedTarget &&
+          input?.path === path &&
+          fullPageSource === expectedTarget,
+        { input, fullPageSource },
+      )
+      await screenshot(page, `19-temp-uncommitted-${expectedTarget}.png`, { fullPage: true })
+      const back = await anyLocator(page, SELECTORS.detailsBack)
+      if (back) await back.click()
+      await page.waitForFunction(
+        () => !document.querySelector('[data-testid="commit-diff-page"], [data-testid="diff-page"], [data-testid="status-diff-page"]'),
+        null,
+        { timeout: 10_000 },
+      ).catch(() => {})
+      await waitRaf(page, 2)
+    }
+
+    await verifyDiff("Staged", fixture.stagedPath, "index")
+    await verifyDiff("Unstaged", fixture.unstagedPath, "working-tree")
+    metrics.uncommitted = { counts, snapshot: opened, legacyCount }
+  } catch (error) {
+    checkResult(checks, "Uncommitted changes scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+    fixture.cleanup()
+  }
+}
+
+async function fetchScenario(browser, tempRepo, checks, metrics) {
+  const tempStatus = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+  let remote
+  try {
+    remote = setupFetchRemote(tempRepo, tempStatus)
+  } catch (error) {
+    checkResult(checks, "TEMP local bare fetch remote can be created", false, { error: String(error) })
+    return
+  }
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  const fetchRequests = []
+  let fetchResult = null
+  try {
+    const page = await context.newPage()
+    page.on("request", (request) => {
+      if (!request.url().endsWith(`/__gg/rpc/${FETCH_METHOD}`)) return
+      fetchRequests.push({ input: parseInput(request), at: Date.now() })
+    })
+    await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 2,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(tempRepo.id)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+
+    const fetchButton = await anyLocator(page, SELECTORS.fetchButton)
+    checkResult(checks, "toolbar exposes a fetch button", Boolean(fetchButton), {})
+    if (!fetchButton) return
+    const fetchEnabled = !(await fetchButton.isDisabled().catch(() => true))
+    checkResult(checks, "fetch button is enabled when remotes exist", fetchEnabled, {})
+    if (!fetchEnabled) return
+
+    // Cancel must not issue any fetch RPC.
+    await fetchButton.click()
+    await waitForAny(page, SELECTORS.fetchDialog)
+    await screenshot(page, "20-temp-fetch-dialog.png", { fullPage: true })
+    const requestsBeforeCancel = fetchRequests.length
+    const cancel = await anyLocator(page, SELECTORS.fetchCancel)
+    checkResult(checks, "fetch confirmation has a cancel action", Boolean(cancel), {})
+    if (cancel) {
+      await cancel.click()
+      await page.waitForFunction(
+        () => !document.querySelector('[data-testid="fetch-dialog"], [data-testid="fetch-confirm-dialog"], [data-testid="confirm-dialog"]'),
+        null,
+        { timeout: 10_000 },
+      ).catch(() => {})
+      await waitRaf(page, 3)
+    }
+    checkResult(
+      checks,
+      "fetch cancel sends zero fetch RPCs",
+      fetchRequests.length === requestsBeforeCancel && fetchRequests.length === 0,
+      { before: requestsBeforeCancel, after: fetchRequests.length },
+    )
+
+    // Confirmed fetch against the local bare remote.
+    await fetchButton.click()
+    await waitForAny(page, SELECTORS.fetchDialog)
+    const remoteSelect = await anyLocator(page, SELECTORS.fetchRemote)
+    checkResult(checks, "fetch dialog exposes a remote selector", Boolean(remoteSelect), {})
+    if (!remoteSelect) return
+    const optionCount = await remoteSelect.locator("option").count()
+    let selected = false
+    for (let index = 0; index < optionCount; index += 1) {
+      const option = remoteSelect.locator("option").nth(index)
+      const value = await option.getAttribute("value")
+      const label = (await option.textContent()) ?? ""
+      if (value === remote.remoteName || label.trim() === remote.remoteName) {
+        await remoteSelect.selectOption(value ? value : { label: remote.remoteName })
+        selected = true
+        break
+      }
+    }
+    checkResult(checks, "fetch dialog can select the local bare remote", selected, { remote: remote.remoteName, optionCount })
+    if (!selected) return
+
+    const prune = await anyLocator(page, SELECTORS.fetchPrune)
+    checkResult(checks, "fetch dialog exposes a prune control", Boolean(prune), {})
+    if (prune) {
+      const type = await prune.getAttribute("type")
+      if (type === "checkbox") await prune.check().catch(() => {})
+      else await prune.click().catch(() => {})
+    }
+    const expectedHeadControl = await anyLocator(page, SELECTORS.fetchExpectedHead)
+    if (expectedHeadControl) {
+      const expectedHeadText = `${await expectedHeadControl.inputValue().catch(() => "")} ${await expectedHeadControl.textContent().catch(() => "")}`
+      checkResult(checks, "fetch dialog exposes the expected HEAD", expectedHeadText.includes(tempStatus.head ?? ""), { expectedHead: tempStatus.head })
+    } else {
+      checkResult(checks, "fetch dialog exposes the expected HEAD", false, { note: "no fetch-expected-head/fetch-head testid; request guard still asserts it" })
+    }
+
+    const responsePromise = page.waitForResponse(
+      (response) => response.url().endsWith(`/__gg/rpc/${FETCH_METHOD}`),
+      { timeout: 30_000 },
+    )
+    const refsRefresh = page.waitForRequest(
+      (request) => request.url().endsWith("/__gg/rpc/getRefs"),
+      { timeout: 30_000 },
+    ).catch(() => null)
+    const logRefresh = page.waitForRequest(
+      (request) => request.url().endsWith("/__gg/rpc/getLog"),
+      { timeout: 30_000 },
+    ).catch(() => null)
+    const confirm = await anyLocator(page, SELECTORS.fetchConfirm)
+    checkResult(checks, "fetch confirmation has a confirm action", Boolean(confirm), {})
+    if (!confirm) return
+    await confirm.click()
+    const response = await responsePromise
+    const body = await response.json().catch(() => null)
+    await Promise.allSettled([refsRefresh, logRefresh])
+    const result = body?.result
+    fetchResult = result ?? null
+    const refsUpdated = Array.isArray(result?.refsUpdated) ? result.refsUpdated.length : result?.refsUpdated
+    checkResult(
+      checks,
+      "confirmed fetch returns refsUpdated/changed/status",
+      response.status() === 200 &&
+        body?.ok === true &&
+        typeof refsUpdated === "number" &&
+        refsUpdated > 0 &&
+        result?.changed === true &&
+        result?.status?.head === tempStatus.head,
+      { status: response.status(), result },
+    )
+    checkResult(
+      checks,
+      "fetch request carries remote/prune/expectedHead/confirmed",
+      fetchRequests.some(
+        (entry) =>
+          entry.input?.repositoryId === tempRepo.id &&
+          entry.input?.remote === remote.remoteName &&
+          typeof entry.input?.prune === "boolean" &&
+          entry.input?.expectedHead === tempStatus.head &&
+          entry.input?.confirmed === true,
+      ),
+      { requests: fetchRequests },
+    )
+    const refsAfter = (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs
+    checkResult(
+      checks,
+      "confirmed fetch refreshes the new remote-tracking ref",
+      refsAfter.some((ref) => ref.kind === "remote" && ref.name === `${remote.remoteName}/fetch-target`),
+      { remote: `${remote.remoteName}/fetch-target`, refs: refsAfter.filter((ref) => ref.kind === "remote").length },
+    )
+    await waitRaf(page, 4)
+    const remoteBadge = page
+      .locator(`[data-testid="ref-badge"][data-ref-name="${remote.remoteName}/fetch-target"]`)
+      .first()
+    await remoteBadge.waitFor({ state: "visible", timeout: 20_000 }).catch(() => {})
+    const badgeCount = await page
+      .locator(`[data-testid="ref-badge"][data-ref-name="${remote.remoteName}/fetch-target"]`)
+      .count()
+    // A commit with many refs may put the new remote behind the "+N" budget
+    // badge; the overflow title still proves the refreshed ref reached the row.
+    const overflowTitle = await page
+      .locator('[data-testid="ref-more"]')
+      .first()
+      .getAttribute("title")
+      .catch(() => "")
+    checkResult(
+      checks,
+      "fetch success refreshes visible refs/history",
+      badgeCount > 0 || (overflowTitle ?? "").includes(`${remote.remoteName}/fetch-target`),
+      { badgeCount, overflowTitle },
+    )
+    await screenshot(page, "21-temp-fetch-success.png", { fullPage: true })
+
+    // Failure reason injection: only the bounded reason may reach the user.
+    const injectedReason = "fetch_failed"
+    await page.route(`**/__gg/rpc/${FETCH_METHOD}`, async (route) => {
+      fetchRequests.push({ input: parseInput(route.request()), injected: true })
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: {
+            type: "mutation_rejected",
+            message: "Fetch rejected",
+            data: { reason: injectedReason, path: "C:\\private\\secret-fetch.git" },
+          },
+        }),
+      })
+    })
+    await fetchButton.click()
+    await waitForAny(page, SELECTORS.fetchDialog)
+    const failureResponse = page.waitForResponse(
+      (response) => response.url().endsWith(`/__gg/rpc/${FETCH_METHOD}`),
+      { timeout: 20_000 },
+    )
+    await confirm.click().catch(async () => {
+      const fallback = await anyLocator(page, SELECTORS.fetchConfirm)
+      if (fallback) await fallback.click()
+    })
+    await failureResponse.catch(() => null)
+    await page.waitForFunction(
+      () => Boolean(document.querySelector('[data-testid="fetch-error"], [data-testid="mutation-warning"], [data-testid="mutation-notice"], .gg-mutation-warning, .gg-mutation-notice')),
+      null,
+      { timeout: 20_000 },
+    ).catch(() => {})
+    const failureText = await anyLocator(page, SELECTORS.fetchError)
+      .then((element) => element?.innerText().catch(() => "") ?? "")
+      .catch(() => "")
+    checkResult(checks, "injected fetch failure surfaces the bounded reason", failureText.includes(injectedReason), { failureText })
+    checkResult(
+      checks,
+      "fetch failure does not leak injected private paths",
+      !/C:\\private|secret-fetch\.git/i.test(failureText),
+      { failureText },
+    )
+    await screenshot(page, "22-temp-fetch-failure.png", { fullPage: true })
+    await page.unroute(`**/__gg/rpc/${FETCH_METHOD}`).catch(() => {})
+    metrics.fetch = { remote: remote.remoteName, requests: fetchRequests, result: fetchResult }
+  } catch (error) {
+    checkResult(checks, "confirmed fetch scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+    remote.cleanup()
+  }
+}
+
+async function frFetchGuardScenario(browser, frPrimary, checks, metrics) {
+  const status = (await fetchRpc(FR_ORIGIN, "getStatus", { repositoryId: frPrimary.id })).body.result
+  const refsBefore = (await fetchRpc(FR_ORIGIN, "getRefs", { repositoryId: frPrimary.id })).body.result.refs
+  const direct = await fetchRpc(FR_ORIGIN, FETCH_METHOD, {
+    repositoryId: frPrimary.id,
+    remote: "__gg_release_guard__",
+    prune: false,
+    expectedHead: status.head,
+    confirmed: true,
+  })
+  const refsAfterDirect = (await fetchRpc(FR_ORIGIN, "getRefs", { repositoryId: frPrimary.id })).body.result.refs
+  checkResult(checks, "FR fetch is still rejected with HTTP 403", direct.status === 403, { status: direct.status, body: direct.body })
+  checkResult(
+    checks,
+    "FR fetch guard leaves HEAD and refs unchanged",
+    refsSignature(refsAfterDirect) === refsSignature(refsBefore),
+    { before: refsBefore.length, after: refsAfterDirect.length },
+  )
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  const intercepted = []
+  try {
+    const page = await context.newPage()
+    await page.route(`**/__gg/rpc/${FETCH_METHOD}`, async (route) => {
+      intercepted.push({ input: parseInput(route.request()), blocked: true })
+      await route.fulfill({
+        status: 403,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: { type: "rpc.method_forbidden", message: "Mutation methods are not available in FR read-only mode" },
+        }),
+      })
+    })
+    await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+    await waitLoaded(page, 100)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    const fetchButton = await anyLocator(page, SELECTORS.fetchButton)
+    checkResult(checks, "FR toolbar exposes the fetch confirmation entry", Boolean(fetchButton), {})
+    if (fetchButton) {
+      await fetchButton.click().catch(() => {})
+      await waitForAny(page, SELECTORS.fetchDialog).catch(() => null)
+      const remoteSelect = await anyLocator(page, SELECTORS.fetchRemote)
+      if (remoteSelect && (await remoteSelect.locator("option").count()) > 1) {
+        await remoteSelect.selectOption({ index: 1 }).catch(() => {})
+      }
+      const confirm = await anyLocator(page, SELECTORS.fetchConfirm)
+      if (confirm) await confirm.click()
+      await page.waitForResponse(
+        (response) => response.url().endsWith(`/__gg/rpc/${FETCH_METHOD}`),
+        { timeout: 20_000 },
+      ).catch(() => null)
+      await waitRaf(page, 3)
+    }
+    const refsAfterUi = (await fetchRpc(FR_ORIGIN, "getRefs", { repositoryId: frPrimary.id })).body.result.refs
+    const fetchErrorElement = await anyLocator(page, SELECTORS.fetchError)
+    const fetchErrorText = fetchErrorElement
+      ? await fetchErrorElement.innerText().catch(() => "")
+      : ""
+    // The FR dev client intentionally does not expose mutation methods, so the
+    // never-reaches-bridge case is a valid client-side block; if a request is
+    // forced through, the intercepted 403 response must be the block instead.
+    const clientBlocked =
+      intercepted.length === 0 && /does not expose fetchRemote|not support|unavailable/i.test(fetchErrorText)
+    const bridgeBlocked = intercepted.length > 0 && intercepted.every((entry) => entry.blocked === true)
+    checkResult(
+      checks,
+      "FR fetch confirmation is blocked before any valid write",
+      (clientBlocked || bridgeBlocked) && refsSignature(refsAfterUi) === refsSignature(refsBefore),
+      { intercepted, fetchErrorText, clientBlocked, bridgeBlocked, before: refsBefore.length, after: refsAfterUi.length },
+    )
+    metrics.frFetchGuard = { direct, intercepted }
+    await screenshot(page, "23-fr-fetch-forbidden.png", { fullPage: true })
+  } catch (error) {
+    checkResult(checks, "FR fetch guard scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+  }
+}
+
 async function auditSelectors(browser, base, label, minimumOptions) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
   const page = await context.newPage()
@@ -2506,7 +3548,36 @@ async function auditSelectors(browser, base, label, minimumOptions) {
     ...SELECTORS.showRemotes,
     ...SELECTORS.showTags,
     ...SELECTORS.denseGraph,
+    ...SELECTORS.fetchButton,
+    ...SELECTORS.uncommittedRow,
   ])
+  await auditGroup("legacy-absent", [LEGACY_CHANGES_SELECTOR])
+  await openUncommitted(page).catch(() => null)
+  await auditGroup("uncommitted", [
+    '[data-testid="uncommitted-row"]',
+    '[data-testid="uncommitted-total"]',
+    '[data-testid="uncommitted-slot"]',
+    '[data-testid="uncommitted-files"]',
+  ])
+  const fetchButton = await anyLocator(page, SELECTORS.fetchButton)
+  if (fetchButton) {
+    await fetchButton.click().catch(() => {})
+    await waitForAny(page, SELECTORS.fetchDialog).catch(() => null)
+    await auditGroup("fetch-dialog", [
+      '[data-testid="fetch-dialog"]',
+      '[data-testid="fetch-remote-select"]',
+      '[data-testid="fetch-prune"]',
+      '[data-testid="fetch-dialog"] .gg-dialog-facts dd:nth-of-type(2)',
+      '[data-testid="fetch-confirm"]',
+      '[data-testid="fetch-cancel"]',
+    ])
+    const cancel = await anyLocator(page, SELECTORS.fetchCancel)
+    if (cancel) await cancel.click().catch(() => {})
+  }
+  const inlineRow = page.locator(SELECTORS.row[0]).first()
+  await inlineRow.locator(".gg-subject").click().catch(() => {})
+  await waitForAny(page, SELECTORS.inlineSlot).catch(() => null)
+  await auditGroup("inline-slot", [...SELECTORS.slotResizeHandle])
   await openBranchSelector(page)
   await auditGroup("branch-selector", [
     ...SELECTORS.branchFilter,
@@ -2532,6 +3603,9 @@ async function auditSelectors(browser, base, label, minimumOptions) {
   }
   const expectedAbsent = new Set([
     '[data-testid="graph-scroll"]',
+    '[data-testid="first-parent"]',
+    '[data-testid="jump-head"]',
+    LEGACY_CHANGES_SELECTOR,
   ])
   const alternatives = [
     ['[data-testid="commit-date"]', ".gg-col-date"],
@@ -2807,18 +3881,15 @@ async function fullRun(browser, executablePath) {
     } else {
       checkResult(checks, "history-order selector exists", false, { selectors: SELECTORS.historyOrder })
     }
-    const firstParent = await anyLocator(fr, SELECTORS.firstParent)
-    if (firstParent) {
-      const input = await triggerHistoryRequest(fr, (value) => value.firstParent === true, async () => {
-        await fr.locator(SELECTORS.firstParent[0]).click()
-      })
-      checkResult(checks, "first-parent is sent in the request", input.firstParent === true, input)
-      await triggerHistoryRequest(fr, (value) => value.firstParent !== true, async () => {
-        await fr.locator(SELECTORS.firstParent[0]).click()
-      })
-    } else {
-      checkResult(checks, "first-parent selector exists", false, { selectors: SELECTORS.firstParent })
-    }
+    const forbiddenToolbar = await fr
+      .locator(`${FORBIDDEN_TOOLBAR_SELECTORS.join(", ")}, ${LEGACY_CHANGES_SELECTOR}`)
+      .count()
+    checkResult(
+      checks,
+      "toolbar no longer exposes first-parent/HEAD jump and the legacy Changes section is gone",
+      forbiddenToolbar === 0,
+      { forbiddenToolbar },
+    )
 
     const badge = await anyLocator(fr, SELECTORS.refBadge)
     if (badge) {
@@ -2942,23 +4013,21 @@ async function fullRun(browser, executablePath) {
       await fr.locator("button.gg-search-clear").click().catch(() => {})
     }
     await fr.locator(SELECTORS.row[0]).first().focus()
+    const logCountBeforeCtrlH = events.fr.rpc.filter((entry) => entry.method === "getLog").length
     await fr.keyboard.press("Control+h")
+    await waitRaf(fr, 3)
+    const logCountAfterCtrlH = events.fr.rpc.filter((entry) => entry.method === "getLog").length
     await fr.keyboard.press("Escape")
-    checkResult(checks, "Ctrl+H/Escape leaves no open dialog or menu", (await fr.locator(SELECTORS.dialog.join(",")).count()) === 0 && (await fr.locator(SELECTORS.refMenu.join(",")).count()) === 0 && (await fr.locator(SELECTORS.commitMenu.join(",")).count()) === 0, {})
+    checkResult(
+      checks,
+      "Ctrl+H does not enable first-parent or jump to HEAD",
+      logCountAfterCtrlH === logCountBeforeCtrlH &&
+        (await fr.locator(`${FORBIDDEN_TOOLBAR_SELECTORS.join(", ")}, ${SELECTORS.dialog.join(",")}, ${SELECTORS.refMenu.join(",")}, ${SELECTORS.commitMenu.join(",")}`).count()) === 0,
+      { logCountBeforeCtrlH, logCountAfterCtrlH },
+    )
 
     const jump = await anyLocator(fr, SELECTORS.jumpHead)
-    if (jump) {
-      const head = frPrimary.head
-      await jump.click()
-      await fr.waitForFunction(
-        (hash) => Boolean(document.querySelector(`.gg-graph-row[data-commit="${hash}"]`)),
-        head,
-        { timeout: 20_000 },
-      ).catch(() => {})
-      checkResult(checks, "Jump HEAD locates the loaded HEAD row", await fr.locator(`.gg-graph-row[data-commit="${head}"]`).count() > 0, {})
-    } else {
-      checkResult(checks, "jump-head selector exists", false, { selectors: SELECTORS.jumpHead })
-    }
+    checkResult(checks, "jump-head selector is absent", !jump, { present: Boolean(jump) })
 
     // Core inline/auto/back regression on real FR data.
     await fr.locator(SELECTORS.historyScroll[0]).evaluate((element) => { element.scrollTop = element.scrollHeight })
@@ -3010,6 +4079,14 @@ async function fullRun(browser, executablePath) {
         null,
         { timeout: 10_000 },
       ).catch(() => {})
+      // The restore is scheduled on the next frame after the diff closes.
+      await fr.waitForFunction(
+        (expected) =>
+          Math.abs((document.querySelector('[data-testid="history-scroll"]')?.scrollTop ?? -1) - expected) <= 1,
+        scrollBeforeInline,
+        { timeout: 10_000 },
+      ).catch(() => {})
+      await waitRaf(fr, 2)
       const afterInline = await layoutSnapshot(fr)
       checkResult(checks, "inline commit diff opens and Back returns", true, {})
       checkResult(checks, "inline Back restores scroll within one pixel and keeps the slot", Math.abs((afterInline.scroller?.scrollTop ?? 0) - scrollBeforeInline) <= 1 && Boolean(afterInline.slot), { scrollBeforeInline, scrollAfter: afterInline.scroller?.scrollTop, slot: afterInline.slot })
@@ -3085,6 +4162,21 @@ async function fullRun(browser, executablePath) {
       await inlineThreeColumnScenario(browser, frPrimary, checks, metrics)
     } catch (error) {
       checkResult(checks, "inline three-column scenario executes", false, { error: String(error) })
+    }
+    try {
+      await slotResizeScenario(browser, frPrimary, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "slot resize scenario executes", false, { error: String(error) })
+    }
+    try {
+      await uncommittedCleanScenario(browser, frPrimary, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "clean uncommitted row scenario executes", false, { error: String(error) })
+    }
+    try {
+      await frFetchGuardScenario(browser, frPrimary, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "FR fetch guard scenario executes", false, { error: String(error) })
     }
 
     // TEMP mutation fixture: real write UI flow only here.
@@ -3366,6 +4458,21 @@ async function fullRun(browser, executablePath) {
     } catch (error) {
       checkResult(checks, "mutation in-flight switch scenario executes", false, { error: String(error) })
     }
+    try {
+      await slotBottomFollowScenario(browser, tempRepo, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "slot bottom-follow scenario executes", false, { error: String(error) })
+    }
+    try {
+      await uncommittedScenario(browser, tempRepo, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "Uncommitted changes scenario executes", false, { error: String(error) })
+    }
+    try {
+      await fetchScenario(browser, tempRepo, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "confirmed fetch scenario executes", false, { error: String(error) })
+    }
   } catch (error) {
     fatal = error instanceof Error ? error.message : String(error)
     notes.push(`Fatal: ${fatal}`)
@@ -3399,6 +4506,20 @@ async function fullRun(browser, executablePath) {
     events,
     hmrEvents,
     sourceMtimes: { start: sourceStart, end: sourceEnd },
+    selectorAssumptions: {
+      slotResizeHandle: SLOT_HANDLE_SELECTOR,
+      uncommittedRow: UNCOMMITTED_ROW_SELECTOR,
+      uncommittedGroups: "visible group buttons labelled Staged/Unstaged/Untracked/Conflicted",
+      legacyChangesAbsent: LEGACY_CHANGES_SELECTOR,
+      fetchButton: SELECTORS.fetchButton,
+      fetchDialog: SELECTORS.fetchDialog,
+      fetchConfirm: SELECTORS.fetchConfirm,
+      fetchCancel: SELECTORS.fetchCancel,
+      fetchRemote: SELECTORS.fetchRemote,
+      fetchPrune: SELECTORS.fetchPrune,
+      fetchExpectedHead: SELECTORS.fetchExpectedHead,
+      fetchMethod: FETCH_METHOD,
+    },
     notes,
     privateDataNote:
       "TEMP result.json may contain private repository/hash/path details. The committed acceptance summary is anonymous.",
@@ -3406,7 +4527,7 @@ async function fullRun(browser, executablePath) {
       "Desktop window/panel chrome, tab strip, drag/resize and side-region rules",
       "MenuItem registration for session.panel",
       "OpenCode session switching, project/sidebar data, host theme injection and host event bus",
-      "Network push/fetch/reset clean and other unavailable remote operations",
+      "Network push/pull/reset clean, credential prompts, SSH/HTTPS authentication and interactive prune confirmation",
     ],
   }
   const resultPath = join(ARTIFACTS, "result.json")

@@ -32,6 +32,9 @@ export const MUTATION_METHODS = [
   "renameBranch",
   "deleteBranch",
   "deleteTag",
+  // Network write; the backend contract ships it with the mutation engine, so
+  // it is gated exactly like the local mutations above (FR stays read-only).
+  "fetchRemote",
 ] as const
 
 export const FR_READ_METHOD_SET: ReadonlySet<string> = new Set(FR_READ_METHODS)

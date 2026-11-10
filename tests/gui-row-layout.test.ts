@@ -317,3 +317,81 @@ describe("createRowLayout", () => {
     expect(range.end).toBeLessThanOrEqual(1_000_000)
   })
 })
+
+describe("createRowLayout leading special rows", () => {
+  it("puts the working-tree row and its slot above every commit row", () => {
+    const layout = createRowLayout({
+      count: 10,
+      rowHeight: ROW,
+      leadingRows: 1,
+      leadingSlotHeight: 100,
+    })
+
+    expect(layout.leadingHeight).toBe(28)
+    expect(layout.leadingSlotTop).toBe(28)
+    expect(layout.leadingSlotHeight).toBe(100)
+    expect(layout.totalHeight).toBe(408)
+    expect(layout.rowTop(0)).toBe(128)
+    expect(layout.rowTop(10)).toBe(408)
+
+    // The special row/slot never receives a commit index.
+    expect(layout.indexAtOffset(0)).toBe(-1)
+    expect(layout.indexAtOffset(27)).toBe(-1)
+    expect(layout.indexAtOffset(127)).toBe(-1)
+    expect(layout.indexAtOffset(128)).toBe(0)
+    expect(layout.indexAtOffset(155)).toBe(0)
+    expect(layout.indexAtOffset(156)).toBe(1)
+  })
+
+  it("keeps the commit slot after its owner, offset by the leading block", () => {
+    const layout = createRowLayout({
+      count: 10,
+      rowHeight: ROW,
+      leadingRows: 1,
+      leadingSlotHeight: 100,
+      expandedIndex: 0,
+      expandedHeight: 50,
+    })
+
+    expect(layout.slotTop).toBe(156)
+    expect(layout.slotHeight).toBe(50)
+    expect(layout.totalHeight).toBe(458)
+    expect(layout.rowTop(1)).toBe(206)
+    expect(layout.indexAtOffset(170)).toBe(0)
+    expect(layout.indexAtOffset(206)).toBe(1)
+  })
+
+  it("returns no commit rows while the viewport only covers the leading block", () => {
+    const layout = createRowLayout({
+      count: 20,
+      rowHeight: ROW,
+      leadingRows: 1,
+      leadingSlotHeight: 100,
+    })
+
+    expect(layout.range(0, 56, 0)).toEqual({ start: 0, end: 0 })
+    expect(layout.range(127, 1, 0)).toEqual({ start: 0, end: 0 })
+    expect(layout.range(0, 160, 0)).toEqual({ start: 0, end: 2 })
+    expect(layout.range(128, 56, 0)).toEqual({ start: 0, end: 2 })
+    expect(layout.range(140, 28, 0)).toEqual({ start: 0, end: 2 })
+    expect(layout.range(500, 56, 2)).toEqual({ start: 11, end: 18 })
+  })
+
+  it("keeps the old virtual window when leading rows are absent", () => {
+    const layout = createRowLayout({ count: 100, rowHeight: ROW })
+    expect(layout.leadingHeight).toBe(0)
+    expect(layout.leadingSlotTop).toBeUndefined()
+    expect(layout.leadingSlotHeight).toBe(0)
+    expect(layout.totalHeight).toBe(2_800)
+    expect(layout.rowTop(0)).toBe(0)
+    expect(layout.range(0, 56, 0)).toEqual(
+      computeVirtualRange({
+        scrollTop: 0,
+        viewportHeight: 56,
+        rowHeight: ROW,
+        total: 100,
+        overscan: 0,
+      }),
+    )
+  })
+})

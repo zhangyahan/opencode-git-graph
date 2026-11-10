@@ -388,6 +388,32 @@ export const DeleteTagInputSchema = z
   })
   .strict()
 
+/**
+ * Fetch input. `remote: null` (or omitted) fetches every configured remote.
+ * `prune` maps to `git fetch --prune`; it is never interpolated into a command
+ * line. `expectedHead` is checked before and after the fetch.
+ */
+export const FetchRemoteInputSchema = z
+  .object({
+    ...MutationBase,
+    remote: SafeShortRefSchema.nullable().optional(),
+    prune: z.boolean().optional(),
+  })
+  .strict()
+
+/**
+ * Fetch output. `refsUpdated` counts remote-tracking and tag refs that were
+ * created or moved; pruned deletions set `changed` but are not counted.
+ */
+export const FetchRemoteOutputSchema = z
+  .object({
+    status: GitStatusSchema,
+    refsUpdated: integerInRange(0, Number.MAX_SAFE_INTEGER),
+    changed: z.boolean(),
+    warning: z.string().optional(),
+  })
+  .strict()
+
 /** Expected failures shared by all repository methods. Error messages never
  * include filesystem paths outside the repository id supplied by the caller.
  */
@@ -493,6 +519,11 @@ export const GitGraphRpc = Rpc.define({
     deleteTag: {
       input: DeleteTagInputSchema,
       output: GitMutationResultSchema,
+      errors: mutationErrors,
+    },
+    fetchRemote: {
+      input: FetchRemoteInputSchema,
+      output: FetchRemoteOutputSchema,
       errors: mutationErrors,
     },
   },

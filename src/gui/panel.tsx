@@ -6,6 +6,7 @@ import {
   createSignal,
   onCleanup,
   untrack,
+  type JSX,
 } from "solid-js"
 import { type PanelProps, usePlugin } from "@opencode/plugin/gui"
 import type {
@@ -50,6 +51,12 @@ import {
 } from "./pagination.js"
 import { createRowLayout } from "./row-layout.js"
 import {
+  clampSlotHeight,
+  defaultSlotHeight,
+  SLOT_CONTENT_ROW_HEIGHT,
+  SLOT_HEADER_HEIGHT,
+} from "./slot-size.js"
+import {
   readColumnPreferences,
   resizeColumnPreferences,
   resolveColumnLayout,
@@ -65,6 +72,7 @@ import {
   groupStatusFiles,
   statusFileTarget,
   statusLetter,
+  type StatusGroups,
 } from "./changes.js"
 import {
   BoundedSelectionCache,
@@ -96,6 +104,7 @@ import {
   commitMenuActions,
   decideCompareActivation,
   detectCommitFileContentSupport,
+  detectFetchRemoteSupport,
   detectRpcCapabilities,
   extendedClient,
   filterRefsToAvailable,
@@ -109,11 +118,15 @@ import {
   refBadgesForCommit,
   refKindLabel,
   refMenuActions,
+  remoteNamesFromRefs,
+  rpcErrorReason,
   typedRefForBadge,
   workspaceRelativePath,
   type ChangedFileStats,
   type CommitFileContent,
   type ExtendedLogInput,
+  type FetchRemoteInput,
+  type FetchRemoteResult,
   type HistoryFilterState,
   type HistoryLogSettings,
   type HistoryOrder,
@@ -125,6 +138,7 @@ import {
 import { ContextMenu } from "./ref-menu.js"
 import { BranchSelector } from "./branch-selector.js"
 import { ConfirmDialog, type ConfirmFact, type ConfirmField } from "./confirm-dialog.js"
+import { FetchDialog } from "./fetch-dialog.js"
 import { ComparisonView } from "./compare-view.js"
 import { CommitFileContentView } from "./file-content-view.js"
 
@@ -134,10 +148,7 @@ const OVERSCAN = 6
 const LANE_PADDING = DEFAULT_LANE_PADDING
 const MAX_DIFF_DISPLAY_LINES = 4_000
 const SELECTION_CACHE_LIMIT = 16
-const MIN_SLOT_HEIGHT = 96
-const MAX_SLOT_HEIGHT = 260
-const SLOT_TREE_ROW_HEIGHT = 22
-const SLOT_TREE_HEADER = 30
+const UNCOMMITTED_SLOT_KEY = "uncommitted"
 /** Bound for the post-reinsert restore loop: one or two layout frames only. */
 const RESTORE_MAX_FRAMES = 2
 
@@ -215,6 +226,13 @@ interface CommitMenuState {
 interface ActiveComparison {
   readonly base: GitCommit
   readonly head: GitCommit
+}
+
+interface FetchDialogState {
+  readonly repositoryId: string
+  readonly repositoryLabel: string
+  readonly expectedHead: string | null
+  readonly remotes: readonly string[]
 }
 
 /** One bounded cache per window, shared by every mount of this panel. */
@@ -495,6 +513,271 @@ function GraphRow(props: GraphRowProps) {
   )
 }
 
+/* ---------- uncommitted working-tree row ---------- */
+
+interface UncommittedRowProps {
+  readonly total: number
+  readonly counts: {
+    readonly staged: number
+    readonly unstaged: number
+    readonly untracked: number
+    readonly conflicted: number
+  }
+  readonly expanded: boolean
+  readonly disabled: boolean
+  readonly graphWidth: number
+  readonly showDate: boolean
+  readonly showAuthor: boolean
+  readonly onToggle: () => void
+  readonly onKeyDown: (event: KeyboardEvent) => void
+  readonly children?: JSX.Element
+}
+
+function UncommittedMarker(props: { readonly graphWidth: number }) {
+  const centerX = graphLaneX(0, LANE_SPACING, LANE_PADDING)
+  return (
+    <svg
+      class="gg-graph-svg"
+      width={props.graphWidth}
+      height={ROW_HEIGHT}
+      viewBox={`0 0 ${props.graphWidth} ${ROW_HEIGHT}`}
+      aria-hidden="true"
+    >
+      <circle
+        cx={centerX}
+        cy={ROW_HEIGHT / 2}
+        r={4.5}
+        fill="none"
+        stroke="#7aa2f7"
+        stroke-width="1.5"
+        stroke-dasharray="2.5 2.5"
+      />
+    </svg>
+  )
+}
+
+/**
+ * A special history row pinned above the commit rows. It deliberately has no
+ * commit index; the working tree is not part of the graph walk.
+ */
+function UncommittedRow(props: UncommittedRowProps) {
+  const countBadges = (): Array<{ key: keyof UncommittedRowProps["counts"]; label: string; count: number }> => [
+    { key: "staged", label: "staged", count: props.counts.staged },
+    { key: "unstaged", label: "unstaged", count: props.counts.unstaged },
+    { key: "untracked", label: "untracked", count: props.counts.untracked },
+    { key: "conflicted", label: "conflicted", count: props.counts.conflicted },
+  ]
+
+  return (
+    <div
+      role="button"
+      tabIndex={props.disabled ? -1 : 0}
+      class={[
+        "gg-graph-row",
+        "gg-uncommitted-row",
+        props.expanded ? "gg-selected" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      style={{ top: "0px", height: `${ROW_HEIGHT}px` }}
+      data-testid="uncommitted-row"
+      data-uncommitted-total={props.total}
+      aria-expanded={props.expanded}
+      aria-label={`Uncommitted changes (${props.total})`}
+      aria-disabled={props.disabled}
+      onClick={(event) => {
+        if (props.disabled) return
+        // Clicks inside the expanded working-tree panel operate on files and
+        // groups; they must not toggle the owning row.
+        if (
+          event.target instanceof Element &&
+          event.target.closest(".gg-uncommitted-slot")
+        ) {
+          return
+        }
+        props.onToggle()
+      }}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return
+        props.onKeyDown(event)
+      }}
+    >
+      <div class="gg-row-graph" aria-hidden="true">
+        <div class="gg-row-graph-inner">
+          <UncommittedMarker graphWidth={props.graphWidth} />
+        </div>
+      </div>
+
+      <div class="gg-col-desc">
+        <span class="gg-subject gg-uncommitted-title">
+          Uncommitted changes
+          <span class="gg-uncommitted-total" data-testid="uncommitted-total">
+            ({props.total})
+          </span>
+        </span>
+        <span class="gg-uncommitted-badges">
+          <For each={countBadges()}>
+            {(badge) => (
+              <Show when={badge.count > 0}>
+                <span
+                  class={`gg-uncommitted-badge gg-uncommitted-${badge.key}`}
+                  data-testid={`uncommitted-count-${badge.key}`}
+                  data-count={badge.count}
+                  title={`${badge.count} ${badge.label}`}
+                  aria-label={`${badge.count} ${badge.label}`}
+                >
+                  {badge.count}
+                </span>
+              </Show>
+            )}
+          </For>
+        </span>
+      </div>
+
+      <Show when={props.showDate}>
+        <div class="gg-col-date" aria-hidden="true" />
+      </Show>
+      <Show when={props.showAuthor}>
+        <div class="gg-col-author" aria-hidden="true" />
+      </Show>
+      <div class="gg-col-commit">
+        <span class="gg-muted">working tree</span>
+      </div>
+
+      {props.children}
+    </div>
+  )
+}
+
+interface UncommittedSlotProps {
+  readonly top: number
+  readonly height: number
+  readonly graphWidth: number
+  readonly columnWidth: number
+  readonly total: number
+  readonly groups: StatusGroups
+  readonly disabled: boolean
+  readonly expandedGroups: (key: string) => boolean
+  readonly onToggleGroup: (key: string) => void
+  readonly isSelected: (file: ChangedFile) => boolean
+  readonly onSelect: (file: ChangedFile) => void
+  readonly onResizeStart: (event: PointerEvent) => void
+  readonly onResizeKeyDown: (event: KeyboardEvent) => void
+}
+
+/**
+ * Inline working-tree expansion. It reuses the commit slot geometry so the
+ * virtual list and scroll position stay identical, but the content is grouped
+ * by index/worktree stage instead of by commit.
+ */
+function UncommittedSlot(props: UncommittedSlotProps) {
+  const centerX = graphLaneX(0, LANE_SPACING, LANE_PADDING)
+  return (
+    <div
+      class="gg-row-slot gg-uncommitted-slot"
+      style={{ top: `${props.top}px`, height: `${props.height}px` }}
+      data-slot-height={props.height}
+      data-testid="uncommitted-slot"
+    >
+      <div
+        class="gg-row-slot-graph"
+        style={{ width: `${props.columnWidth}px` }}
+        data-testid="uncommitted-graph"
+        aria-hidden="true"
+      >
+        <div class="gg-row-slot-graph-inner">
+          <svg
+            class="gg-graph-svg"
+            width={props.graphWidth}
+            height={Math.max(1, props.height)}
+            viewBox={`0 0 ${props.graphWidth} ${Math.max(1, props.height)}`}
+            aria-hidden="true"
+          >
+            <line
+              x1={centerX}
+              y1={0}
+              x2={centerX}
+              y2={Math.max(1, props.height)}
+              stroke="#7aa2f7"
+              stroke-width="1.4"
+              stroke-dasharray="3 4"
+              opacity="0.7"
+            />
+          </svg>
+        </div>
+      </div>
+
+      <div class="gg-row-slot-body">
+        <div class="gg-row-slot-files">
+          <div class="gg-row-slot-head">
+            <span class="gg-row-slot-title">Working tree changes</span>
+            <span class="gg-muted">
+              {props.total} file{props.total === 1 ? "" : "s"}
+            </span>
+          </div>
+          <div class="gg-row-slot-tree" data-testid="uncommitted-files">
+            <Show
+              when={props.total > 0}
+              fallback={
+                <div class="gg-empty" data-testid="uncommitted-empty">
+                  No changes
+                </div>
+              }
+            >
+              <StatusGroupSection
+                title="Staged"
+                files={props.groups.staged}
+                disabled={props.disabled}
+                expanded={props.expandedGroups("staged")}
+                onToggle={() => props.onToggleGroup("staged")}
+                isSelected={props.isSelected}
+                onSelect={props.onSelect}
+              />
+              <StatusGroupSection
+                title="Unstaged"
+                files={props.groups.unstaged}
+                disabled={props.disabled}
+                expanded={props.expandedGroups("unstaged")}
+                onToggle={() => props.onToggleGroup("unstaged")}
+                isSelected={props.isSelected}
+                onSelect={props.onSelect}
+              />
+              <StatusGroupSection
+                title="Untracked"
+                files={props.groups.untracked}
+                disabled={props.disabled}
+                expanded={props.expandedGroups("untracked")}
+                onToggle={() => props.onToggleGroup("untracked")}
+                isSelected={props.isSelected}
+                onSelect={props.onSelect}
+              />
+              <StatusGroupSection
+                title="Conflicted"
+                files={props.groups.conflicted}
+                disabled={props.disabled}
+                expanded={props.expandedGroups("conflicted")}
+                onToggle={() => props.onToggleGroup("conflicted")}
+                isSelected={props.isSelected}
+                onSelect={props.onSelect}
+              />
+            </Show>
+          </div>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        class="gg-slot-resize"
+        data-testid="slot-resize-handle"
+        aria-label="Resize expanded row"
+        title="Drag to resize; double-click to reset"
+        onPointerDown={(event) => props.onResizeStart(event)}
+        onKeyDown={(event) => props.onResizeKeyDown(event)}
+      />
+    </div>
+  )
+}
+
 /* ---------- inline commit file slot ---------- */
 
 interface CommitFilesSlotProps {
@@ -520,6 +803,8 @@ interface CommitFilesSlotProps {
   readonly onViewAtCommit: (file: ChangedFile) => void
   readonly onOpenCurrent: (file: ChangedFile) => void
   readonly onRetry: () => void
+  readonly onResizeStart: (event: PointerEvent) => void
+  readonly onResizeKeyDown: (event: KeyboardEvent) => void
 }
 
 /**
@@ -738,6 +1023,16 @@ function CommitFilesSlot(props: CommitFilesSlotProps) {
           </button>
         </div>
       </div>
+
+      <button
+        type="button"
+        class="gg-slot-resize"
+        data-testid="slot-resize-handle"
+        aria-label="Resize expanded row"
+        title="Drag to resize; double-click to reset"
+        onPointerDown={(event) => props.onResizeStart(event)}
+        onKeyDown={(event) => props.onResizeKeyDown(event)}
+      />
     </div>
   )
 }
@@ -1094,8 +1389,16 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     createSignal<AutoLoadState>(INITIAL_AUTO_LOAD_STATE)
 
   const [searchQuery, setSearchQuery] = createSignal("")
-  const [changesExpanded, setChangesExpanded] = createSignal(true)
+  const [uncommittedExpanded, setUncommittedExpanded] = createSignal(false)
+  const [slotHeightOverrides, setSlotHeightOverrides] =
+    createSignal<Readonly<Record<string, number>>>({})
   const [collapsedGroups, setCollapsedGroups] = createSignal<ReadonlySet<string>>(new Set<string>())
+
+  const [fetchDialog, setFetchDialog] = createSignal<FetchDialogState | undefined>()
+  const [fetchRemoteName, setFetchRemoteName] = createSignal<string | null>(null)
+  const [fetchPrune, setFetchPrune] = createSignal(false)
+  const [fetchBusy, setFetchBusy] = createSignal(false)
+  const [fetchError, setFetchError] = createSignal<string | undefined>()
 
   const repositoriesRequest = new LatestRequest()
   const graphRequest = new LatestRequest()
@@ -1114,6 +1417,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   let resizeObserver: ResizeObserver | undefined
   let panelObserver: ResizeObserver | undefined
   let resizeDragCleanup: (() => void) | undefined
+  let slotResizeCleanup: (() => void) | undefined
+  let slotResizeFrame: { readonly id: number; readonly timeout: boolean } | undefined
+  let fetchRequestVersion = 0
   let loadMoreInFlight = false
   let historyVersion = 0
   const repositoryLoadGeneration = new SelectionGeneration()
@@ -1216,9 +1522,16 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       // The slot height is derived from the file list; applying at the loading
       // placeholder height and then growing would shift the restored rows.
       if (filesLoading()) return false
-      const slot = scroller.querySelector(".gg-row-slot")
+      const slot = scroller.querySelector(".gg-row-slot:not(.gg-uncommitted-slot)")
       if (!(slot instanceof HTMLElement)) return false
       if (Math.abs(slot.getBoundingClientRect().height - layout.slotHeight) > 1) return false
+    }
+    if (uncommittedExpanded()) {
+      const slot = scroller.querySelector(".gg-uncommitted-slot")
+      if (!(slot instanceof HTMLElement)) return false
+      if (Math.abs(slot.getBoundingClientRect().height - layout.leadingSlotHeight) > 1) {
+        return false
+      }
     }
     return true
   }
@@ -1353,6 +1666,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setDiffLoading(false)
     setDiffError(undefined)
 
+    setUncommittedExpanded(false)
+    setCollapsedGroups(new Set<string>())
+
     setActiveComparison(undefined)
     setComparisonFiles([])
     setComparisonFilesLoading(false)
@@ -1399,8 +1715,14 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setSelectedRepositoryId(undefined)
     setSearchQuery("")
     setFilters((current) => ({ ...current, refs: [] }))
-    setChangesExpanded(true)
     setCollapsedGroups(new Set<string>())
+    setUncommittedExpanded(false)
+    fetchRequestVersion += 1
+    setFetchDialog(undefined)
+    setFetchBusy(false)
+    setFetchError(undefined)
+    setFetchRemoteName(null)
+    setFetchPrune(false)
     setScrollTop(0)
     if (scroller) scroller.scrollTop = 0
     setBranchSelectorOpen(false)
@@ -1702,6 +2024,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     // A normal commit click leaves comparison mode and cancels its requests.
     clearComparisonState()
     setComparisonBase(undefined)
+    setUncommittedExpanded(false)
     const maxIndex = Math.max(0, commit.parents.length - 1)
     const parentIndex = Math.min(Math.max(0, requestedParentIndex), maxIndex)
     setCommitDiffOpen(false)
@@ -1739,6 +2062,29 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setDiffError(undefined)
     setCommitDiffOpen(false)
     clearPendingViewRestore()
+  }
+
+  /** The working-tree row owns a separate slot; only one inline expansion is open. */
+  function toggleUncommitted(): void {
+    if (uncommittedExpanded()) {
+      collapseUncommitted()
+      return
+    }
+    selectionGeneration.bump()
+    clearCommitSelection()
+    clearComparisonState()
+    setComparisonBase(undefined)
+    setSelectedFile(undefined)
+    setDiff(undefined)
+    setDiffLoading(false)
+    setDiffError(undefined)
+    setUncommittedExpanded(true)
+  }
+
+  function collapseUncommitted(): void {
+    setUncommittedExpanded(false)
+    const file = selectedFile()
+    if (file && file.source !== "commit") closeDetails()
   }
 
   async function loadCommitFiles(
@@ -2129,6 +2475,11 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const restoreToken = selectionGeneration.current()
     const snapshot = untrack(() => captureSelection())
     pendingRestore = undefined
+    fetchRequestVersion += 1
+    setFetchDialog(undefined)
+    setFetchBusy(false)
+    setFetchError(undefined)
+    setUncommittedExpanded(false)
     repositoriesRequest.cancel()
     graphRequest.cancel()
     filesRequest.cancel()
@@ -2157,6 +2508,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setBranchSelectorOpen(false)
     setMutationDialog(undefined)
     setJumpNotice(undefined)
+    setFetchDialog(undefined)
+    setFetchBusy(false)
+    setFetchError(undefined)
     void loadRepository(repositoryId)
   }
 
@@ -2255,6 +2609,93 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     window.addEventListener("pointercancel", cancel)
   }
 
+  function startSlotResize(key: string, event: PointerEvent): void {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.button !== 0) return
+    const startHeight = untrack(() =>
+      key === UNCOMMITTED_SLOT_KEY ? uncommittedSlotHeight() : slotHeight(),
+    )
+    if (startHeight <= 0) return
+    const startY = event.clientY
+    const startScrollTop = scroller ? scroller.scrollTop : scrollTop()
+    const startMax = scroller
+      ? Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+      : 0
+    // Only a viewport already parked near the bottom follows the handle; any
+    // other scroll position stays exactly where it was while the slot grows.
+    const followBottom =
+      scroller !== undefined && startScrollTop >= startMax - ROW_HEIGHT * 2
+    let latestY = startY
+
+    const apply = (): void => {
+      slotResizeFrame = undefined
+      const next = clampSlotHeight(
+        startHeight + (latestY - startY),
+        untrack(() => viewportHeight()),
+      )
+      setSlotHeightOverrides((previous) =>
+        previous[key] === next ? previous : { ...previous, [key]: next },
+      )
+      if (followBottom && scroller) {
+        const max = Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+        const target = startScrollTop + (next - startHeight)
+        scroller.scrollTop = Math.min(max, Math.max(0, target))
+        setScrollTop(scroller.scrollTop)
+      }
+    }
+    const schedule = (): void => {
+      if (slotResizeFrame !== undefined) return
+      slotResizeFrame = postFrame(apply)
+    }
+    const move = (moveEvent: PointerEvent): void => {
+      latestY = moveEvent.clientY
+      schedule()
+    }
+    const cleanup = (): void => {
+      window.removeEventListener("pointermove", move)
+      window.removeEventListener("pointerup", stop)
+      window.removeEventListener("pointercancel", cancel)
+      slotResizeCleanup = undefined
+    }
+    const stop = (): void => {
+      cleanup()
+      cancelFrame(slotResizeFrame)
+      slotResizeFrame = undefined
+      apply()
+    }
+    const cancel = (): void => {
+      cleanup()
+      cancelFrame(slotResizeFrame)
+      slotResizeFrame = undefined
+    }
+    slotResizeCleanup?.()
+    slotResizeCleanup = cleanup
+    window.addEventListener("pointermove", move)
+    window.addEventListener("pointerup", stop)
+    window.addEventListener("pointercancel", cancel)
+  }
+
+  function nudgeSlotHeight(key: string, event: KeyboardEvent): void {
+    const step = event.shiftKey ? 48 : 16
+    let delta: number | undefined
+    if (event.key === "ArrowUp") delta = -step
+    else if (event.key === "ArrowDown") delta = step
+    else if (event.key === "Home") delta = -Number.MAX_SAFE_INTEGER
+    else if (event.key === "End") delta = Number.MAX_SAFE_INTEGER
+    if (delta === undefined) return
+    event.preventDefault()
+    event.stopPropagation()
+    const current = untrack(() =>
+      key === UNCOMMITTED_SLOT_KEY ? uncommittedSlotHeight() : slotHeight(),
+    )
+    if (current <= 0) return
+    const next = clampSlotHeight(current + delta, untrack(() => viewportHeight()))
+    setSlotHeightOverrides((previous) =>
+      previous[key] === next ? previous : { ...previous, [key]: next },
+    )
+  }
+
   const selectedRepository = createMemo(() =>
     repositories().find((repository) => repository.id === selectedRepositoryId()),
   )
@@ -2264,11 +2705,31 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const fileContentSupported = createMemo(() =>
     detectCommitFileContentSupport(currentRpc().rpc, GitGraphRpc),
   )
+  const fetchRemoteSupported = createMemo(() =>
+    detectFetchRemoteSupport(currentRpc().rpc, GitGraphRpc),
+  )
+  const fetchRemotes = createMemo(() => remoteNamesFromRefs(refs()))
   const busy = createMemo(
-    () => repositoriesLoading() || repositoryLoading() || mutationBusy(),
+    () => repositoriesLoading() || repositoryLoading() || mutationBusy() || fetchBusy(),
   )
   const directoryReady = createMemo(() => currentDirectory().length > 0)
   const groups = createMemo(() => groupStatusFiles(status()?.files ?? []))
+  const uncommittedTotal = createMemo(() => status()?.files.length ?? 0)
+  const statusCounts = createMemo(
+    () =>
+      status()?.counts ?? { staged: 0, unstaged: 0, untracked: 0, conflicted: 0 },
+  )
+  const uncommittedContentRows = createMemo(() => {
+    const current = groups()
+    const groupCount = [
+      current.staged,
+      current.unstaged,
+      current.untracked,
+      current.conflicted,
+    ].filter((files) => files.length > 0).length
+    return groupCount + current.staged.length + current.unstaged.length +
+      current.untracked.length + current.conflicted.length
+  })
   const commitTree = createMemo(() => buildFileTree(commitFiles()))
   const diffLines = createMemo(() => classifyDiff(diff()?.text ?? ""))
   const visibleDiffLines = createMemo(() => diffLines().slice(0, MAX_DIFF_DISPLAY_LINES))
@@ -2297,18 +2758,30 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const index = expandedRowIndex()
     return index === undefined ? undefined : rows()[index]
   })
+  function resolveSlotHeight(key: string, automatic: number): number {
+    const stored = slotHeightOverrides()[key]
+    return stored === undefined ? automatic : clampSlotHeight(stored, viewportHeight())
+  }
   const slotHeight = createMemo(() => {
     if (expandedRowIndex() === undefined) return 0
-    const rowsNeeded = commitFiles().length
-    return Math.min(
-      MAX_SLOT_HEIGHT,
-      Math.max(MIN_SLOT_HEIGHT, SLOT_TREE_HEADER + rowsNeeded * SLOT_TREE_ROW_HEIGHT),
+    return resolveSlotHeight(
+      selectedCommit()?.hash ?? "",
+      defaultSlotHeight(commitFiles().length, viewportHeight()),
+    )
+  })
+  const uncommittedSlotHeight = createMemo(() => {
+    if (!uncommittedExpanded()) return 0
+    return resolveSlotHeight(
+      UNCOMMITTED_SLOT_KEY,
+      defaultSlotHeight(uncommittedContentRows(), viewportHeight()),
     )
   })
   const rowLayout = createMemo(() =>
     createRowLayout({
       count: rows().length,
       rowHeight: ROW_HEIGHT,
+      leadingRows: 1,
+      leadingSlotHeight: uncommittedSlotHeight(),
       expandedIndex: expandedRowIndex(),
       expandedHeight: slotHeight(),
     }),
@@ -3024,6 +3497,110 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     return status()?.head ?? null
   }
 
+  function openFetchDialog(): void {
+    if (fetchBusy() || repositoryLoading() || mutationBusy()) return
+    if (!fetchRemoteSupported()) {
+      setMutationNotice(
+        "This server does not support fetchRemote yet; the fetch action is unavailable.",
+      )
+      return
+    }
+    const repository = selectedRepository()
+    if (!repository) return
+    const remotes = fetchRemotes()
+    if (remotes.length === 0) {
+      setMutationNotice("No Git remotes are available to fetch from.")
+      return
+    }
+    closeMenus()
+    setBranchSelectorOpen(false)
+    setFetchError(undefined)
+    setFetchRemoteName(null)
+    setFetchPrune(false)
+    setFetchDialog({
+      repositoryId: repository.id,
+      repositoryLabel: `${repository.name} (${repository.rootPath})`,
+      expectedHead: dialogExpectedHead(),
+      remotes,
+    })
+  }
+
+  function cancelFetch(): void {
+    if (fetchBusy()) return
+    fetchRequestVersion += 1
+    setFetchDialog(undefined)
+    setFetchError(undefined)
+    setFetchRemoteName(null)
+    setFetchPrune(false)
+  }
+
+  /**
+   * Fetch runs without an abort signal on purpose: the server mutation must not
+   * be cancelled at the transport layer once it has started. The dialog stays
+   * open on failure so the server-provided reason is visible.
+   */
+  async function confirmFetch(): Promise<void> {
+    const dialog = fetchDialog()
+    if (!dialog || fetchBusy()) return
+    const { route, rpc } = currentRpc()
+    const { directory } = route
+    if (!directory) return
+    const client = extendedClient(rpc)
+    if (!client.fetchRemote) {
+      setFetchError("This server does not expose fetchRemote; nothing was fetched.")
+      return
+    }
+
+    const version = ++fetchRequestVersion
+    const repositoryId = dialog.repositoryId
+    setFetchBusy(true)
+    setFetchError(undefined)
+    try {
+      const input: FetchRemoteInput = {
+        repositoryId,
+        remote: fetchRemoteName(),
+        prune: fetchPrune(),
+        expectedHead: dialog.expectedHead,
+        confirmed: true,
+      }
+      const result: FetchRemoteResult = await client.fetchRemote(input, {
+        location: { directory },
+      })
+      if (version !== fetchRequestVersion) return
+      setFetchBusy(false)
+      setFetchDialog(undefined)
+      const refsUpdated = Number.isFinite(result.refsUpdated)
+        ? Math.max(0, Math.trunc(result.refsUpdated))
+        : 0
+      setMutationNotice(
+        `Fetch completed for ${dialog.repositoryLabel}: ${refsUpdated} ref${
+          refsUpdated === 1 ? "" : "s"
+        } updated${result.changed ? "." : " (no changes)."}`,
+      )
+      setMutationWarning(result.warning)
+      if (selectedRepositoryId() !== repositoryId) return
+      setStatus(result.status)
+      await refreshAfterFetch(repositoryId)
+    } catch (error) {
+      if (version !== fetchRequestVersion) return
+      setFetchBusy(false)
+      const reason = rpcErrorReason(error)
+      setFetchError(
+        `Fetch failed: ${formatError(error)}${reason ? ` (${reason})` : ""}`,
+      )
+    }
+  }
+
+  /** Fetch already returned the authoritative status; refresh refs and history. */
+  async function refreshAfterFetch(repositoryId: string): Promise<void> {
+    const { route } = currentRpc()
+    const key = selectionKey(route.serverId, route.directory)
+    if (key !== activeKey || selectedRepositoryId() !== repositoryId) return
+    await loadRefs(repositoryId)
+    if (key !== activeKey || selectedRepositoryId() !== repositoryId) return
+    await loadHistoryFirstPage(repositoryId)
+  }
+
   function openCheckoutDialog(ref: GitRef): void {
     if (mutationBusy()) return
     if (!capabilities().checkout) return
@@ -3453,11 +4030,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       refreshAll()
       return
     }
-    if (modifier && event.key.toLowerCase() === "h") {
-      event.preventDefault()
-      void jumpToHead()
-      return
-    }
     if (event.key === "Escape") {
       if (refMenu() || overflowMenu() || commitMenu()) {
         event.preventDefault()
@@ -3534,6 +4106,10 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resizeObserver?.disconnect()
     panelObserver?.disconnect()
     resizeDragCleanup?.()
+    slotResizeCleanup?.()
+    cancelFrame(slotResizeFrame)
+    slotResizeFrame = undefined
+    fetchRequestVersion += 1
     cancelRestoreFrame()
     cancelAutoLoadSettle()
     if (activeKey) selectionCache.set(activeKey, untrack(() => captureSelection()))
@@ -3635,20 +4211,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           />
           <span>Tags</span>
         </label>
-        <label
-          class="gg-toolbar-toggle gg-toolbar-check"
-          title="Follow only first parents; merge details keep every parent"
-        >
-          <input
-            type="checkbox"
-            data-testid="first-parent"
-            aria-label="First parent only"
-            checked={firstParent()}
-            disabled={!selectedRepositoryId() || !capabilities().extendedLog || busy()}
-            onChange={() => toggleFirstParent()}
-          />
-          <span>First parent</span>
-        </label>
         <label class="gg-toolbar-order" title="History order">
           <span class="gg-sr-only">History order</span>
           <select
@@ -3666,14 +4228,25 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
         </label>
         <button
           type="button"
-          class="gg-toolbar-toggle"
-          data-testid="jump-head"
-          aria-label="Jump to HEAD"
-          title="Jump to the current HEAD commit"
-          disabled={!selectedRepositoryId() || !status()?.head || busy()}
-          onClick={() => void jumpToHead()}
+          class="gg-toolbar-toggle gg-fetch-button"
+          data-testid="fetch-button"
+          aria-label="Fetch"
+          title={
+            !fetchRemoteSupported()
+              ? "The connected server does not support fetch yet"
+              : fetchRemotes().length === 0
+                ? "No Git remotes are available to fetch from"
+                : "Fetch remote branches through a confirmation dialog"
+          }
+          disabled={
+            !selectedRepositoryId() ||
+            !fetchRemoteSupported() ||
+            fetchRemotes().length === 0 ||
+            busy()
+          }
+          onClick={() => openFetchDialog()}
         >
-          HEAD
+          Fetch
         </button>
 
         <div class="gg-search">
@@ -3797,84 +4370,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       </Show>
 
       <Show when={selectedRepositoryId() && !commitDiffOpen() && !activeComparison()}>
-        <section class="gg-changes-section" data-testid="changes" aria-label="Working tree changes">
-          <Show
-            when={status()}
-            fallback={
-              <Show when={repositoryLoading()}>
-                <div class="gg-status">Loading repository…</div>
-              </Show>
-            }
-          >
-            {(current) => (
-              <Show
-                when={current().files.length > 0}
-                fallback={
-                  <div class="gg-working-tree-clean">
-                    <span class="gg-clean-dot" aria-hidden="true" />
-                    <span>Working tree clean</span>
-                  </div>
-                }
-              >
-                <button
-                  type="button"
-                  class="gg-changes-head"
-                  aria-expanded={changesExpanded()}
-                  onClick={() => setChangesExpanded((value) => !value)}
-                >
-                  <span class="gg-caret" aria-hidden="true">
-                    {changesExpanded() ? "▾" : "▸"}
-                  </span>
-                  <span>Changes</span>
-                  <span class="gg-count-badge">{current().files.length}</span>
-                  <span class="gg-changes-summary">
-                    {current().counts.staged} staged · {current().counts.unstaged} unstaged ·{" "}
-                    {current().counts.untracked} untracked · {current().counts.conflicted} conflicted
-                  </span>
-                </button>
-                <Show when={changesExpanded()}>
-                  <div class="gg-changes-body">
-                    <StatusGroupSection
-                      title="Staged"
-                      files={groups().staged}
-                      disabled={busy()}
-                      expanded={groupExpanded("staged")}
-                      onToggle={() => toggleGroup("staged")}
-                      isSelected={selectedFileForStatus}
-                      onSelect={selectStatusFile}
-                    />
-                    <StatusGroupSection
-                      title="Unstaged"
-                      files={groups().unstaged}
-                      disabled={busy()}
-                      expanded={groupExpanded("unstaged")}
-                      onToggle={() => toggleGroup("unstaged")}
-                      isSelected={selectedFileForStatus}
-                      onSelect={selectStatusFile}
-                    />
-                    <StatusGroupSection
-                      title="Untracked"
-                      files={groups().untracked}
-                      disabled={busy()}
-                      expanded={groupExpanded("untracked")}
-                      onToggle={() => toggleGroup("untracked")}
-                      isSelected={selectedFileForStatus}
-                      onSelect={selectStatusFile}
-                    />
-                    <StatusGroupSection
-                      title="Conflicted"
-                      files={groups().conflicted}
-                      disabled={busy()}
-                      expanded={groupExpanded("conflicted")}
-                      onToggle={() => toggleGroup("conflicted")}
-                      isSelected={selectedFileForStatus}
-                      onSelect={selectStatusFile}
-                    />
-                  </div>
-                </Show>
-              </Show>
-            )}
-          </Show>
+        <section
+          class="gg-history"
+          data-testid="history"
+          aria-label="History"
+          style={historyStyle()}
+        >
           <Show when={repositoryError()}>
             {(message) => (
               <div class="gg-error">
@@ -3885,14 +4386,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
               </div>
             )}
           </Show>
-        </section>
 
-        <section
-          class="gg-history"
-          data-testid="history"
-          aria-label="History"
-          style={historyStyle()}
-        >
           <div class="gg-history-head">
             <For each={resolvedColumns().visible}>
               {(column) => (
@@ -3950,10 +4444,86 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
               maybeAutoLoad(element)
             }}
           >
-            <Show
-              when={rows().length > 0}
-              fallback={
-                <div class="gg-empty">
+            <div
+              class="gg-history-spacer"
+              style={{ height: `${rowLayout().totalHeight}px` }}
+              data-slot-height={rowLayout().slotHeight}
+              data-leading-slot-height={rowLayout().leadingSlotHeight}
+              data-expanded-index={
+                expandedRowIndex() === undefined ? undefined : expandedRowIndex()
+              }
+            >
+              <UncommittedRow
+                total={uncommittedTotal()}
+                counts={statusCounts()}
+                expanded={uncommittedExpanded()}
+                disabled={busy()}
+                graphWidth={graphWidth()}
+                showDate={resolvedColumns().visibility.date}
+                showAuthor={resolvedColumns().visibility.author}
+                onToggle={toggleUncommitted}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    toggleUncommitted()
+                  }
+                }}
+              >
+                <Show when={uncommittedExpanded()}>
+                  <UncommittedSlot
+                    top={ROW_HEIGHT}
+                    height={rowLayout().leadingSlotHeight}
+                    graphWidth={graphWidth()}
+                    columnWidth={graphColumnWidth()}
+                    total={uncommittedTotal()}
+                    groups={groups()}
+                    disabled={busy()}
+                    expandedGroups={groupExpanded}
+                    onToggleGroup={toggleGroup}
+                    isSelected={selectedFileForStatus}
+                    onSelect={selectStatusFile}
+                    onResizeStart={(event) => startSlotResize(UNCOMMITTED_SLOT_KEY, event)}
+                    onResizeKeyDown={(event) =>
+                      nudgeSlotHeight(UNCOMMITTED_SLOT_KEY, event)
+                    }
+                  />
+                </Show>
+              </UncommittedRow>
+
+              <For each={visibleRows()}>
+                {(view) => (
+                  <GraphRow
+                    view={view}
+                    laneSpacing={laneSpacing()}
+                    graphWidth={graphWidth()}
+                    rowHeight={ROW_HEIGHT}
+                    top={rowLayout().rowTop(view.index)}
+                    selected={selectedCommit()?.hash === view.commit.hash}
+                    expanded={
+                      selectedCommit()?.hash === view.commit.hash &&
+                      expandedRowIndex() !== undefined
+                    }
+                    disabled={busy()}
+                    searchState={searchState(view.commit.hash)}
+                    showDate={resolvedColumns().visibility.date}
+                    showAuthor={resolvedColumns().visibility.author}
+                    maxRefs={maxRefs()}
+                    refs={refs()}
+                    compareBase={comparisonBase()?.hash === view.commit.hash}
+                    onSelect={(event) => activateRow(view.commit, event)}
+                    onRefMenu={(badge, event) => openRefMenu(badge, event)}
+                    onOverflowMenu={(badges, event) => openOverflowMenu(badges, event)}
+                    onContextMenu={(event) => openCommitMenu(view.commit, event)}
+                    onKeyDown={(event) => handleRowKeyDown(view.commit, event)}
+                  />
+                )}
+              </For>
+
+              <Show when={rows().length === 0}>
+                <div
+                  class="gg-empty gg-history-empty"
+                  style={{ top: `${rowLayout().totalHeight + 8}px` }}
+                >
                   {repositoryLoading()
                     ? "Loading commits…"
                     : graphError()
@@ -3962,84 +4532,54 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                         ? "No commits (empty repository)."
                         : "No rows to show."}
                 </div>
-              }
-            >
-              <div
-                class="gg-history-spacer"
-                style={{ height: `${rowLayout().totalHeight}px` }}
-                data-slot-height={rowLayout().slotHeight}
-                data-expanded-index={
-                  expandedRowIndex() === undefined ? undefined : expandedRowIndex()
-                }
-              >
-                <For each={visibleRows()}>
-                  {(view) => (
-                    <GraphRow
-                      view={view}
-                      laneSpacing={laneSpacing()}
-                      graphWidth={graphWidth()}
-                      rowHeight={ROW_HEIGHT}
-                      top={rowLayout().rowTop(view.index)}
-                      selected={selectedCommit()?.hash === view.commit.hash}
-                      expanded={
-                        selectedCommit()?.hash === view.commit.hash &&
-                        expandedRowIndex() !== undefined
-                      }
-                      disabled={busy()}
-                      searchState={searchState(view.commit.hash)}
-                      showDate={resolvedColumns().visibility.date}
-                      showAuthor={resolvedColumns().visibility.author}
-                      maxRefs={maxRefs()}
-                      refs={refs()}
-                      compareBase={comparisonBase()?.hash === view.commit.hash}
-                      onSelect={(event) => activateRow(view.commit, event)}
-                      onRefMenu={(badge, event) => openRefMenu(badge, event)}
-                      onOverflowMenu={(badges, event) => openOverflowMenu(badges, event)}
-                      onContextMenu={(event) => openCommitMenu(view.commit, event)}
-                      onKeyDown={(event) => handleRowKeyDown(view.commit, event)}
-                    />
-                  )}
-                </For>
+              </Show>
 
-                <Show when={expandedRow()}>
-                  {(row) => (
-                    <CommitFilesSlot
-                      top={rowLayout().slotTop ?? 0}
-                      height={rowLayout().slotHeight}
-                      row={row()}
-                      commit={selectedCommit()!}
-                      graphWidth={graphWidth()}
-                      columnWidth={graphColumnWidth()}
-                      laneSpacing={laneSpacing()}
-                      nodes={commitTree()}
-                      files={commitFiles()}
-                      fileCount={commitFiles().length}
-                      expanded={expandedDirectories()}
-                      selectedPath={inlineSelectedPath()}
-                      view={inlineView()}
-                      loading={filesLoading()}
-                      error={filesError()}
-                      disabled={busy()}
-                      onToggle={toggleDirectory}
-                      onSelect={(file) => {
-                        const commit = selectedCommit()
-                        if (commit) selectCommitFile(file, commit, selectedParentIndex())
-                      }}
-                      onViewChange={(view) => setInlineView(view)}
-                      onViewAtCommit={(file) => {
-                        const commit = selectedCommit()
-                        if (commit) viewFileAtCommit(file, commit)
-                      }}
-                      onOpenCurrent={(file) => openCurrentWorkspaceFile(file)}
-                      onRetry={() => {
-                        const commit = selectedCommit()
-                        if (commit) void loadCommitFiles(commit, selectedParentIndex())
-                      }}
-                    />
-                  )}
-                </Show>
-              </div>
-            </Show>
+              <Show when={expandedRow()}>
+                {(row) => (
+                  <CommitFilesSlot
+                    top={rowLayout().slotTop ?? 0}
+                    height={rowLayout().slotHeight}
+                    row={row()}
+                    commit={selectedCommit()!}
+                    graphWidth={graphWidth()}
+                    columnWidth={graphColumnWidth()}
+                    laneSpacing={laneSpacing()}
+                    nodes={commitTree()}
+                    files={commitFiles()}
+                    fileCount={commitFiles().length}
+                    expanded={expandedDirectories()}
+                    selectedPath={inlineSelectedPath()}
+                    view={inlineView()}
+                    loading={filesLoading()}
+                    error={filesError()}
+                    disabled={busy()}
+                    onToggle={toggleDirectory}
+                    onSelect={(file) => {
+                      const commit = selectedCommit()
+                      if (commit) selectCommitFile(file, commit, selectedParentIndex())
+                    }}
+                    onViewChange={(view) => setInlineView(view)}
+                    onViewAtCommit={(file) => {
+                      const commit = selectedCommit()
+                      if (commit) viewFileAtCommit(file, commit)
+                    }}
+                    onOpenCurrent={(file) => openCurrentWorkspaceFile(file)}
+                    onRetry={() => {
+                      const commit = selectedCommit()
+                      if (commit) void loadCommitFiles(commit, selectedParentIndex())
+                    }}
+                    onResizeStart={(event) => {
+                      const commit = selectedCommit()
+                      if (commit) startSlotResize(commit.hash, event)
+                    }}
+                    onResizeKeyDown={(event) => {
+                      const commit = selectedCommit()
+                      if (commit) nudgeSlotHeight(commit.hash, event)
+                    }}
+                  />
+                )}
+              </Show>
+            </div>
           </div>
 
           <div class="gg-history-footer">
@@ -4110,6 +4650,16 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
             <div class="gg-details-actions">
               <button
                 type="button"
+                class="gg-details-back"
+                data-testid="details-back"
+                aria-label="Back to history"
+                title="Back to history"
+                onClick={() => closeDetails()}
+              >
+                Back
+              </button>
+              <button
+                type="button"
                 class="gg-icon-button"
                 data-testid="close-details"
                 aria-label="Close details"
@@ -4122,7 +4672,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           </div>
 
           <div class={detailsBodyClass()}>
-            <div class="gg-details-diff" data-testid="diff" aria-label="Diff">
+            <div
+              class="gg-details-diff"
+              data-testid="commit-diff-page"
+              data-diff-source={selectedFile()?.source}
+              aria-label="Diff"
+            >
               <Show
                 when={selectedFile()}
                 fallback={
@@ -4249,6 +4804,21 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
         onApplyFilter={(next) => applyHistoryFilter(next)}
         onCheckout={(ref) => openCheckoutDialog(ref)}
         onClose={() => setBranchSelectorOpen(false)}
+      />
+
+      <FetchDialog
+        open={fetchDialog() !== undefined}
+        repositoryLabel={fetchDialog()?.repositoryLabel ?? "Repository"}
+        expectedHead={fetchDialog()?.expectedHead ?? null}
+        remotes={fetchDialog()?.remotes ?? []}
+        selectedRemote={fetchRemoteName()}
+        prune={fetchPrune()}
+        busy={fetchBusy()}
+        error={fetchError()}
+        onRemoteChange={(remote) => setFetchRemoteName(remote)}
+        onPruneChange={(prune) => setFetchPrune(prune)}
+        onConfirm={() => void confirmFetch()}
+        onCancel={() => cancelFetch()}
       />
 
       <ConfirmDialog

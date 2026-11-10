@@ -256,6 +256,17 @@ export function isValidTagNameSyntax(name: unknown): name is string {
 }
 
 /**
+ * Pure syntax check for a remote name (without any `refs/remotes/` prefix).
+ *
+ * Remote names share git's refname rules (they may contain `/`), but the same
+ * additional restrictions apply so a name can never be parsed as an option or
+ * escape `refs/remotes/<name>/`.
+ */
+export function isValidRemoteNameSyntax(name: unknown): name is string {
+  return isValidRefNameSyntax(name)
+}
+
+/**
  * Authoritative refname validation through `git check-ref-format`.
  *
  * Returns `false` for exit code 1 (invalid name). Other failures (repository
