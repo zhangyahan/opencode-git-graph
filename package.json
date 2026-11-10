@@ -10,7 +10,10 @@
   },
   "files": [
     "src",
-    "dist"
+    "dist/gui-experimental.cjs",
+    "THIRD_PARTY_NOTICES.md",
+    "docs/FEATURE-PARITY.md",
+    "docs/RELEASE-0.2.0.md"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
