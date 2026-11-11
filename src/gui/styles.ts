@@ -112,16 +112,17 @@ export const GG_STYLES = `
   gap: 4px;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 190px;
-  height: 24px;
-  padding: 0 7px;
+  max-width: 100%;
+  min-height: 24px;
+  height: auto;
+  padding: 2px 7px;
   border-radius: 12px;
   border: 1px solid var(--color-border, #444);
   background: rgba(90, 130, 220, 0.12);
   color: var(--color-textPrimary, #d4d4d4);
 }
 .git-graph-panel button.gg-branch {
-  padding: 0 7px;
+  padding: 2px 7px;
   cursor: pointer;
 }
 .git-graph-panel button.gg-branch:hover:not(:disabled) {
@@ -170,13 +171,16 @@ export const GG_STYLES = `
 .gg-branch-icon {
   display: block;
   flex: 0 0 auto;
+  align-self: center;
   color: #7aa2f7;
 }
 .gg-branch-name {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-weight: 600;
 }
 .gg-branch.gg-branch-detached {
@@ -489,42 +493,36 @@ export const GG_STYLES = `
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The divider between two header cells is the resize affordance itself: a
+   transparent 5px hit strip that ends exactly on the always-visible border.
+   There is no separate handle decoration, and the strip never extends past the
+   header edge, so the panel can never gain a horizontal scrollbar. */
 .gg-column-resize {
   position: absolute;
   top: 0;
-  right: -3px;
+  right: 0;
   bottom: 0;
-  width: 6px;
+  width: 5px;
   padding: 0 !important;
   border: 0 !important;
   border-radius: 0 !important;
   background: transparent !important;
   cursor: col-resize;
+  touch-action: none;
   z-index: 2;
 }
-.gg-column-resize::after {
-  content: "";
-  position: absolute;
-  top: 6px;
-  bottom: 6px;
-  left: 2px;
-  width: 1px;
-  background: var(--color-border, #444);
-  opacity: 0;
+.gg-column-resize:focus-visible {
+  outline: 1px solid rgba(122, 162, 247, 0.75);
+  outline-offset: -2px;
 }
-.gg-column-resize:hover::after {
-  opacity: 1;
+/* The panel's generic button rule also sets cursor: pointer; keep the drag
+   cursor on the divider strips. */
+.git-graph-panel button.gg-column-resize {
+  cursor: col-resize;
 }
-/* The commit handle is the last column. Inset its hit area so the panel's
-   overflow clip cannot swallow the centre of the handle (and the header never
-   adds 3px to the panel scroll width). */
+/* The commit divider is the panel's last edge and has no border of its own. */
 .gg-col-head-commit .gg-column-resize {
   right: 0;
-}
-/* The graph column is user-resizable from its header edge, but the handle is
-   inset so the panel cannot gain a horizontal scrollbar. */
-.gg-graph-resize {
-  right: 0 !important;
 }
 .gg-history-scroll {
   position: relative;
@@ -575,28 +573,32 @@ export const GG_STYLES = `
   flex-direction: column;
   gap: 3px;
   flex: 0 1 auto;
-  width: clamp(140px, 22%, 190px);
-  min-width: 96px;
-  max-width: 190px;
+  /* Fallback before the measured pixel width arrives; the panel sets the
+     resolved width inline from the shared split geometry. */
+  width: clamp(200px, 40%, 60%);
+  min-width: 0;
+  max-width: none;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 6px 7px;
-  border-right: 1px solid var(--color-border, #3a3a3a);
   background: rgba(0, 0, 0, 0.06);
   font-size: 10.5px;
 }
 .gg-inline-info-subject {
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
   color: var(--color-textPrimary, #d4d4d4);
   font-weight: 600;
   line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .gg-inline-info-row {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   gap: 5px;
   min-width: 0;
 }
@@ -606,11 +608,14 @@ export const GG_STYLES = `
   font-size: 9.5px;
 }
 .gg-inline-info-value {
+  flex: 1 1 auto;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
   color: var(--color-textSecondary, #b0b0b0);
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  text-overflow: clip;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .gg-inline-info-mono {
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
@@ -626,6 +631,35 @@ export const GG_STYLES = `
   background: rgba(128, 128, 128, 0.14);
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
   font-size: 9.5px;
+}
+/* Divider between the commit info pane and the file list: the always-visible
+   line is the drag affordance (no extra handle decoration). */
+.gg-inline-split {
+  position: relative;
+  flex: 0 0 5px;
+  width: 5px;
+  min-width: 5px;
+  align-self: stretch;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+}
+.gg-inline-split::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 1px;
+  background: var(--color-border, #3a3a3a);
+}
+.gg-inline-split:hover::after,
+.gg-inline-split:focus-visible::after {
+  background: rgba(122, 162, 247, 0.85);
+}
+.gg-inline-split:focus-visible {
+  outline: 1px solid rgba(122, 162, 247, 0.75);
+  outline-offset: -2px;
 }
 .gg-inline-info-details {
   margin-top: 2px;
@@ -833,8 +867,13 @@ export const GG_STYLES = `
   gap: 3px;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 55%;
-  overflow: hidden;
+  max-width: 60%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+.gg-ref-badges::-webkit-scrollbar {
+  display: none;
 }
 .gg-subject {
   flex: 1 1 auto;
@@ -844,11 +883,11 @@ export const GG_STYLES = `
   white-space: nowrap;
 }
 .git-graph-panel button.gg-ref-badge {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
   min-width: 0;
-  max-width: 72px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
   white-space: nowrap;
   padding: 0 4px;
   border-radius: 3px;
@@ -1130,30 +1169,7 @@ export const GG_STYLES = `
   font-size: 10px;
 }
 
-/* ---------- dense graph safety net ---------- */
-.gg-dense-graph {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 0 0 auto;
-  min-width: 0;
-  padding: 3px 8px;
-  border-bottom: 1px solid rgba(230, 193, 90, 0.3);
-  background: rgba(230, 193, 90, 0.08);
-  color: #e6c15a;
-  font-size: 10.5px;
-}
-.gg-dense-graph span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.gg-dense-graph button {
-  flex: 0 0 auto;
-  padding: 1px 6px;
-  font-size: 10px;
-}
+/* ---------- mutation / refs status ---------- */
 .gg-mutation-status {
   display: flex;
   align-items: center;
@@ -1610,39 +1626,30 @@ export const GG_STYLES = `
 .gg-uncommitted-slot .gg-row-slot-tree {
   padding-bottom: 10px;
 }
+/* The slot's bottom divider is the resize affordance itself: one full-width
+   hit strip sitting on the always-visible bottom border. There is no separate
+   pill/handle decoration. */
 .gg-slot-resize {
   position: absolute;
   left: 0;
   right: 0;
   bottom: 0;
   z-index: 4;
-  height: 7px;
+  width: 100%;
+  height: 5px;
   padding: 0 !important;
   border: 0 !important;
   border-radius: 0 !important;
   background: transparent !important;
-  cursor: ns-resize;
+  cursor: row-resize;
   touch-action: none;
-}
-.gg-slot-resize::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 2px;
-  width: 34px;
-  height: 2px;
-  margin-left: -17px;
-  border-radius: 2px;
-  background: var(--color-border, #555);
-  opacity: 0;
-}
-.gg-slot-resize:hover::after,
-.gg-slot-resize:focus-visible::after {
-  opacity: 1;
 }
 .gg-slot-resize:focus-visible {
   outline: 1px solid rgba(122, 162, 247, 0.75);
   outline-offset: -2px;
+}
+.git-graph-panel button.gg-slot-resize {
+  cursor: row-resize;
 }
 .gg-history-empty {
   position: absolute;

@@ -302,7 +302,8 @@ describe("scroll clamping", () => {
 describe("commit formatting", () => {
   it("formats dates without locale or time-zone state", () => {
     const value = formatCommitDate("2026-11-09T12:34:56+08:00")
-    expect(value).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/)
+    expect(value).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/)
+    expect(value).toHaveLength(16)
     expect(value).not.toContain("T")
     expect(value).not.toContain("+")
     expect(formatCommitDate("not a date")).toBe("not a date")

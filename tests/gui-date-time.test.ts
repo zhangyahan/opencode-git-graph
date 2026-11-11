@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { formatCommitDate } from "../src/gui/format.js"
 
-const STAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+const STAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/
 
 function pad(value: number, width = 2): string {
   return String(value).padStart(width, "0")
@@ -14,7 +14,7 @@ function pad(value: number, width = 2): string {
  */
 function localStamp(date: Date): string {
   const day = `${pad(date.getFullYear(), 4)}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
-  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`
   return `${day} ${time}`
 }
 
@@ -31,22 +31,23 @@ function localIso(
 }
 
 describe("formatCommitDate", () => {
-  it("renders the full local date and time of a commit instant", () => {
+  it("renders the full local date and minute of a commit instant", () => {
     const value = formatCommitDate(localIso(2026, 11, 9, 12, 34, 56))
-    expect(value).toBe("2026-11-09 12:34:56")
+    expect(value).toBe("2026-11-09 12:34")
     expect(value).toMatch(STAMP)
   })
 
-  it("keeps the seconds component", () => {
+  it("keeps the date column at 16 characters by dropping the seconds", () => {
     const value = formatCommitDate(localIso(2026, 1, 2, 3, 4, 42))
-    expect(value.endsWith(":42")).toBe(true)
-    expect(value).toBe("2026-01-02 03:04:42")
+    expect(value).toBe("2026-01-02 03:04")
+    expect(value).toHaveLength(16)
+    expect(value.endsWith(":42")).toBe(false)
   })
 
   it("zero-pads every component to a fixed width", () => {
-    expect(formatCommitDate(localIso(2026, 1, 2, 3, 4, 5))).toBe("2026-01-02 03:04:05")
+    expect(formatCommitDate(localIso(2026, 1, 2, 3, 4, 5))).toBe("2026-01-02 03:04")
     expect(formatCommitDate(localIso(2026, 12, 31, 23, 59, 59))).toBe(
-      "2026-12-31 23:59:59",
+      "2026-12-31 23:59",
     )
   })
 
@@ -54,8 +55,8 @@ describe("formatCommitDate", () => {
     const earlyMorning = localIso(2026, 6, 15, 0, 5, 0)
     const lateEvening = localIso(2026, 6, 15, 23, 55, 0)
 
-    expect(formatCommitDate(earlyMorning)).toBe("2026-06-15 00:05:00")
-    expect(formatCommitDate(lateEvening)).toBe("2026-06-15 23:55:00")
+    expect(formatCommitDate(earlyMorning)).toBe("2026-06-15 00:05")
+    expect(formatCommitDate(lateEvening)).toBe("2026-06-15 23:55")
     expect(formatCommitDate(earlyMorning)).toBe(localStamp(new Date(earlyMorning)))
     expect(formatCommitDate(lateEvening)).toBe(localStamp(new Date(lateEvening)))
   })
@@ -75,13 +76,13 @@ describe("formatCommitDate", () => {
 
   it("ignores sub-second precision", () => {
     expect(formatCommitDate(localIso(2026, 11, 9, 12, 34, 56, 789))).toBe(
-      "2026-11-09 12:34:56",
+      "2026-11-09 12:34",
     )
   })
 
   it("renders date-only input as local midnight without shifting the day", () => {
-    expect(formatCommitDate("2026-11-09")).toBe("2026-11-09 00:00:00")
-    expect(formatCommitDate("2026-01-01")).toBe("2026-01-01 00:00:00")
+    expect(formatCommitDate("2026-11-09")).toBe("2026-11-09 00:00")
+    expect(formatCommitDate("2026-01-01")).toBe("2026-01-01 00:00")
   })
 
   it("returns an empty string for missing values", () => {

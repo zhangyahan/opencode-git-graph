@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Release-candidate UI acceptance: FR read-only + isolated TEMP mutation fixture.
  *
  * THIS SCRIPT IS PREPARED FOR THE FROZEN RELEASE BUILD. It is intentionally
@@ -56,6 +56,28 @@ const FETCH_METHOD = process.env.GG_FETCH_METHOD ?? "fetchRemote"
 const COMPARISON_METHODS = new Set(["getComparisonFiles", "getComparisonDiff"])
 const SLOT_MIN_HEIGHT = 96
 const SLOT_HANDLE_SELECTOR = '[data-testid="slot-resize-handle"]'
+const COLUMN_DIVIDER_SELECTOR = (column) => `[data-testid="resize-column-${column}"]`
+const COLUMN_DIVIDER_TARGET_WIDTH = 5
+const COLUMN_DIVIDER_MIN_WIDTH = 3
+const COLUMN_DIVIDER_MAX_WIDTH = 8
+const INLINE_INFO_MIN_RATIO = 0.25
+const INLINE_INFO_MAX_RATIO = 0.6
+/**
+ * The left/middle inline divider is part of the upcoming frozen layout. The
+ * exact test id is not frozen yet; audit reports which candidate exists.
+ */
+const INLINE_INFO_DIVIDER_SELECTORS = [
+  '[data-testid="inline-split"]',
+  '[data-testid="inline-info-resize"]',
+  '[data-testid="inline-column-resize"]',
+  '[data-testid="inline-info-divider"]',
+  '[data-testid="inline-info-splitter"]',
+  '[data-testid="inline-resize"]',
+  '[data-testid="inline-splitter"]',
+  '.gg-inline-split',
+  '.gg-inline-info-resize',
+  '.gg-inline-splitter',
+]
 const UNCOMMITTED_ROW_SELECTOR =
   '[data-testid="uncommitted-row"], [data-testid="uncommitted-changes"], .gg-uncommitted-row'
 const LEGACY_CHANGES_SELECTOR = '[data-testid="changes"], .gg-changes-section'
@@ -81,6 +103,8 @@ const SOURCE_FILES = [
   "src/gui/file-content-view.tsx",
   "src/gui/graph-geometry.ts",
   "src/gui/history-columns.ts",
+  "src/gui/format.ts",
+  "src/gui/inline-split.ts",
   "src/gui/changes.ts",
   "src/gui/fetch-dialog.tsx",
   "src/gui/slot-size.ts",
@@ -101,6 +125,7 @@ const SELECTORS = {
   row: [".gg-graph-row:not(.gg-uncommitted-row)"],
   dateCell: ['[data-testid="commit-date"]', ".gg-col-date"],
   denseGraph: ['[data-testid="dense-graph"]'],
+  resizeHandle: ['[data-testid^="resize-column-"]'],
   graphResize: ['[data-testid="resize-column-graph"]'],
   graphScroll: ['[data-testid="graph-scroll"]'],
   resizeGraph: ['[data-testid="resize-column-graph"]'],
@@ -143,6 +168,11 @@ const SELECTORS = {
     ".gg-mutation-notice",
   ],
   slotResizeHandle: [SLOT_HANDLE_SELECTOR],
+  inlineInfoDivider: INLINE_INFO_DIVIDER_SELECTORS,
+  inlineBody: [".gg-row-slot-body"],
+  inlineInfoResolved: ['[data-testid="inline-info"]'],
+  inlineFilesResolved: [".gg-row-slot-files"],
+  refMore: ['[data-testid="ref-more"]', ".gg-ref-more"],
   uncommittedRow: [UNCOMMITTED_ROW_SELECTOR],
   uncommittedCounts: [
     '[data-testid="uncommitted-total"]',
@@ -444,6 +474,10 @@ async function layoutSnapshot(page) {
             width: firstDate.getBoundingClientRect().width,
             scrollWidth: firstDate.scrollWidth,
             clientWidth: firstDate.clientWidth,
+            scrollHeight: firstDate.scrollHeight,
+            clientHeight: firstDate.clientHeight,
+            textOverflow: getComputedStyle(firstDate).textOverflow,
+            whiteSpace: getComputedStyle(firstDate).whiteSpace,
             visible: true,
           }
         : { visible: false },
@@ -727,6 +761,247 @@ async function columnWidth(page, id) {
   }, id)
 }
 
+/**
+ * The frozen layout makes the header divider itself the ~5px drag target.
+ * There must be no separate grip/knob: the hit area is transparent and any
+ * pseudo-element is at most a one-pixel divider line.
+ */
+async function columnDividerGeometry(page, id) {
+  return page.evaluate(({ columnId, selector }) => {
+    const handle = document.querySelector(selector)
+    if (!handle) return { present: false, selector }
+    const cells = [...document.querySelectorAll(".gg-history-head > .gg-col-head")]
+    const label = columnId[0].toUpperCase() + columnId.slice(1)
+    const index = cells.findIndex((cell) => cell.textContent.trim() === label)
+    const cell = cells[index]
+    const next = cells[index + 1]
+    const cellRect = cell?.getBoundingClientRect()
+    const nextRect = next?.getBoundingClientRect()
+    const headRect = document.querySelector(".gg-history-head")?.getBoundingClientRect()
+    const handleRect = handle.getBoundingClientRect()
+    const style = getComputedStyle(handle)
+    const pseudo = (side) => {
+      const value = getComputedStyle(handle, side)
+      const width = Number.parseFloat(value.width)
+      const height = Number.parseFloat(value.height)
+      const opacity = Number.parseFloat(value.opacity)
+      const visible =
+        value.content !== "none" &&
+        value.display !== "none" &&
+        (Number.isNaN(opacity) || opacity > 0.05) &&
+        ((Number.isFinite(width) && width > 0.5) || (Number.isFinite(height) && height > 0.5))
+      return {
+        content: value.content,
+        display: value.display,
+        width: Number.isFinite(width) ? width : null,
+        height: Number.isFinite(height) ? height : null,
+        opacity: Number.isFinite(opacity) ? opacity : null,
+        background: value.backgroundColor,
+        backgroundImage: value.backgroundImage,
+        borderRadius: value.borderRadius,
+        visible,
+      }
+    }
+    const before = pseudo("::before")
+    const after = pseudo("::after")
+    const boundary = nextRect?.left ?? cellRect?.right ?? null
+    return {
+      present: true,
+      selector,
+      label,
+      width: handleRect.width,
+      height: handleRect.height,
+      left: handleRect.left,
+      right: handleRect.right,
+      boundary,
+      boundaryDelta:
+        boundary === null ? null : Math.abs((handleRect.left + handleRect.right) / 2 - boundary),
+      headerHeight: headRect?.height ?? null,
+      cursor: style.cursor,
+      background: style.backgroundColor,
+      borderWidth: style.borderWidth,
+      before,
+      after,
+      // A small centered bar (the old 34px/1px grip) is an independent handle
+      // ornament. A 1px full-height divider line is allowed.
+      ornament: [before, after].some(
+        (entry) =>
+          entry.visible &&
+          (entry.width === null || entry.width > 2.5) &&
+          (entry.height === null || entry.height < Math.max(4, handleRect.height - 2)),
+      ),
+    }
+  }, { columnId: id, selector: COLUMN_DIVIDER_SELECTOR(id) })
+}
+
+async function columnSync(page) {
+  return page.evaluate(() => {
+    const row = document.querySelector(".gg-graph-row:not(.gg-uncommitted-row)")
+    const rowCell = {
+      Graph: row?.querySelector(".gg-row-graph"),
+      Description: row?.querySelector(".gg-col-desc"),
+      Date: row?.querySelector(".gg-col-date"),
+      Author: row?.querySelector(".gg-col-author"),
+      Commit: row?.querySelector(".gg-col-commit"),
+    }
+    return [...document.querySelectorAll(".gg-history-head > .gg-col-head")].map((cell) => {
+      const label = cell.textContent.trim()
+      const header = cell.getBoundingClientRect().width
+      const rowWidth = rowCell[label]?.getBoundingClientRect().width ?? null
+      return {
+        label,
+        header,
+        row: rowWidth,
+        delta: rowWidth === null ? null : Math.abs(header - rowWidth),
+      }
+    })
+  })
+}
+
+async function hoverDecoration(page, selector) {
+  const handle = page.locator(selector).first()
+  await handle.waitFor({ state: "visible", timeout: 10_000 })
+  await handle.hover().catch(() => {})
+  await waitRaf(page, 1)
+  return page.evaluate((wanted) => {
+    const element = document.querySelector(wanted)
+    if (!element) return { present: false }
+    const rect = element.getBoundingClientRect()
+    const pseudo = (side) => {
+      const value = getComputedStyle(element, side)
+      const width = Number.parseFloat(value.width)
+      const height = Number.parseFloat(value.height)
+      const opacity = Number.parseFloat(value.opacity)
+      return {
+        content: value.content,
+        display: value.display,
+        width: Number.isFinite(width) ? width : null,
+        height: Number.isFinite(height) ? height : null,
+        opacity: Number.isFinite(opacity) ? opacity : null,
+        background: value.backgroundColor,
+        borderRadius: value.borderRadius,
+        visible:
+          value.content !== "none" &&
+          value.display !== "none" &&
+          (Number.isNaN(opacity) || opacity > 0.05) &&
+          ((Number.isFinite(width) && width > 0.5) || (Number.isFinite(height) && height > 0.5)),
+      }
+    }
+    const before = pseudo("::before")
+    const after = pseudo("::after")
+    const style = getComputedStyle(element)
+    return {
+      present: true,
+      width: rect.width,
+      height: rect.height,
+      background: style.backgroundColor,
+      borderWidth: style.borderWidth,
+      cursor: style.cursor,
+      before,
+      after,
+      // A short bar entirely inside the line is a separate small control.
+      smallWidgetInside:
+        [before, after].some(
+          (entry) =>
+            entry.visible &&
+            entry.width !== null &&
+            entry.width > 2.5 &&
+            entry.width < Math.max(8, rect.width - 2) &&
+            entry.height !== null &&
+            entry.height > 1.5,
+        ),
+    }
+  }, selector)
+}
+
+async function fullTextState(page, selector, name) {
+  return page.evaluate(({ wanted, expected }) => {
+    const elements = [...document.querySelectorAll(wanted)]
+    const element =
+      elements.find((entry) => entry.getAttribute("data-ref-name") === expected) ??
+      elements.find((entry) => (entry.textContent ?? "").includes(expected)) ??
+      elements[0]
+    if (!element) return { present: false }
+    const style = getComputedStyle(element)
+    const lineHeight = Number.parseFloat(style.lineHeight)
+    const text = (element.textContent ?? "").replace(/\s+/g, " ").trim()
+    const descendants = [...element.querySelectorAll("*")]
+      .filter((child) => (child.textContent ?? "").trim().length > 0)
+      .map((child) => {
+        const childStyle = getComputedStyle(child)
+        return {
+          className: child.className,
+          textOverflow: childStyle.textOverflow,
+          overflowX: childStyle.overflowX,
+          scrollWidth: child.scrollWidth,
+          clientWidth: child.clientWidth,
+          truncated:
+            childStyle.textOverflow === "ellipsis" &&
+            childStyle.overflowX !== "visible" &&
+            child.scrollWidth > child.clientWidth + 1,
+        }
+      })
+    const descendantEllipsis = descendants.some((child) => child.truncated)
+    return {
+      present: true,
+      text,
+      title: element.getAttribute("title"),
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+      textOverflow: style.textOverflow,
+      whiteSpace: style.whiteSpace,
+      overflow: style.overflow,
+      overflowY: style.overflowY,
+      lineHeight: Number.isFinite(lineHeight) ? lineHeight : null,
+      noEllipsis: style.textOverflow !== "ellipsis" && !descendantEllipsis,
+      descendantEllipsis,
+      horizontallyFits: element.scrollWidth <= element.clientWidth + 1,
+      verticallyFits: element.scrollHeight <= element.clientHeight + 1,
+      fullyVisible:
+        element.scrollWidth <= element.clientWidth + 1 &&
+        element.scrollHeight <= element.clientHeight + 1,
+      multiline:
+        (style.whiteSpace !== "nowrap" && element.clientHeight > (Number.isFinite(lineHeight) ? lineHeight * 1.6 : 0)) ||
+        [...element.getClientRects()].length > 1,
+      includesName: expected ? text.includes(expected) : true,
+    }
+  }, { wanted: selector, expected: name })
+}
+
+async function refBadgeSnapshot(page) {
+  return page.evaluate(() => {
+    const badges = [...document.querySelectorAll('[data-testid="ref-badge"]')].map((badge) => {
+      const style = getComputedStyle(badge)
+      const lineHeight = Number.parseFloat(style.lineHeight)
+      return {
+        name: badge.getAttribute("data-ref-name") ?? (badge.textContent ?? "").trim(),
+        text: (badge.textContent ?? "").replace(/\s+/g, " ").trim(),
+        title: badge.getAttribute("title"),
+        scrollWidth: badge.scrollWidth,
+        clientWidth: badge.clientWidth,
+        scrollHeight: badge.scrollHeight,
+        clientHeight: badge.clientHeight,
+        textOverflow: style.textOverflow,
+        whiteSpace: style.whiteSpace,
+        noEllipsis: style.textOverflow !== "ellipsis",
+        fullyVisible:
+          badge.scrollWidth <= badge.clientWidth + 1 &&
+          badge.scrollHeight <= badge.clientHeight + 1,
+        multiline:
+          style.whiteSpace !== "nowrap" &&
+          badge.clientHeight > (Number.isFinite(lineHeight) ? lineHeight * 1.6 : 0),
+      }
+    })
+    const more = [...document.querySelectorAll('[data-testid="ref-more"], .gg-ref-more')]
+      .map((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim())
+      .find((text) => text.length > 0)
+    return { badges, more: more ?? null }
+  })
+}
+
+
 /* ---------- release extension helpers (WIP selectors are documented in README) ---------- */
 
 function runGit(cwd, args, { allowFailure = false } = {}) {
@@ -874,6 +1149,145 @@ async function dragSlotHandle(page, deltaY) {
   return { before, after, deltaY: targetY - y }
 }
 
+async function inlineLayoutSnapshot(page) {
+  return page.evaluate((dividerSelectors) => {
+    const root = document.querySelector('[data-testid="inline-slot"]')
+    const body = root?.querySelector(".gg-row-slot-body")
+    const info = root?.querySelector('[data-testid="inline-info"]')
+    const files = root?.querySelector(".gg-row-slot-files")
+    const controls = root?.querySelector(".gg-inline-view-controls")
+    const divider = dividerSelectors
+      .map((selector) => document.querySelector(selector))
+      .find(Boolean)
+    const rect = (element) => {
+      if (!element) return null
+      const r = element.getBoundingClientRect()
+      return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }
+    }
+    const box = {
+      root: rect(root),
+      body: rect(body),
+      info: rect(info),
+      files: rect(files),
+      controls: rect(controls),
+      divider: rect(divider),
+    }
+    const ratio =
+      box.info && box.files && box.info.width + box.files.width > 0
+        ? box.info.width / (box.info.width + box.files.width)
+        : null
+    const infoStyle = info ? getComputedStyle(info) : null
+    const text = info
+      ? [...info.querySelectorAll(".gg-inline-info-subject, .gg-inline-info-value")].map(
+          (element) => {
+            const style = getComputedStyle(element)
+            const lineHeight = Number.parseFloat(style.lineHeight)
+            return {
+              className: element.className,
+              text: (element.textContent ?? "").replace(/\s+/g, " ").trim(),
+              title: element.getAttribute("title"),
+              scrollWidth: element.scrollWidth,
+              clientWidth: element.clientWidth,
+              scrollHeight: element.scrollHeight,
+              clientHeight: element.clientHeight,
+              textOverflow: style.textOverflow,
+              whiteSpace: style.whiteSpace,
+              lineHeight: Number.isFinite(lineHeight) ? lineHeight : null,
+              noEllipsis: style.textOverflow !== "ellipsis",
+              lines: Number.isFinite(lineHeight) && lineHeight > 0
+                ? Math.round(element.clientHeight / lineHeight)
+                : null,
+              fullyVisible:
+                element.scrollWidth <= element.clientWidth + 1 &&
+                element.scrollHeight <= element.clientHeight + 1,
+            }
+          },
+        )
+      : []
+    const dateRow = info
+      ? [...info.querySelectorAll(".gg-inline-info-row")].find(
+          (row) => row.querySelector(".gg-inline-info-label")?.textContent?.trim() === "Date",
+        )
+      : null
+    const dateValue = dateRow?.querySelector(".gg-inline-info-value")
+    return {
+      slotPresent: Boolean(root),
+      dividerPresent: Boolean(divider),
+      dividerSelector:
+        dividerSelectors.find((selector) => document.querySelector(selector)) ?? null,
+      dividerWidth: box.divider?.width ?? null,
+      dividerHeight: box.divider?.height ?? null,
+      dividerAriaNow:
+        divider?.getAttribute("aria-valuenow") === null ||
+        divider?.getAttribute("aria-valuenow") === undefined
+          ? null
+          : Number(divider.getAttribute("aria-valuenow")),
+      dividerAriaMin:
+        divider?.getAttribute("aria-valuemin") === null ||
+        divider?.getAttribute("aria-valuemin") === undefined
+          ? null
+          : Number(divider.getAttribute("aria-valuemin")),
+      dividerAriaMax:
+        divider?.getAttribute("aria-valuemax") === null ||
+        divider?.getAttribute("aria-valuemax") === undefined
+          ? null
+          : Number(divider.getAttribute("aria-valuemax")),
+      box,
+      ratio,
+      infoStyle: infoStyle
+        ? {
+            width: infoStyle.width,
+            minWidth: infoStyle.minWidth,
+            maxWidth: infoStyle.maxWidth,
+            flex: infoStyle.flex,
+            overflowX: infoStyle.overflowX,
+            overflowY: infoStyle.overflowY,
+            whiteSpace: infoStyle.whiteSpace,
+          }
+        : null,
+      infoScroll: info
+        ? {
+            scrollWidth: info.scrollWidth,
+            clientWidth: info.clientWidth,
+            scrollHeight: info.scrollHeight,
+            clientHeight: info.clientHeight,
+          }
+        : null,
+      text,
+      date: dateValue
+        ? {
+            text: (dateValue.textContent ?? "").replace(/\s+/g, " ").trim(),
+            title:
+              dateValue.getAttribute("title") ??
+              dateRow?.getAttribute("title") ??
+              null,
+            rowTitle: dateRow?.getAttribute("title") ?? null,
+          }
+        : null,
+    }
+  }, INLINE_INFO_DIVIDER_SELECTORS)
+}
+
+async function dragInlineDivider(page, deltaX) {
+  const divider = await anyLocator(page, SELECTORS.inlineInfoDivider)
+  if (!divider) throw new Error("inline info/files divider is missing")
+  const box = await divider.boundingBox()
+  if (!box) throw new Error("inline info/files divider has no box")
+  const before = await inlineLayoutSnapshot(page)
+  const viewport = page.viewportSize() ?? { width: 1280, height: 900 }
+  const x = Math.max(2, Math.min(viewport.width - 2, box.x + box.width / 2))
+  const y = box.y + box.height / 2
+  const targetX = Math.max(2, Math.min(viewport.width - 2, x + deltaX))
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  await page.mouse.move(targetX, y, { steps: 10 })
+  await page.mouse.up()
+  await waitRaf(page, 3)
+  const after = await inlineLayoutSnapshot(page)
+  return { before, after, deltaX: targetX - x }
+}
+
+
 async function uncommittedSnapshot(page) {
   return page.evaluate(() => {
     const row = document.querySelector(
@@ -919,7 +1333,7 @@ function uncommittedGroupButton(page, label) {
     .locator(
       '[data-testid="uncommitted-slot"] button, [data-testid="uncommitted-files"] button, [data-testid="uncommitted-body"] button, [data-testid="uncommitted-groups"] button, .gg-uncommitted-body button',
     )
-    .filter({ hasText: new RegExp(`(?:^|[\\s▾▸])${label}(?:\\s|\\d|$)`, "i") })
+    .filter({ hasText: new RegExp(`(?:^|[\\s\\u25BE\\u25B8])${label}(?:\\s|\\d|$)`, "i") })
     .first()
 }
 
@@ -1145,7 +1559,7 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
   })
   await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
   await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
     null,
     { timeout: 30_000 },
   )
@@ -1370,7 +1784,7 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
   const page = await context.newPage()
   await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
   await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
     null,
     { timeout: 30_000 },
   )
@@ -1443,8 +1857,30 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
   checkResult(checks, "header labels are Graph/Description/Date/Author/Commit", headerLabelsOk, headers.map((header) => header.text))
   checkResult(checks, "header column dividers are visible without hover", alwaysVisibleDividers, headers)
   checkResult(checks, "graph starts at 240px with a resize handle", initial.graph.handleCount >= 1 && Math.abs(initial.graph.headerWidth - 240) <= 1, initial.graph)
+  const graphDivider = await columnDividerGeometry(page, "graph")
+  const graphDecoration = await hoverDecoration(page, COLUMN_DIVIDER_SELECTOR("graph"))
+  metrics.graphDrag.divider = { graphDivider, graphDecoration }
+  checkResult(
+    checks,
+    "graph divider is the ~5px header hit area with no separate handle ornament",
+    graphDivider.present &&
+      graphDivider.width >= COLUMN_DIVIDER_MIN_WIDTH &&
+      graphDivider.width <= COLUMN_DIVIDER_MAX_WIDTH &&
+      graphDivider.boundaryDelta !== null &&
+      graphDivider.boundaryDelta <= 4 &&
+      graphDivider.cursor === "col-resize" &&
+      !graphDivider.ornament &&
+      !graphDecoration.smallWidgetInside,
+    { graphDivider, graphDecoration },
+  )
   const initialLanes = await graphLaneSnapshot(page)
   metrics.graphDrag.initialLanes = initialLanes
+  checkResult(
+    checks,
+    "graph crop never renders the dense-graph hint",
+    !initialLanes.denseVisible && (await page.locator('[data-testid="dense-graph"]').count()) === 0,
+    { denseVisible: initialLanes.denseVisible },
+  )
   checkResult(
     checks,
     "narrow graph keeps fixed 14px lane spacing (15,29,43...) and content width lanes*14+16",
@@ -1500,6 +1936,13 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
     { expandedClipped, expandedLanes },
   )
   checkResult(checks, "resizing graph does not overflow the panel or other columns", afterExpand.panelOverflowX <= 1 && afterExpand.historyHeadOverflow <= 1 && afterExpand.rowOverflow <= 1 && afterExpand.doc.scrollWidth <= afterExpand.doc.clientWidth && afterExpand.body.scrollWidth <= afterExpand.body.clientWidth, { panelOverflowX: afterExpand.panelOverflowX, historyHeadOverflow: afterExpand.historyHeadOverflow, rowOverflow: afterExpand.rowOverflow, doc: afterExpand.doc, body: afterExpand.body, grids: afterExpand.grids })
+  const graphSync = await columnSync(page)
+  checkResult(
+    checks,
+    "resized graph header and row widths stay in sync",
+    graphSync.length >= 2 && graphSync.every((entry) => entry.row !== null && entry.delta <= 1),
+    graphSync,
+  )
   await screenshot(page, "17-fr-graph-drag.png", { fullPage: true })
   const narrowTarget = 120
   const narrowed = await dragColumn(page, "graph", narrowTarget - expanded.after)
@@ -1579,10 +2022,13 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
   )
   checkResult(
     checks,
-    "narrow graph clips right lanes, shows the dense hint and has no visible/user horizontal scroll",
-    narrowLanes.contentWidth > narrowLanes.cellWidth &&
-      narrowLanes.denseVisible &&
-      narrowLanes.maxShapeRight > narrowLanes.cellWidth + 1 &&
+    "narrow graph keeps fixed lanes, no dense hint and no visible/user horizontal scroll",
+    narrowLanes.contentWidth > 0 &&
+      !narrowLanes.denseVisible &&
+      (narrowLanes.contentWidth <= narrowLanes.cellWidth + 1
+        ? narrowLanes.maxShapeRight <= narrowLanes.cellWidth + 1
+        : narrowLanes.maxShapeRight > narrowLanes.cellWidth + 1) &&
+      (await page.locator('[data-testid="dense-graph"]').count()) === 0 &&
       /hidden|clip/.test(scrollSemantics.overflowX.cell ?? "") &&
       /hidden|clip/.test(scrollSemantics.overflowX.history ?? "") &&
       scrollSemantics.cellScrollLeftAfterWheel === 0 &&
@@ -1609,7 +2055,7 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
   )
   await page.reload({ waitUntil: "domcontentloaded" })
   await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
     null,
     { timeout: 30_000 },
   )
@@ -1642,7 +2088,8 @@ async function graphDragScenario(browser, frPrimary, checks, metrics) {
   )
   await waitRaf(page, 2)
   const narrow = await layoutSnapshot(page)
-  checkResult(checks, "520px graph budget shrinks without horizontal overflow", narrow.graph.headerWidth <= 241 && narrow.graph.scrollWidth <= narrow.graph.clientWidth + 1 && narrow.panelOverflowX <= 1 && narrow.doc.scrollWidth <= narrow.doc.clientWidth, { graph: narrow.graph, panelOverflowX: narrow.panelOverflowX, doc: narrow.doc })
+  const dense520 = await page.locator('[data-testid="dense-graph"]').count()
+  checkResult(checks, "520px graph budget shrinks without horizontal overflow or a dense hint", narrow.graph.headerWidth <= 241 && narrow.graph.scrollWidth <= narrow.graph.clientWidth + 1 && narrow.panelOverflowX <= 1 && narrow.doc.scrollWidth <= narrow.doc.clientWidth && !narrow.denseGraphVisible && dense520 === 0, { graph: narrow.graph, panelOverflowX: narrow.panelOverflowX, doc: narrow.doc, dense520 })
   await context.close()
 }
 
@@ -1661,7 +2108,7 @@ async function inlineThreeColumnScenario(browser, frPrimary, checks, metrics) {
   })
   await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
   await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+    () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
     null,
     { timeout: 30_000 },
   )
@@ -1722,7 +2169,7 @@ async function inlineThreeColumnScenario(browser, frPrimary, checks, metrics) {
   const fileRows = page.locator(`${SELECTORS.inlineFiles[0]} .gg-file-row`)
   // Backend contract: added/deleted are optional non-negative integers; binary
   // rows omit both and must render '-' rather than fabricated numbers.
-  const titlePath = (title) => (title?.includes(" → ") ? title.split(" → ").at(-1) : title)
+  const titlePath = (title) => (title?.includes(" �� ") ? title.split(" �� ").at(-1) : title)
   const pathOf = (file) => file?.path ?? null
   const statsForRow = async (row) => {
     const addLocator = row.locator(SELECTORS.fileStatAdd[0])
@@ -2186,6 +2633,223 @@ async function inlineThreeColumnScenario(browser, frPrimary, checks, metrics) {
   await waitForAny(page, SELECTORS.inlineSlot)
   checkResult(checks, "inline can be closed and reopened after view toggles", Boolean(await page.locator(SELECTORS.inlineSlot[0]).count()), {})
   await context.close()
+}
+
+async function inlineLayoutScenario(browser, frPrimary, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  try {
+    const page = await context.newPage()
+    await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator('[data-testid="harness-width-1100"]').click()
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="harness-panel-shell"]')?.dataset.panelWidth === "1100",
+      null,
+      { timeout: 15_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+    await waitLoaded(page, 100)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+
+    const log = (await fetchRpc(FR_ORIGIN, "getLog", { repositoryId: frPrimary.id, limit: 100 })).body.result
+    let candidate = null
+    let fallback = null
+    for (let index = 0; index < Math.min(60, log.commits.length); index += 1) {
+      const commit = log.commits[index]
+      const files = (await fetchRpc(FR_ORIGIN, "getCommitFiles", {
+        repositoryId: frPrimary.id,
+        hash: commit.hash,
+        parentIndex: 0,
+      })).body.result.files
+      if (files.length === 0) continue
+      const entry = { index, commit, files }
+      if (!fallback || (commit.subject ?? "").length > (fallback.commit.subject ?? "").length) {
+        fallback = entry
+      }
+      if ((commit.subject ?? "").length >= 80) {
+        candidate = entry
+        break
+      }
+    }
+    candidate ??= fallback
+    if (!candidate) {
+      checkResult(checks, "inline layout fixture has a commit with files", false, { commits: log.commits.length })
+      return
+    }
+
+    await scrollToRowIndex(page, candidate.index)
+    await page.locator(`.gg-graph-row[data-index="${candidate.index}"] .gg-subject`).click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await page.waitForFunction(
+      () => {
+        const files = document.querySelector('[data-testid="inline-files"]')
+        return Boolean(files) && !files.querySelector(".gg-status")
+      },
+      null,
+      { timeout: 20_000 },
+    ).catch(() => {})
+    await waitRaf(page, 3)
+
+    const initial = await inlineLayoutSnapshot(page)
+    const initialOverflow = await page.evaluate(() => {
+      const slot = document.querySelector('[data-testid="inline-slot"]')
+      const body = document.querySelector(".gg-row-slot-body")
+      return {
+        slot: slot ? slot.scrollWidth - slot.clientWidth : null,
+        body: body ? body.scrollWidth - body.clientWidth : null,
+        doc: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      }
+    })
+    const infoWidth = initial.box.info?.width ?? 0
+    const filesWidth = initial.box.files?.width ?? 0
+    const bodyWidth = initial.box.body?.width ?? 0
+    const longestText = [...initial.text].sort((a, b) => b.text.length - a.text.length)[0]
+    const wrappingEnabled = initial.text.every((entry) => entry.whiteSpace !== "nowrap")
+    const textNoClip = initial.text.every(
+      (entry) => entry.scrollWidth <= entry.clientWidth + 1 && entry.fullyVisible,
+    )
+    const wrappedExercise =
+      !longestText || longestText.text.length < 80 || (longestText.lines ?? 0) >= 2
+    metrics.inlineLayout = {
+      candidate: { index: candidate.index, subject: candidate.commit.subject, files: candidate.files.length },
+      initial,
+      initialOverflow,
+    }
+    checkResult(
+      checks,
+      "inline layout has a real left/middle divider and no horizontal overflow",
+      initial.slotPresent &&
+        initial.dividerPresent &&
+        initial.dividerWidth !== null &&
+        initial.dividerWidth >= COLUMN_DIVIDER_MIN_WIDTH &&
+        initial.dividerWidth <= COLUMN_DIVIDER_MAX_WIDTH &&
+        initialOverflow.slot <= 1 &&
+        initialOverflow.body <= 1 &&
+        initialOverflow.doc === 0,
+      { dividerSelector: initial.dividerSelector, dividerWidth: initial.dividerWidth, initialOverflow },
+    )
+    checkResult(
+      checks,
+      "inline left info column is wider and the file column is narrower",
+      infoWidth >= 200 &&
+        bodyWidth > 0 &&
+        initial.ratio >= 0.28 &&
+        initial.ratio <= 0.62 &&
+        filesWidth <= bodyWidth * 0.72,
+      { infoWidth, filesWidth, bodyWidth, ratio: initial.ratio, infoStyle: initial.infoStyle },
+    )
+    checkResult(
+      checks,
+      "inline left info text wraps without ellipsis or clipping and shows multiple lines when long",
+      initial.infoScroll !== null &&
+        initial.infoScroll.scrollWidth <= initial.infoScroll.clientWidth + 1 &&
+        wrappingEnabled &&
+        textNoClip &&
+        wrappedExercise &&
+        initial.text.every((entry) => entry.noEllipsis),
+      { infoScroll: initial.infoScroll, text: initial.text, longestText, wrappingEnabled, textNoClip, wrappedExercise },
+    )
+    checkResult(
+      checks,
+      "inline Date uses YYYY-MM-DD HH:mm with the original ISO tooltip",
+      Boolean(initial.date) &&
+        /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(initial.date.text) &&
+        initial.date.text.length === 16 &&
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(initial.date.title ?? ""),
+      initial.date,
+    )
+
+    const moved = await dragInlineDivider(page, 110)
+    const movedOverflow = await page.evaluate(() => {
+      const slot = document.querySelector('[data-testid="inline-slot"]')
+      const doc = document.documentElement
+      return {
+        slot: slot ? slot.scrollWidth - slot.clientWidth : null,
+        doc: doc.scrollWidth - doc.clientWidth,
+      }
+    })
+    metrics.inlineLayout.moved = { ...moved, movedOverflow }
+    checkResult(
+      checks,
+      "dragging the inline divider changes the info/files ratio without overflowing",
+      moved.after.ratio !== null &&
+        moved.before.ratio !== null &&
+        Math.abs(moved.after.ratio - moved.before.ratio) >= 0.02 &&
+        movedOverflow.slot <= 1 &&
+        movedOverflow.doc === 0,
+      { before: moved.before.ratio, after: moved.after.ratio, movedOverflow },
+    )
+
+    const dividerControl = page.locator('[data-testid="inline-split"]').first()
+    await dividerControl.focus()
+    await page.keyboard.press("Home")
+    await waitRaf(page, 2)
+    const minimum = await inlineLayoutSnapshot(page)
+    await page.keyboard.press("End")
+    await waitRaf(page, 2)
+    const maximum = await inlineLayoutSnapshot(page)
+    const minRatio = minimum.ratio
+    const maxRatio = maximum.ratio
+    const minAria = minimum.dividerAriaNow
+    const maxAria = maximum.dividerAriaNow
+    metrics.inlineLayout.clamp = {
+      minRatio,
+      maxRatio,
+      minAria,
+      maxAria,
+      ariaMin: maximum.dividerAriaMin,
+      ariaMax: maximum.dividerAriaMax,
+      min: minimum.box.info,
+      max: maximum.box.info,
+    }
+    checkResult(
+      checks,
+      "inline divider clamps the info ratio to 25%-60% with Home/End",
+      minAria === 25 &&
+        maxAria === 60 &&
+        maximum.dividerAriaMin === 25 &&
+        maximum.dividerAriaMax === 60 &&
+        minRatio !== null &&
+        maxRatio !== null &&
+        minRatio >= INLINE_INFO_MIN_RATIO - 0.03 &&
+        minRatio <= INLINE_INFO_MIN_RATIO + 0.08 &&
+        maxRatio >= INLINE_INFO_MAX_RATIO - 0.15 &&
+        maxRatio <= INLINE_INFO_MAX_RATIO + 0.05 &&
+        maxRatio > minRatio,
+      { minRatio, maxRatio, minAria, maxAria, ariaMin: maximum.dividerAriaMin, ariaMax: maximum.dividerAriaMax },
+    )
+
+    const savedAria = maximum.dividerAriaNow
+    const savedWidth = maximum.box.info?.width ?? null
+    await page.locator(`.gg-graph-row[data-index="${candidate.index}"] .gg-subject`).click()
+    await page.waitForFunction(() => !document.querySelector('[data-testid="inline-slot"]'), null, { timeout: 10_000 })
+    await page.locator(`.gg-graph-row[data-index="${candidate.index}"] .gg-subject`).click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await waitRaf(page, 3)
+    const reopened = await inlineLayoutSnapshot(page)
+    metrics.inlineLayout.reopened = reopened
+    checkResult(
+      checks,
+      "inline info/files ratio persists for the session after collapse/reopen",
+      savedAria === 60 &&
+        reopened.dividerAriaNow === savedAria &&
+        reopened.box.info !== null &&
+        reopened.box.info.width > 0 &&
+        reopened.box.body !== null &&
+        reopened.box.body.width > 0,
+      { savedAria, reopenedAria: reopened.dividerAriaNow, savedWidth, reopened: reopened.box.info },
+    )
+    await screenshot(page, "18b-fr-inline-layout.png", { fullPage: true })
+  } catch (error) {
+    checkResult(checks, "inline layout scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+  }
 }
 
 async function selectedFilterScenario(browser, tempRepo, checks, metrics) {
@@ -2797,7 +3461,7 @@ async function slotResizeScenario(browser, frPrimary, checks, metrics) {
     const page = await context.newPage()
     await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
     await page.waitForFunction(
-      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
       null,
       { timeout: 30_000 },
     )
@@ -2843,11 +3507,23 @@ async function slotResizeScenario(browser, frPrimary, checks, metrics) {
     await waitRaf(page, 2)
 
     const initial = await slotSnapshot(page)
+    const slotDecoration = await hoverDecoration(page, SLOT_HANDLE_SELECTOR)
+    metrics.slotResize = { initial, slotDecoration }
+    const handleSpansSlot =
+      Boolean(initial.handle && initial.slot) &&
+      Math.abs(initial.handle.left - initial.slot.left) <= 1.5 &&
+      Math.abs(initial.handle.right - initial.slot.right) <= 1.5 &&
+      Math.abs(initial.handle.bottom - initial.slot.bottom) <= 1.5 &&
+      initial.handle.height >= 1 &&
+      initial.handle.height <= 12
     checkResult(
       checks,
-      "inline slot exposes a bottom resize handle outside the scroll area",
-      initial.slotPresent && initial.handleCount === 1 && Boolean(initial.handle),
-      initial,
+      "inline slot bottom divider is the full-line resize hit area with no separate small widget",
+      initial.slotPresent &&
+        initial.handleCount === 1 &&
+        handleSpansSlot &&
+        !slotDecoration.smallWidgetInside,
+      { slot: initial.slot, handle: initial.handle, slotDecoration },
     )
 
     const minDrag = await dragSlotHandle(page, -4000)
@@ -2920,6 +3596,8 @@ async function slotResizeScenario(browser, frPrimary, checks, metrics) {
     metrics.slotResize = {
       candidate,
       initial: initial.slotHeight,
+      initialHandle: initial.handle,
+      slotDecoration,
       minHeight,
       maxHeight,
       reopened: reopened.slotHeight,
@@ -2993,7 +3671,11 @@ async function slotBottomFollowScenario(browser, tempRepo, checks, metrics) {
       shrunk.handle !== null &&
       shrunk.handle.top >= 0 &&
       shrunk.handle.bottom <= viewport.height
-    checkResult(checks, "bottom-follow handle is actually visible at the scroller bottom", handleVisible, { before: before.handle, shrunk: shrunk.handle, viewportHeight: viewport.height })
+    const handleFullLine =
+      Boolean(before.slot && before.handle) &&
+      Math.abs(before.handle.left - before.slot.left) <= 1.5 &&
+      Math.abs(before.handle.right - before.slot.right) <= 1.5
+    checkResult(checks, "bottom-follow handle is a visible full-line hit area at the scroller bottom", handleVisible && handleFullLine, { before: before.handle, shrunk: shrunk.handle, viewportHeight: viewport.height, handleFullLine })
     checkResult(
       checks,
       "slot drag clamps to the 96px minimum height at the bottom",
@@ -3037,7 +3719,7 @@ async function uncommittedCleanScenario(browser, frPrimary, checks, metrics) {
     const page = await context.newPage()
     await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
     await page.waitForFunction(
-      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
       null,
       { timeout: 30_000 },
     )
@@ -3118,7 +3800,7 @@ async function uncommittedScenario(browser, tempRepo, checks, metrics) {
       checks,
       "Uncommitted row expands Staged/Unstaged/Untracked/Conflicted groups",
       ["Staged", "Unstaged", "Untracked", "Conflicted"].every((label) =>
-        opened.groups.some((text) => new RegExp(`(?:^|[\\s▾▸])${label}(?:\\s|\\d|$)`, "i").test(text)),
+        opened.groups.some((text) => new RegExp(`(?:^|[\\s\\u25BE\\u25B8])${label}(?:\\s|\\d|$)`, "i").test(text)),
       ),
       { groups: opened.groups },
     )
@@ -3448,7 +4130,7 @@ async function frFetchGuardScenario(browser, frPrimary, checks, metrics) {
     })
     await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
     await page.waitForFunction(
-      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
       null,
       { timeout: 30_000 },
     )
@@ -3578,6 +4260,7 @@ async function auditSelectors(browser, base, label, minimumOptions) {
   await inlineRow.locator(".gg-subject").click().catch(() => {})
   await waitForAny(page, SELECTORS.inlineSlot).catch(() => null)
   await auditGroup("inline-slot", [...SELECTORS.slotResizeHandle])
+  await auditGroup("inline-divider", [...SELECTORS.inlineInfoDivider])
   await openBranchSelector(page)
   await auditGroup("branch-selector", [
     ...SELECTORS.branchFilter,
@@ -3605,6 +4288,7 @@ async function auditSelectors(browser, base, label, minimumOptions) {
     '[data-testid="graph-scroll"]',
     '[data-testid="first-parent"]',
     '[data-testid="jump-head"]',
+    '[data-testid="dense-graph"]',
     LEGACY_CHANGES_SELECTOR,
   ])
   const alternatives = [
@@ -3676,7 +4360,7 @@ async function fullRun(browser, executablePath) {
     await fr.goto(FR_BASE, { waitUntil: "domcontentloaded" })
     await fr.reload({ waitUntil: "domcontentloaded" })
     await fr.waitForFunction(
-      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
       null,
       { timeout: 30_000 },
     )
@@ -3687,8 +4371,110 @@ async function fullRun(browser, executablePath) {
       ? frRepos.find((repo) => repo.name === FR_REPO_NAME)
       : frRepos.find((repo) => repo.type === "normal")
     if (!frPrimary) throw new Error("FR primary repository was not found")
-    metrics.repositories = { count: frRepos.length, worktrees: frRepos.filter((repo) => repo.type === "worktree").length }
-    checkResult(checks, "FR picker has 16 repositories and 4 worktrees", frRepos.length === 16 && metrics.repositories.worktrees === 4, metrics.repositories)
+    const worktreeRepos = frRepos.filter((repo) => repo.type === "worktree")
+    const optionEntries = await fr
+      .locator(`${SELECTORS.repository[0]} option`)
+      .evaluateAll((options) =>
+        options
+          .map((option) => ({ value: option.value, label: (option.textContent ?? "").trim() }))
+          .filter((option) => option.value.length > 0),
+      )
+    const selectedBefore = await fr.locator(SELECTORS.repository[0]).inputValue()
+    const initialRows = await fr.locator(SELECTORS.row[0]).count()
+    const initialBranch = await fr.locator(SELECTORS.currentBranch[0]).innerText().catch(() => "")
+    const initialFooter = await fr.locator(".gg-history-footer").innerText().catch(() => "")
+    const repositoryLoads = []
+    for (const option of optionEntries) {
+      if (option.value === selectedBefore) {
+        repositoryLoads.push({
+          id: option.value,
+          label: option.label,
+          type: frRepos.find((repo) => repo.id === option.value)?.type ?? null,
+          selectedOk: true,
+          rows: initialRows,
+          branch: initialBranch.trim(),
+          footer: initialFooter.replace(/\s+/g, " ").trim(),
+          errors: [],
+          initial: true,
+        })
+        continue
+      }
+      const statusRequest = fr
+        .waitForRequest(
+          (request) => {
+            if (!request.url().endsWith("/__gg/rpc/getStatus")) return false
+            return parseInput(request)?.repositoryId === option.value
+          },
+          { timeout: 20_000 },
+        )
+        .catch(() => null)
+      await fr.locator(SELECTORS.repository[0]).selectOption(option.value)
+      await statusRequest
+      await waitNotBusy(fr, 20_000).catch(() => {})
+      await waitRows(fr, 1, 20_000).catch(() => {})
+      const state = await fr.evaluate(() => ({
+        selected: document.querySelector('[data-testid="repository-select"]')?.value ?? null,
+        rows: document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)").length,
+        branch: (document.querySelector('[data-testid="current-branch"]')?.textContent ?? "").trim(),
+        footer: (document.querySelector(".gg-history-footer")?.innerText ?? "").replace(/\s+/g, " ").trim(),
+        errors: [...document.querySelectorAll(".gg-error")].map((element) =>
+          (element.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 160),
+        ),
+      }))
+      repositoryLoads.push({
+        id: option.value,
+        label: option.label,
+        type: frRepos.find((repo) => repo.id === option.value)?.type ?? null,
+        selectedOk: state.selected === option.value,
+        rows: state.rows,
+        branch: state.branch,
+        footer: state.footer,
+        errors: state.errors,
+        initial: false,
+      })
+    }
+    const worktreeLabels = worktreeRepos.map((repo) => {
+      const option = optionEntries.find((entry) => entry.value === repo.id)
+      return {
+        id: repo.id,
+        label: option?.label ?? null,
+        hasWorktreeLabel: Boolean(option && /\(worktree\)/i.test(option.label)),
+      }
+    })
+    metrics.repositories = {
+      count: frRepos.length,
+      worktrees: worktreeRepos.length,
+      worktreeLabels: worktreeRepos.length > 0 ? worktreeLabels : "notPresent",
+      options: optionEntries.length,
+      loads: repositoryLoads,
+    }
+    const repositoryLoaded = (entry) =>
+      entry.selectedOk &&
+      entry.branch.length > 0 &&
+      entry.errors.length === 0 &&
+      (entry.rows > 0 || /\b0 loaded\b/.test(entry.footer))
+    checkResult(
+      checks,
+      "FR repository picker loads every repository and labels worktrees when present",
+      frRepos.length >= 1 &&
+        optionEntries.length === frRepos.length &&
+        repositoryLoads.length === optionEntries.length &&
+        repositoryLoads.every(repositoryLoaded) &&
+        (worktreeRepos.length === 0 || worktreeLabels.every((entry) => entry.hasWorktreeLabel)),
+      {
+        count: frRepos.length,
+        worktrees: worktreeRepos.length,
+        worktreeLabels: worktreeRepos.length > 0 ? worktreeLabels : "notPresent",
+        loads: repositoryLoads.map((entry) => ({
+          label: entry.label,
+          type: entry.type,
+          selectedOk: entry.selectedOk,
+          rows: entry.rows,
+          errors: entry.errors,
+          initial: entry.initial,
+        })),
+      },
+    )
     await fr.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
     await waitLoaded(fr, 100)
     await waitRows(fr, 1)
@@ -3703,8 +4489,25 @@ async function fullRun(browser, executablePath) {
     const layout = await layoutSnapshot(fr)
     metrics.layout1100 = layout
     checkResult(checks, "graph starts at 240px with a resize handle and no graph scrollbar", layout.graph.headerWidth === 240 && layout.graph.rowWidth === 240 && layout.graph.handleCount >= 1 && !layout.graph.hasGraphScroll && layout.graph.scrollWidth <= layout.graph.clientWidth, layout.graph)
-    checkResult(checks, "Date shows full 19-character seconds, default 150px and an ISO tooltip", layout.date.visible && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(layout.date.text) && Math.abs(layout.date.width - 150) <= 1 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(layout.date.title ?? ""), layout.date)
+    checkResult(checks, "Date shows a 16-character YYYY-MM-DD HH:mm value and an ISO tooltip", layout.date.visible && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(layout.date.text) && layout.date.text.length === 16 && layout.date.scrollWidth <= layout.date.clientWidth + 1 && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(layout.date.title ?? ""), layout.date)
     checkResult(checks, "1100px has no body/panel horizontal overflow or nested buttons", layout.doc.scrollWidth <= layout.doc.clientWidth && layout.body.scrollWidth <= layout.body.clientWidth && layout.panelOverflowX <= 1 && layout.nestedButtons === 0, { doc: layout.doc, body: layout.body, panelOverflow: layout.panelOverflowX, nestedButtons: layout.nestedButtons })
+    const frLabelStatus = (await fetchRpc(FR_ORIGIN, "getStatus", { repositoryId: frPrimary.id })).body.result
+    const currentLabel1100 = await fullTextState(fr, SELECTORS.currentBranch[0], frLabelStatus.branch)
+    const refBadges1100 = await refBadgeSnapshot(fr)
+    metrics.labels1100 = { currentLabel1100, refBadges1100 }
+    checkResult(
+      checks,
+      "current-branch and visible ref badges show full names without ellipsis at 1100px",
+      currentLabel1100.present &&
+        currentLabel1100.includesName &&
+        currentLabel1100.noEllipsis &&
+        currentLabel1100.fullyVisible &&
+        refBadges1100.badges.every(
+          (badge) => badge.noEllipsis && (badge.fullyVisible || badge.multiline),
+        ) &&
+        (refBadges1100.more === null || /^\+\d+$/.test(refBadges1100.more)),
+      { currentLabel1100, refBadges1100 },
+    )
     await screenshot(fr, "01-fr-graph-date-1100.png", { fullPage: true })
 
     const frLog = (await fetchRpc(FR_ORIGIN, "getLog", { repositoryId: frPrimary.id, limit: 100 })).body.result
@@ -3719,7 +4522,8 @@ async function fullRun(browser, executablePath) {
         graphClientWidth: row.querySelector(".gg-row-graph")?.clientWidth,
       }))
       const expectedParents = frLog.commits[mergeIndex].parents.length
-      checkResult(checks, "dense graph keeps parent edges and fits the graph column", mergeInfo.paths >= expectedParents && mergeInfo.graphScrollWidth <= mergeInfo.graphClientWidth, { ...mergeInfo, expectedParents })
+      const mergeDense = await fr.locator('[data-testid="dense-graph"]').count()
+      checkResult(checks, "dense graph keeps parent edges, fits the graph column and has no dense hint", mergeInfo.paths >= expectedParents && mergeInfo.graphScrollWidth <= mergeInfo.graphClientWidth && mergeDense === 0, { ...mergeInfo, expectedParents, mergeDense })
       await fr.locator(SELECTORS.historyScroll[0]).evaluate((element) => { element.scrollTop = 0 })
       await waitRaf(fr, 2)
     } else {
@@ -3727,14 +4531,68 @@ async function fullRun(browser, executablePath) {
     }
 
     const nonGraphHandles = ["description", "date", "author", "commit"]
+    const nonGraphDividers = []
     for (const name of nonGraphHandles) {
+      nonGraphDividers.push({ name, geometry: await columnDividerGeometry(fr, name) })
       const drag = await dragColumn(fr, name, 12)
       checkResult(checks, `${name} column drag changes width`, Math.abs(drag.after - drag.before) > 1, drag)
     }
+    const nonGraphDecoration = []
+    for (const name of nonGraphHandles) {
+      nonGraphDecoration.push({ name, decoration: await hoverDecoration(fr, COLUMN_DIVIDER_SELECTOR(name)) })
+    }
+    const nonGraphSync = await columnSync(fr)
+    metrics.columnDividers = { nonGraphDividers, nonGraphDecoration, nonGraphSync }
+    checkResult(
+      checks,
+      "header column dividers are ~5px hit areas without separate handle ornaments",
+      nonGraphDividers.every(
+        (entry) =>
+          entry.geometry.present &&
+          entry.geometry.width >= COLUMN_DIVIDER_MIN_WIDTH &&
+          entry.geometry.width <= COLUMN_DIVIDER_MAX_WIDTH &&
+          entry.geometry.boundaryDelta !== null &&
+          entry.geometry.boundaryDelta <= 4 &&
+          entry.geometry.cursor === "col-resize" &&
+          !entry.geometry.ornament,
+      ) && nonGraphDecoration.every((entry) => !entry.decoration.smallWidgetInside),
+      { nonGraphDividers, nonGraphDecoration },
+    )
+    checkResult(
+      checks,
+      "header and history row widths stay in sync after column divider drags",
+      nonGraphSync.length >= 4 && nonGraphSync.every((entry) => entry.row !== null && entry.delta <= 1),
+      nonGraphSync,
+    )
     const afterResize = await layoutSnapshot(fr)
     metrics.afterResize = afterResize
     checkResult(checks, "non-graph column drags do not overflow the panel", afterResize.panelOverflowX <= 1 && afterResize.doc.scrollWidth <= afterResize.doc.clientWidth, { panelOverflow: afterResize.panelOverflowX, doc: afterResize.doc })
     await screenshot(fr, "02-fr-columns-after-drag.png", { fullPage: true })
+
+    const persistedBefore = await columnSync(fr)
+    await fr.reload({ waitUntil: "domcontentloaded" })
+    await fr.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
+      null,
+      { timeout: 30_000 },
+    )
+    await fr.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+    await waitLoaded(fr, 100)
+    await waitRows(fr, 1)
+    await waitNotBusy(fr)
+    await fr.locator('[data-testid="harness-width-1100"]').click()
+    await fr.waitForFunction(
+      () => document.querySelector('[data-testid="harness-panel-shell"]')?.dataset.panelWidth === "1100",
+      null,
+      { timeout: 15_000 },
+    )
+    await waitRaf(fr, 2)
+    const persistedAfter = await columnSync(fr)
+    const persistedAll = persistedBefore.every((entry) => {
+      const match = persistedAfter.find((candidate) => candidate.label === entry.label)
+      return match && Math.abs(match.header - entry.header) <= 2 && match.delta <= 1
+    })
+    checkResult(checks, "column widths persist across reload and stay header/row synced", persistedAll, { before: persistedBefore, after: persistedAfter })
 
     await fr.locator('[data-testid="harness-width-520"]').click()
     await fr.waitForFunction(
@@ -3747,6 +4605,27 @@ async function fullRun(browser, executablePath) {
     metrics.layout520 = narrow
     checkResult(checks, "520px has no horizontal overflow and no nested buttons", narrow.doc.scrollWidth <= narrow.doc.clientWidth && narrow.body.scrollWidth <= narrow.body.clientWidth && narrow.panelOverflowX <= 1 && narrow.nestedButtons === 0, { doc: narrow.doc, body: narrow.body, panelOverflow: narrow.panelOverflowX, nestedButtons: narrow.nestedButtons })
     checkResult(checks, "520px keeps the graph within its budget without horizontal overflow", narrow.graph.headerWidth <= 241 && narrow.graph.rowWidth <= 241 && !narrow.graph.hasGraphScroll && narrow.graph.scrollWidth <= narrow.graph.clientWidth, narrow.graph)
+    const currentLabel520 = await fullTextState(fr, SELECTORS.currentBranch[0], frLabelStatus.branch)
+    const refBadges520 = await refBadgeSnapshot(fr)
+    const dense520 = await fr.locator('[data-testid="dense-graph"]').count()
+    metrics.labels520 = { currentLabel520, refBadges520, dense520 }
+    checkResult(
+      checks,
+      "520px keeps current-branch/ref names fully visible without ellipsis or page overflow",
+      narrow.doc.scrollWidth <= narrow.doc.clientWidth &&
+        narrow.body.scrollWidth <= narrow.body.clientWidth &&
+        narrow.panelOverflowX <= 1 &&
+        currentLabel520.present &&
+        currentLabel520.includesName &&
+        currentLabel520.noEllipsis &&
+        currentLabel520.fullyVisible &&
+        refBadges520.badges.every(
+          (badge) => badge.noEllipsis && (badge.fullyVisible || badge.multiline),
+        ) &&
+        (refBadges520.more === null || /^\+\d+$/.test(refBadges520.more)) &&
+        dense520 === 0,
+      { doc: narrow.doc, body: narrow.body, panelOverflow: narrow.panelOverflowX, currentLabel520, refBadges520, dense520 },
+    )
     await screenshot(fr, "03-fr-520.png", { fullPage: true })
     await fr.locator('[data-testid="harness-width-1100"]').click()
     await fr.waitForFunction(
@@ -4130,7 +5009,7 @@ async function fullRun(browser, executablePath) {
     )
     await refFailPage.goto(FR_BASE, { waitUntil: "domcontentloaded" })
     await refFailPage.waitForFunction(
-      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 16,
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
       null,
       { timeout: 30_000 },
     )
@@ -4162,6 +5041,11 @@ async function fullRun(browser, executablePath) {
       await inlineThreeColumnScenario(browser, frPrimary, checks, metrics)
     } catch (error) {
       checkResult(checks, "inline three-column scenario executes", false, { error: String(error) })
+    }
+    try {
+      await inlineLayoutScenario(browser, frPrimary, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "inline layout scenario executes", false, { error: String(error) })
     }
     try {
       await slotResizeScenario(browser, frPrimary, checks, metrics)
@@ -4239,7 +5123,7 @@ async function fullRun(browser, executablePath) {
     const tempCommit = await tempRow.getAttribute("data-commit")
     await tempRow.locator(".gg-subject").click({ button: "right" })
     await menuAction(temp, SELECTORS.commitMenu, "create-branch")
-    const branchName = `gg-release-${Date.now().toString(36)}`
+    const branchName = `gg-release-${Date.now().toString(36)}-long-branch-name-for-label-overflow-regression`
     await fillFieldIfPresent(temp, "name", branchName)
     await confirmDialog(temp)
     const tempRefsAfterCreate = (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs
@@ -4258,6 +5142,22 @@ async function fullRun(browser, executablePath) {
         { timeout: 30_000 },
       )
       checkResult(checks, "ref-menu checkout can switch to the created branch", (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result.branch === branchName, {})
+      const longLabel = await fullTextState(temp, SELECTORS.currentBranch[0], branchName)
+      const longBadge = await fullTextState(temp, SELECTORS.refBadge.join(","), branchName)
+      const longRefs = await refBadgeSnapshot(temp)
+      const longBadgeOk = longBadge.present && longBadge.includesName
+        ? longBadge.noEllipsis && (longBadge.fullyVisible || longBadge.multiline)
+        : longRefs.more !== null && /^\+\d+$/.test(longRefs.more)
+      checkResult(
+        checks,
+        "current-branch and ref badge show a long name fully without ellipsis",
+        longLabel.present &&
+          longLabel.includesName &&
+          longLabel.noEllipsis &&
+          longLabel.fullyVisible &&
+          longBadgeOk,
+        { branchName: branchName.length, longLabel, longBadge, more: longRefs.more },
+      )
       const currentBadge = await refBadgeByName(temp, branchName)
       await currentBadge.click({ button: "right" })
       await menuAction(temp, SELECTORS.refMenu, "rename-branch")
@@ -4508,6 +5408,11 @@ async function fullRun(browser, executablePath) {
     sourceMtimes: { start: sourceStart, end: sourceEnd },
     selectorAssumptions: {
       slotResizeHandle: SLOT_HANDLE_SELECTOR,
+      columnDividers: "resize-column-<graph|description|date|author|commit> (~5px header divider hit area)",
+      denseGraphAbsent: '[data-testid="dense-graph"]',
+      inlineInfoDivider: INLINE_INFO_DIVIDER_SELECTORS,
+      dateFormat: "YYYY-MM-DD HH:mm (16 chars) with the original ISO value in title",
+      labelOverflow: "current-branch and visible ref badges keep full text; +N aggregation is allowed",
       uncommittedRow: UNCOMMITTED_ROW_SELECTOR,
       uncommittedGroups: "visible group buttons labelled Staged/Unstaged/Untracked/Conflicted",
       legacyChangesAbsent: LEGACY_CHANGES_SELECTOR,

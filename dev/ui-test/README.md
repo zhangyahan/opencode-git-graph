@@ -76,7 +76,48 @@ node dev/ui-test/release.mjs --audit
 The historical 0.2.1 baseline remains **131/131 PASS**. The extended run on the
 frozen 0.2.2 build completed as **172/172 PASS** (`gg-ui-release-extended-20261110-195711`):
 the 128 still-applicable historical checks plus the new scenarios below. The
-selectors in this document are the frozen names used by that run.
+selectors listed in that historical section are the names used by that run.
+
+#### Next-freeze refinements (executed)
+
+`release.mjs` encodes the layout refinements listed below. The frozen run on the
+current fixture completed **188/188 checks** (172 baseline + 16 refinements).
+The FR picker assertion is environment-independent: at least one repository,
+every dropdown option loads/switches, and worktree labels are checked only when
+worktrees exist. This fixture reports 12 repositories / 0 worktrees and records
+worktree labels as `notPresent`; that is a pass, not a lowered product threshold.
+
+| refinement | environment | what the script asserts |
+| --- | --- | --- |
+| graph crop | FR | the graph still clips right lanes, keeps the fixed 14px lane step and has no horizontal scrollbar, but `[data-testid="dense-graph"]` is absent at every width |
+| column divider itself | FR | `resize-column-<id>` (including graph) is the ~5px header divider hit area, not a separate grip; a real pointer drag changes the width; header and row widths stay in sync; widths persist across reload; 520px has no horizontal overflow |
+| date format | FR | the Date cell is exactly 16 characters in `YYYY-MM-DD HH:mm` form with no seconds and the original ISO value in `title` |
+| full labels | FR + TEMP | the top `current-branch` label and visible `ref-badge` names are not ellipsized (`text-overflow` is not `ellipsis`, and the text fits or wraps fully); `+N` aggregation is still allowed; 520px has no horizontal overflow. TEMP additionally creates and checks out a long branch name and returns to the original branch afterwards |
+| inline three columns | FR | the left info column is wider (at least 200px and at least ~28% of info+files), the file column is narrower; left info text wraps without ellipsis or clipping and shows multiple lines for long text; the left/middle divider drags to change the ratio, clamps to about 25%-60%, survives collapse/reopen, and never overflows |
+| slot bottom divider | FR + TEMP | `slot-resize-handle` is the full-width bottom divider hit area (no separate small grip); drag clamps to 96px, grows to the dynamic viewport maximum, persists for the session, and keeps bottom-follow behaviour |
+
+Regression coverage is unchanged and still runs in the same script: loading
+gates, fetch (FR 403 guard + TEMP real fetch), the Uncommitted row and its
+groups, file eye/content actions, list/tree toggles, comparison scroll/back,
+write confirmation and cancellation, and the TEMP return to the original branch
+(`main` for the fixture).
+
+New selector assumptions to confirm after the freeze:
+
+| assumption | selectors currently probed |
+| --- | --- |
+| header divider is the resize hit area | `[data-testid="resize-column-<id>"]`; the script checks a 3-8px width, divider-edge alignment and the absence of a small pseudo-element grip |
+| repository picker | at least one option; every dropdown option is selected and must load (status/branch and commits or an explicit 0-loaded state); worktree options must contain `(worktree)`, and zero worktrees is recorded as `notPresent` |
+| dense hint removed | `[data-testid="dense-graph"]` must have count 0 |
+| inline left/middle divider | first present of `inline-split`, `inline-info-resize`, `inline-column-resize`, `inline-info-divider`, `inline-info-splitter`, `inline-resize`, `inline-splitter`, `.gg-inline-split`, `.gg-inline-info-resize`, `.gg-inline-splitter` |
+| inline info/file columns | `[data-testid="inline-info"]` plus `.gg-row-slot-files` inside `inline-slot` |
+| slot divider | `[data-testid="slot-resize-handle"]` must span the full slot width; no centered small grip |
+| full labels | `[data-testid="current-branch"]` and `[data-testid="ref-badge"]`; `[data-testid="ref-more"]` is accepted as `+N` |
+| date | 16-character text plus an ISO `title` on `commit-date` / the inline Date row |
+
+If the frozen build renames the inline divider, update only
+`INLINE_INFO_DIVIDER_SELECTORS`; the rest of the scenario is independent of the
+exact name.
 
 #### Extended scenarios (frozen and passed)
 
@@ -115,9 +156,14 @@ the audit reports them explicitly instead of silently skipping:
 | fetch response | `{ status, refsUpdated, changed, warning? }` where `refsUpdated` is a count or array |
 | status diff | `getDiff` target must be `index` or `working-tree`; the full-page surface is `commit-diff-page` (`data-diff-source` must match) with `details-back` |
 
+The next-freeze section above supersedes the 0.2.2 slot-handle row: the frozen
+build keeps `slot-resize-handle` but requires it to be the full-width bottom
+divider with no small grip. The 0.2.2 result remains historical evidence only.
+
 If any frozen name differs, adjust only the matching selector/constant and re-run
-`node dev/ui-test/release.mjs --audit` before the full run. Do not run the new
-scenarios against the WIP tree or record them as acceptance evidence.
+`node dev/ui-test/release.mjs --audit` before the full run. The frozen refinement
+run already executed against the current build; re-run the full script after any
+selector correction.
 
 Known hard points for the frozen run:
 
@@ -137,12 +183,19 @@ Known hard points for the frozen run:
 
 #### Static readiness check
 
-Before the freeze notification, only syntax/static checks are expected. The final
-frozen run additionally executed the full browser matrix via `release.mjs`:
+Static checks remain part of the release gate:
 
 ```powershell
 node --check dev/ui-test/release.mjs
+node dev/ui-test/release.mjs --audit   # confirm the new inline divider and label selectors
+node dev/ui-test/release.mjs
 ```
+
+The frozen refinement run completed **188/188 checks**; see
+`dev/UI-ACCEPTANCE.md`. The FR picker contract is dynamic: it requires at least
+one repository and verifies that every dropdown option loads/switches, with
+worktree labels only when worktrees are present. The current fixture reports
+12 repositories / 0 worktrees, so worktree labels are `notPresent`.
 
 Environment overrides:
 

@@ -61,7 +61,7 @@ export interface ColumnPreferences {
   readonly commit: number
 }
 
-/** Defaults: graph owned by the app, date wide enough for 19 characters. */
+/** Defaults: graph owned by the app, date wide enough for the 16-character stamp. */
 export const DEFAULT_COLUMN_PREFERENCES: ColumnPreferences = Object.freeze({
   graph: DEFAULT_GRAPH_COLUMN_WIDTH,
   description: 660,

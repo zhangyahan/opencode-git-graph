@@ -14,8 +14,10 @@ export function shortHash(hash: string | null | undefined): string {
 }
 
 /**
- * `2026-11-09T12:34:56+08:00` -> `2026-11-09 12:34:56` in the machine's local
- * time zone. Date-only values render as local midnight (`YYYY-MM-DD 00:00:00`);
+ * `2026-11-09T12:34:56+08:00` -> `2026-11-09 12:34` in the machine's local
+ * time zone. The minute precision keeps the cell at 16 characters, which the
+ * 128px date column renders without clipping; the full ISO value stays in the
+ * tooltip. Date-only values render as local midnight (`YYYY-MM-DD 00:00`);
  * empty values become `""` and unparsable input is returned unchanged.
  */
 export function formatCommitDate(value: string): string {
@@ -36,7 +38,7 @@ export function formatCommitDate(value: string): string {
     ) {
       return value
     }
-    return `${text} 00:00:00`
+    return `${text} 00:00`
   }
 
   const date = new Date(text)
@@ -47,8 +49,7 @@ export function formatCommitDate(value: string): string {
   const day = pad(date.getDate())
   const hours = pad(date.getHours())
   const minutes = pad(date.getMinutes())
-  const seconds = pad(date.getSeconds())
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`
+  return `${year}-${month}-${day} ${hours}:${minutes}`
 }
 
 export function formatRefLabel(ref: string): string {

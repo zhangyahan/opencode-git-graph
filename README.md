@@ -2,14 +2,15 @@
 
 面向 OpenCode Desktop 的 Git 侧边栏插件：仓库切换、提交拓扑图、History 顶部未提交变更行、内联 Commit 三栏（提交信息 / 文件列表 / 视图切换）、可调高的内联展开槽、整页只读 Unified Diff，以及经确认的本地 Git 写操作与 **Fetch**。它是受 [mhutchie.git-graph](https://github.com/mhutchie/vscode-git-graph) 启发的**独立实现**，不是该扩展的移植版，也不是完整功能复刻。
 
-`0.2.1` 是已发布基线：**生产读操作 + 确认式本地 mutation**（checkout / create / rename / delete merged branch / create / delete lightweight & annotated tag），并包含可拖宽 Graph 列、内联三栏提交详情与 commit 版本文件内容查看。`0.2.2` 在此基础上新增**未提交变更顶部行、内联展开高度拖拽、确认式 Fetch（下载远程更新）**与统一 branch 图标，并移除 First parent 控件、Jump HEAD 按钮与 `Ctrl/Cmd+H` 绑定；最终 UI 验收见 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。仍不提供 pull/push、stash、rebase/reset/cherry-pick/revert 等能力。
+`0.2.1` 是已发布基线：**生产读操作 + 确认式本地 mutation**（checkout / create / rename / delete merged branch / create / delete lightweight & annotated tag），并包含可拖宽 Graph 列、内联三栏提交详情与 commit 版本文件内容查看。`0.2.2` 在此基础上新增**未提交变更顶部行、内联展开高度拖拽、确认式 Fetch（下载远程更新）**与统一 branch 图标，并移除 First parent 控件、Jump HEAD 按钮与 `Ctrl/Cmd+H` 绑定；最终 UI 验收见 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。`0.2.3` 进一步细化 UI：Graph 裁剪不再显示 dense 提示；列宽改为拖拽表头常显分割线上的 5px 命中区，没有独立把手；Date 精确到 `YYYY-MM-DD HH:mm`（16 字符，ISO 原值保留在 tooltip）；分支与 ref 名称完整显示不省略；内联三栏的信息列约占 40%（最小 200px）并可通过分割线拖动，比例在本面板会话内记忆；内联槽高度改为拖拽整条底边横线。仍不提供 pull/push、stash、rebase/reset/cherry-pick/revert 等能力。
 
 ## 当前状态
 
+- `0.2.3` 的最终 release UI 验收为 **188/188 PASS，0 failed**：在 FR 只读真实仓库环境与隔离 TEMP mutation/content fixture 两个环境中，以真实浏览器、真实生产面板和真实 RepositoryManager / RPC 路径执行（非 mock 数据）。188 项由历史 172 项回归基线加 16 项细化断言组成；FR 仓库数量按环境动态读取（本机为 12 个仓库 / 0 worktree，worktree 标签记为 `notPresent`），不再硬编码旧 fixture 形状。证据为 `gg-ui-release-refined-20261111-201722`（仅保存在批准的 TEMP 目录，不提交）。
+- `0.2.2` 的历史 release UI 验收为 **172/172 PASS，0 failed**：历史 131 项中有 128 项仍然适用并通过，3 项 First parent / Jump HEAD 断言由“控件不存在 + `Ctrl+H` 不发请求”的断言替代；新增 Uncommitted 顶部行、内联槽高度拖拽、index/working-tree diff 与 Fetch 确认/本地 bare remote 流程。证据为 `gg-ui-release-extended-20261110-195711`（仅保存在批准的 TEMP 目录，不提交）。
 - `0.2.1` 的 release UI 验收为 **131/131 PASS，0 failed**：在 FR 只读真实仓库环境与隔离 TEMP mutation/content fixture 两个环境中，以真实浏览器、真实生产面板和真实 RepositoryManager / RPC 路径执行（非 mock 数据）。这是已发布基线的历史结论，记录在 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。
-- `0.2.2` 的最终 release UI 验收为 **172/172 PASS，0 failed**：历史 131 项中有 128 项仍然适用并通过，3 项 First parent / Jump HEAD 断言由本轮“控件不存在 + `Ctrl+H` 不发请求”的断言替代；新增 Uncommitted 顶部行、内联槽高度拖拽、index/working-tree diff 与 Fetch 确认/本地 bare remote 流程。证据为 `gg-ui-release-extended-20261110-195711`（仅保存在批准的 TEMP 目录，不提交）。
-- 自动化验证：**446 tests passed，1 platform-specific skip**（Windows 专用路径用例在其他平台跳过）；`npm run typecheck`、`npm run build`、`git diff --check` 均通过。`0.2.1` 基线的 418 passed / 1 skip 仅作历史参照。
-- 172/172（以及历史 131/131）只代表该 harness 交互矩阵，**不等于原生 Desktop 全链路 E2E**。真实 Desktop 的会话/scope 切换、窗口与面板 chrome、`MenuItem` 注册、宿主主题/事件总线、真实 Desktop 面板 resize 未被该 harness 覆盖，需要用户在实际 Desktop 中 `/reload` 后人工确认。
+- 自动化验证：**459 tests passed，1 platform-specific skip**（Windows 专用路径用例在其他平台跳过）；`npm run typecheck`、`npm run build`、`git diff --check` 均通过。`0.2.2` 的 446 passed / 1 skip 与 `0.2.1` 的 418 passed / 1 skip 仅作历史参照。
+- 188/188（以及历史 172/172、131/131）只代表该 harness 交互矩阵，**不等于原生 Desktop 全链路 E2E**。真实 Desktop 的会话/scope 切换、窗口与面板 chrome、`MenuItem` 注册、宿主主题/事件总线、真实 Desktop 面板 resize 未被该 harness 覆盖，需要用户在实际 Desktop 中 `/reload` 后人工确认。
 - 本版本不是 mhutchie.git-graph 的完整功能复刻：网络目前只有 Fetch（下载远程更新），pull/push、remote 管理、stash、merge/rebase/reset/cherry-pick/revert 等仍未实现（见“明确未实现”）。能力边界详见 [`docs/FEATURE-PARITY.md`](docs/FEATURE-PARITY.md)。
 
 ## 功能概览
@@ -22,7 +23,7 @@
   - **Checkout**：仅列本地分支；每个 checkout 都走独立确认对话框，绝不因为 filter 选中某个 ref 而改变 HEAD。
 - 工具栏提供 Remotes / Tags 开关、`Date` / `Topo` 历史顺序，以及 **Fetch** 按钮。显式选中的 ref 优先于 show 开关；merge commit 的详情仍保留全部 parent。
 - **First parent 控件与 Jump HEAD 按钮已移除**，`Ctrl/Cmd+H` 不再绑定跳转 HEAD；`Ctrl/Cmd+F` 搜索、`Ctrl/Cmd+R` 刷新仍然保留。
-- ref badge 支持单击与右键打开类型化菜单；超出显示数量的 ref 汇总为 `+N` 菜单。菜单动作包括 View history（仅设置 filter）、Copy、Create branch here，以及适用时的 Checkout / Rename branch / Delete branch / Delete tag。
+- ref badge 支持单击与右键打开类型化菜单；超出显示数量的 ref 汇总为 `+N` 菜单。当前分支标签与可见 ref 名称**完整显示、不省略**：当前分支可换行，refs 组在自身区域内横向滚动而不裁切单个名称，聚合 `+N` 行为保留。菜单动作包括 View history（仅设置 filter）、Copy、Create branch here，以及适用时的 Checkout / Rename branch / Delete branch / Delete tag。
 - “View history”与“Checkout”严格分离：前者只改 filter，后者必须经过确认对话框。
 
 ### 未提交变更（History 顶部行）
@@ -36,19 +37,19 @@
 ### Graph 与列布局
 
 - **Graph 列默认 240px，可拖动 96–400px**，宽度偏好持久化到 `localStorage`；存储不可用或数据损坏时安全回退默认值。
-- 轨道间距**恒为 14px**，不会因列变窄而压缩。列宽不足时右侧分支被**裁剪隐藏**，但 SVG 仍按完整内容宽度渲染；历史列表**绝不出现横向滚动条**。出现裁剪时显示 dense graph 提示，引导用户把 Graph 列拖宽，或用 Branches filter 降低密度。
-- Description / Date / Author / Commit 四列同样可拖动改宽并持久化；窄侧边栏（默认 520px）自动隐藏 Date / Author，但保存的宽屏偏好不被破坏。列头使用 Title Case（Graph / Description / Date / Author / Commit），列间常显竖分割线。
+- 轨道间距**恒为 14px**，不会因列变窄而压缩。列宽不足时右侧分支被**裁剪隐藏**，但 SVG 仍按完整内容宽度渲染；历史列表**绝不出现横向滚动条**，也**不再显示 dense graph 提示**或提供“Filter branches”引导条。
+- Description / Date / Author / Commit 四列同样可拖动改宽并持久化；窄侧边栏（默认 520px）自动隐藏 Date / Author，但保存的宽屏偏好不被破坏。列头使用 Title Case（Graph / Description / Date / Author / Commit）。拖拽命中区就是表头**常显竖分割线**上的 5px 透明条（分割线本身就是拖动 affordance），没有独立把手或 hover 装饰；拖动时表头与数据行宽度保持同步。
 - 固定 28px 行高、SVG 提交图、自实现虚拟滚动；滚动接近底部自动加载下一页，同时保留手动 **Load more** 与失败后的 **Retry**。自动加载有单次触发守卫，失败后不会在底部无限自动重试。
 - 搜索只针对**已加载**的 commit：高亮匹配行、淡化其余行，不改变拓扑或行数；`Enter` 跳到首匹配，`Esc` 清空。`Ctrl/Cmd+F` 聚焦搜索，`Ctrl/Cmd+R` 刷新，`Shift+F10` 打开 commit 菜单，`Esc` 依次关闭菜单 / Branches / Fetch / 比较 / 整页 diff。没有 First parent 控件、Jump HEAD 按钮或 `Ctrl/Cmd+H` 绑定；也没有实现 Ctrl/Cmd+S stash、上下提交导航或整库搜索。
 
 ### Date 与排序
 
-- Date 列显示 **authorDate 的本地时区时间**，格式固定为 `YYYY-MM-DD HH:mm:ss`；原始 ISO 时间保留在单元格 title 中。date-only 与无效输入有安全回退，不使用宿主 locale 改写格式。
+- Date 列显示 **authorDate 的本地时区时间**，格式固定为 `YYYY-MM-DD HH:mm`（**16 字符、不含秒**，列宽内完整显示）；原始 ISO 时间保留在单元格 title 中，内联详情行同样使用 16 字符值与 ISO tooltip。date-only 与无效输入有安全回退，不使用宿主 locale 改写格式。
 - 历史排序使用 **git commit date**：默认 `--date-order`（保证父提交晚于子提交，同时减少 merge-heavy 历史的轨道膨胀），可选 `--topo-order`。这与 Date 列展示的 authorDate 不是同一个时间字段；当前没有 author-date-order 选项。
 
 ### Commit 详情、整页 diff 与比较
 
-- 点击 commit 在同行下方展开**内联三栏**：左列显示提交信息（subject、author、date、hash、parents，Full details 展开完整值）；中列是文件列表/目录树，内部独立滚动；右列是 list / tree 视图切换。再次点击 commit 折叠。
+- 点击 commit 在同行下方展开**内联三栏**：左列显示提交信息（subject、author、date、hash、parents，Full details 展开完整值），信息列默认约占槽体的 **40%**（优先最小宽度 200px，窄面板时让位给文件列），长 subject 与值**完整换行、不省略、不裁切**；中列是文件列表/目录树，内部独立滚动且比信息列更窄；右列是固定 28px 的 list / tree 视图切换。左中之间是可拖拽分割线（命中区 5px，即常显分割线本身），比例限制在 **25%–60%**，仅在本面板会话内记忆；文件列始终保留最小宽度，三栏不会横向溢出。再次点击 commit 折叠。
 - 文件行显示 status、文件名，以及 git numstat 的 `+N -M`；binary 或没有 numstat 的条目显示 `-`。点击文件名仍打开整页只读 commit diff，`Back` 返回历史并恢复滚动位置与展开状态。
 - 行尾 eye 通过 `getCommitFileContent` 查看该 commit 版本的单个文件：text 直接展示；binary、symlink、submodule（`missing`）分别提示；文本超过 1 MiB 会截断并提示，超过 20 MiB 只显示大小。deleted 条目不提供该版本视图。
 - 行尾 open current 打开工作区当前文件：优先使用公开的 `ctx.layout.open` 与 `file:` 目标；宿主不支持时退到系统默认应用；再失败则复制仓库相对路径并提示。图标点击会 `stopPropagation`，不会误选或展开 commit。
@@ -60,7 +61,7 @@
 
 ### 内联展开高度
 
-- commit 内联槽与 Uncommitted 槽底部都有拖拽手柄，可上下调整槽高；硬范围为 **96px 到 `max(96, min(560, 历史视口高度 - 80))`**，短视口不会产生小于 96px 的上限。
+- commit 内联槽与 Uncommitted 槽的**整条底边横线本身就是拖拽区**（5px 高、全宽，无独立小把手或装饰），可上下调整槽高；硬范围为 **96px 到 `max(96, min(560, 历史视口高度 - 80))`**，短视口不会产生小于 96px 的上限。
 - 调整后的高度只在当前面板会话内记忆，不写入 `localStorage`；折叠后重新展开同一 commit 或 Uncommitted 行会恢复本次会话的高度。
 - 未手动调整时按内容行数自动取高，默认封顶 260px；内容超出时槽内滚动，不把历史列表推走。
 
@@ -160,6 +161,7 @@ src/
 │  ├─ diff.ts / commit-diff-lines.ts  Unified Diff 行分类与行号
 │  ├─ virtual.ts / row-layout.ts      固定行高虚拟窗口、顶部特殊行与内联槽
 │  ├─ slot-size.ts         内联槽高度边界、默认高度与视口夹取
+│  ├─ inline-split.ts     内联三栏信息/文件分割比例与宽度约束
 │  ├─ column-layout.ts     可拖宽列布局、预算收缩与偏好持久化
 │  ├─ history-columns.ts   窄屏列可见性与详情布局
 │  ├─ commit-diff-view.tsx 整页只读 commit diff 视图
@@ -204,10 +206,10 @@ npm run build -- --watch
 
 ## 测试与验收
 
-- 自动化测试：**446 passed / 1 platform-specific skip**，新增 fetch、slot 高度、Uncommitted 行与顶部特殊行布局覆盖；覆盖范围还包括文件树、Unified Diff、虚拟滚动/行布局、分页与自动加载守卫、列布局与偏好回退、Graph 列拖拽与固定 lane 间距、内联三栏、commit 文件内容、commit diff 行号、ref 交互、日期格式化、比较、写操作安全、manager 写绑定/锁、dev harness 安全等。`0.2.1` 的 418 passed / 1 skip 仅作历史参照。
+- 自动化测试：**459 passed / 1 platform-specific skip**，本轮新增内联三栏分割比例、表头分割线拖拽与 chrome 结构回归、分钟级 Date 覆盖；覆盖范围还包括 fetch、slot 高度、Uncommitted 行与顶部特殊行布局、文件树、Unified Diff、虚拟滚动/行布局、分页与自动加载守卫、列布局与偏好回退、Graph 列拖拽与固定 lane 间距、内联三栏、commit 文件内容、commit diff 行号、ref 交互、日期格式化、比较、写操作安全、manager 写绑定/锁、dev harness 安全等。`0.2.2` 的 446 passed / 1 skip 与 `0.2.1` 的 418 passed / 1 skip 仅作历史参照。
 - 静态检查：`npm run typecheck`、`npm run build`、`git diff --check` 在本轮冻结源码上通过。
-- 最终 release UI 验收：`0.2.2` 为真实浏览器 **172/172 PASS，0 failed**（FR 只读 + 隔离 TEMP mutation/content fixture），记录在 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。已发布 `0.2.1` 的 131/131、`0.2.0` 的 93/93 与更早的 70/70 仅保留为历史基线，不是本版回归结论。
-- 172/172 覆盖真实面板、真实 Git 数据路径、真实指针/键盘输入、对比、Fetch 与 mutation 路径；不覆盖原生 Desktop 宿主集成（见“当前状态”）。
+- 最终 release UI 验收：`0.2.3` 为真实浏览器 **188/188 PASS，0 failed**（FR 只读 + 隔离 TEMP mutation/content fixture），记录在 [`dev/UI-ACCEPTANCE.md`](dev/UI-ACCEPTANCE.md)。188 项 = 历史 172 项回归基线 + 16 项细化断言；历史 `0.2.2` 的 172/172、`0.2.1` 的 131/131、`0.2.0` 的 93/93 与更早的 70/70 仅保留为历史基线，不是本版回归结论。
+- 188/188 覆盖真实面板、真实 Git 数据路径、真实指针/键盘输入、对比、Fetch 与 mutation 路径；FR 仓库数按环境动态读取（本机 12 个仓库 / 0 worktree），worktree 标签在为零时记为 `notPresent`；不覆盖原生 Desktop 宿主集成（见“当前状态”）。
 - 验收脚本与运行方式见 [`dev/ui-test/README.md`](dev/ui-test/README.md)。截图、`result.json` 等证据默认写入批准的 TEMP 目录（如 `%LOCALAPPDATA%\Temp\opencode\...`），可能包含私有仓库路径、提交信息或 diff 片段，**不得提交到版本库**，也不应写入公开文档。
 
 ## 许可说明

@@ -1,45 +1,69 @@
 # Release UI acceptance (real browser)
 
-**Verdict: PASS — 172/172 checks passed, 0 failed.**
+**Verdict: PASS — 188/188 checks passed, 0 failed.**
 
-The frozen 0.2.1 release UI was tested against two real environments:
+The frozen release UI was tested against two real environments:
 
-- **FR**: read-only fixture, 16 repositories / 4 worktrees.
+- **FR**: read-only fixture. This environment currently exposes **12 normal
+  repositories / 0 worktrees**. The picker contract is environment-independent:
+  at least one repository must exist, every dropdown repository must load and
+  switch, and worktree labels are verified only when worktrees are present
+  (`notPresent` is recorded for zero worktrees).
 - **TEMP**: isolated synthetic mutation/content fixture.
 - Real production components and the real repository manager/RPC path; normal
   repository data was not mocked.
 - Fresh real-browser loads, real pointer and keyboard input.
 
-This run revalidated the historical core subset (128 of the 131 historical
-checks still apply; the three checks that asserted first-parent / Jump-HEAD
-behavior are intentionally replaced by absence assertions in this build) and
-added the next UI slice: inline slot resizing, the Uncommitted history row with
-four working-tree groups, and the fetch confirmation/remote flow. Total: 172
-checks.
+This run keeps the historical **172-check baseline** as the regression floor and
+adds **16 refinement checks**. Total observed checks: 188; all passed. The FR
+repository count is read dynamically, so the historical 16/4 fixture is no
+longer a hard-coded precondition.
 
 This public summary is anonymized. Private repository names, absolute paths,
 commit hashes, source paths and private file/diff content are not included.
 Complete machine evidence and screenshots remain only in the operator TEMP
-`gg-ui-release-extended-20261110-195711` directory.
+`gg-ui-release-refined-20261111-201722` directory.
 
 ## Final result
 
 | Area | Result | Evidence |
 | --- | --- | --- |
-| Historical core regression | PASS | 128 of the 131 historical checks still apply and pass; the three first-parent / Jump-HEAD checks are superseded by the absence assertions. Repository discovery, history/filters/menus, comparison/Back, loading gate, FR guard, TEMP writes, binary/content fixtures, warning/afterServer paths. |
-| Inline slot resize | PASS | Real `slot-resize-handle` pointer drag: clamps to 96 px; grows to the dynamic maximum computed from the live scroller (560 px at the 900 px viewport); bottom-follow keeps the scroller pinned (distance 0) while scrollHeight/scrollTop grow together; drags away from the bottom preserve scrollTop and slot top within 1 px; height survives collapse/reopen in the same session. |
-| Uncommitted history row | PASS | The special row is above commit rows and carries no commit index/data; its counts badge matches real `getStatus` counts; a clean FR repo shows 0 files; expanding the TEMP dirty fixture reveals Staged / Unstaged / Untracked / Conflicted groups with real file rows. |
-| Index / working-tree diff | PASS | A staged file requests `getDiff` with `target.type="index"`; an unstaged file requests `target.type="working-tree"`; both open the full-page diff whose `data-diff-source` matches, and Back returns to the Uncommitted row. |
-| Legacy Changes section | PASS | The standalone `changes`/`.gg-changes-section` surface is absent in both FR and TEMP. |
-| Toolbar removal + Ctrl+H | PASS | `first-parent` and `jump-head` are absent; Ctrl+H sends no history request and opens no menu/dialog. |
-| Fetch dialog | PASS | The fetch button is enabled when remotes exist; the dialog exposes remote selector, prune, expected HEAD, cancel and confirm; cancel sends zero fetch RPCs. |
-| Local bare fetch | PASS | A real fetch against a local bare remote returns `refsUpdated: 1`, `changed: true`, an unchanged HEAD status, and refreshes the new remote-tracking ref in refs/history. |
-| Fetch failure reason | PASS | An injected 409 surfaces only the bounded `fetch_failed` reason; the injected private path never reaches the UI. |
-| FR fetch guard | PASS | A direct confirmed FR fetch returns HTTP 403 and leaves HEAD/refs unchanged; the FR UI confirmation cannot reach a valid write (the dev client hides mutation methods and the bridge still rejects the method). |
+| Historical core regression | PASS | All 172 baseline checks passed. |
+| Repository picker / FR fixture | PASS | Actual FR fixture: 12 repositories / 0 worktrees. Every one of the 12 dropdown options was selected and loaded successfully (commits/status present, no UI error); 0 worktrees is recorded as `notPresent`, so no worktree-label requirement is fabricated. The contract requires at least one repository and is independent of the old 16/4 shape. |
+| Graph crop / dense hint | PASS | `dense-graph` is absent at 1100 px, at a 120 px graph column, at 520 px and on merge rows. Lane centres keep the fixed 14 px step; no graph scroll element, legacy scrollbar, wheel scroll or scrollable ancestor; a narrow column either fits exactly or clips with `overflow-x: hidden`. |
+| Header column dividers | PASS | `resize-column-*` is a 5 px transparent hit strip ending on the always-visible divider (`boundaryDelta 2.5`), cursor `col-resize`, no pseudo-element grip or background ornament. Real pointer drags change widths; header and history-row widths stay in sync; widths persist across reload; 520 px has no horizontal overflow. |
+| Date format | PASS | Date cell renders exactly 16 characters as `YYYY-MM-DD HH:mm` with no seconds, fits without clipping, and keeps the original ISO value in `title`. The inline Date row also uses the 16-character value with the ISO tooltip on its row. |
+| Full branch/ref labels | PASS | The top `current-branch` label and visible `ref-badge` names have no `text-overflow: ellipsis` and fit or wrap fully. `+N` aggregation remains. At 520 px the labels remain fully visible with zero document/body/panel horizontal overflow. A synthetic 66-character TEMP branch was checked out, shown fully in both places, then cleaned up and returned to the original branch. |
+| Inline three columns | PASS | `inline-split` is a 5 px separator with ARIA 25–60. At 1100 px the info pane is 344 px of an 860 px body (~40%), the file pane is narrower, and a long subject wraps to 3 lines with no ellipsis or clipping. Pointer drag changes the ratio without overflow. Home/End report 25/60; the effective maximum width is additionally constrained by the file-pane minimum. The remembered 60 ratio survives collapse/reopen. |
+| Slot bottom divider | PASS | `slot-resize-handle` is the full-width 5 px bottom strip (520/520 px), no small pill/grip pseudo-element. Drag clamps to 96 px, grows to the dynamic 560 px maximum at this viewport, survives collapse/reopen, and keeps bottom-follow pinned (`distanceToBottom 0`). |
+| Fetch | PASS | FR direct confirmed fetch still returns HTTP 403. TEMP real local bare fetch returns `refsUpdated: 1`, `changed: true`, unchanged HEAD and refreshed remote-tracking refs. Injected failure exposes only the bounded reason. |
+| Uncommitted row | PASS | Counts badge matches real status counts; expanding shows Staged / Unstaged / Untracked / Conflicted with real file rows; staged opens the `index` diff and unstaged opens the `working-tree` diff; legacy standalone Changes surface is absent. |
+| File actions / list-tree | PASS | Real read-only content panels for text/binary/symlink/missing/truncated/size-only targets; deleted-file eye disabled; view action does not toggle or change selection; list/tree toggles do not collapse the row. |
+| Comparison | PASS | Plain + Ctrl/Cmd click opens real comparison files/diff from a scrolled inline state; Back restores scroll within 1 px, preserves the expanded slot and leaves no blank viewport gap. |
+| Write confirmation | PASS | Checkout cancel sends no mutation; confirmed checkout switches and returns; create/rename/delete branch and light/annotated tag create/delete update real TEMP refs; stale/unknown/dirty guards reject without changing HEAD. |
 | Console / network | PASS | 0 page errors, 0 unexpected console errors (only benign favicon 404s), 0 non-abort request failures, 0 unexpected HTTP >= 400. |
 | Source / HMR | PASS | Production source mtimes identical before/after; no HMR or reload events. |
-| TEMP cleanup | PASS | Returned to `main` with a clean worktree, no test branches/tags/remotes and no file-protocol override. |
-| FR read-only | PASS | HEAD and refs unchanged; no guard branch/tag was created. |
+| TEMP cleanup | PASS | Returned to `main` with a clean worktree; no test branches/tags/remotes or file-protocol override remained. |
+| FR read-only | PASS | HEAD and refs unchanged; no valid confirmed mutation reached the FR bridge. |
+
+## New refinement checks (16/16 PASS)
+
+1. Graph never renders the dense hint (initial, narrow, 520 px, merge row).
+2. Graph divider is the 5 px header hit strip with no separate ornament.
+3. Graph header/row widths stay in sync after resize.
+4. Non-graph dividers are 5 px header hit strips with no separate ornament.
+5. Header/row widths stay in sync after non-graph drags.
+6. Column widths persist across reload and stay synced.
+7. 520 px graph budget has no overflow and no dense hint.
+8. Date is 16 characters with the ISO tooltip.
+9. Current branch and visible ref badges are fully visible at 1100 px.
+10. Current branch and ref badges remain fully visible at 520 px with no page overflow.
+11. A 66-character TEMP branch name is fully visible in the current-branch label and ref badge.
+12. Inline left/middle separator exists and the slot has no horizontal overflow.
+13. Inline info pane is wider and the file pane narrower.
+14. Inline info text wraps with no ellipsis/clipping and shows multiple lines.
+15. Inline divider drag changes the ratio; Home/End clamp at 25/60; ratio survives collapse/reopen.
+16. Slot bottom divider is the full line with no small widget; min/max/persistence/bottom-follow pass.
 
 ## Graph metric clarification
 
@@ -52,7 +76,7 @@ clip container's `scrollWidth > clientWidth` as a failure. It verifies:
   cannot be changed;
 - no scrollable ancestor with `auto`/`scroll` overflow;
 - lane centres remain fixed at 14 px spacing;
-- the right lane field extends beyond the column, proving clipping;
+- the graph either fits the narrow column exactly or clips it with no hint/scroll;
 - a wider 320 px column exposes every lane.
 
 ## Screenshots (basenames; private TEMP only)
@@ -79,6 +103,7 @@ clip container's `scrollWidth > clientWidth` as a failure. It verifies:
 - `17b-temp-slot-bottom-follow.png`
 - `18-fr-inline-three.png`
 - `18-fr-uncommitted-clean.png`
+- `18b-fr-inline-layout.png`
 - `19-fr-file-actions.png`
 - `19-temp-uncommitted-index.png`
 - `19-temp-uncommitted-working-tree.png`
@@ -90,23 +115,34 @@ clip container's `scrollWidth > clientWidth` as a failure. It verifies:
 
 ## Test-harness notes
 
-Only the acceptance script was adjusted before this final run; no product GUI or
-backend source changed (source mtimes were stable during the run).
+This run used the frozen product sources unchanged. Only the acceptance script
+and its README were updated; source mtimes were identical before/after the run.
 
+- The FR picker contract is environment-independent: at least one repository,
+  every dropdown option loads/switches, and worktree labels are checked only if
+  worktrees exist. On this fixture the dynamic result is 12 repositories /
+  0 worktrees, with worktree labels recorded as `notPresent`.
+- The TEMP fixture's README line-ending stat was refreshed (`core.autocrlf
+  false`) before the run so the checkout guard saw a clean worktree. This is
+  fixture metadata only, not a product change.
+- Inline split clamp is asserted through the separator's ARIA 25/60 values and
+  effective width, because the file-pane minimum can constrain the rendered
+  width below the remembered 60% on content-heavy commits.
 - The local bare fetch remote is seeded by pushing the fixture HEAD, because a
   freshly `init --bare` repository has no objects to reference.
 - Bottom-follow is measured on the small TEMP fixture in a short viewport so the
-  expanded slot is genuinely visible at a stable bottom; the paginated FR list
-  keeps extending its bottom while auto-loading.
+  expanded slot is genuinely visible at a stable bottom.
 - The inline Back assertion waits for the scheduled frame restore before
   sampling scrollTop.
 
 ## Historical baseline
 
-The prior 0.2.1 run remains **131/131 PASS**. In this run, 128 of those checks
-still apply and passed; the three checks that asserted first-parent / Jump-HEAD
-behavior are intentionally obsolete in the frozen build and are replaced by the
-absence and Ctrl+H assertions above. This run totals 172 checks.
+The prior 0.2.1 run remains **131/131 PASS**; the 0.2.2 extended run remains
+**172/172 PASS** on its original 16/4 fixture. This run re-executed all 172
+baseline checks with the environment-independent picker contract and passed all
+of them on the current 12/0 fixture, plus 16 refinement checks: **188/188 PASS**.
+No product threshold was relaxed; the fixture-shaped precondition became a
+dynamic contract instead.
 
 ## Not covered / manual
 

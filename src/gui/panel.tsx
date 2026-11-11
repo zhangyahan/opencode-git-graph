@@ -26,7 +26,6 @@ import {
   graphLaneX,
   graphLinePath,
   graphRowLines,
-  isGraphClipped,
   LANE_SPACING,
   type GraphLine,
 } from "./graph-geometry.js"
@@ -64,6 +63,14 @@ import {
   type ColumnId,
   type ColumnPreferences,
 } from "./column-layout.js"
+import {
+  DEFAULT_INLINE_INFO_RATIO,
+  INLINE_INFO_MAX_RATIO,
+  INLINE_INFO_MIN_RATIO,
+  clampInlineInfoRatio,
+  inlineInfoWidth,
+  resizeInlineInfoRatio,
+} from "./inline-split.js"
 import { CommitDiffView } from "./commit-diff-view.js"
 import { LatestRequest } from "./requests.js"
 import { buildFileTree, collectDirectoryPaths, type FileTreeNode } from "./tree.js"
@@ -787,6 +794,10 @@ interface CommitFilesSlotProps {
   readonly commit: GitCommit
   readonly graphWidth: number
   readonly columnWidth: number
+  /** Width available to the three inline panes next to the graph column. */
+  readonly bodyWidth: number
+  /** Remembered info-pane share of `bodyWidth`. */
+  readonly infoRatio: number
   readonly laneSpacing: number
   readonly nodes: readonly FileTreeNode[]
   readonly files: readonly ChangedFile[]
@@ -805,6 +816,8 @@ interface CommitFilesSlotProps {
   readonly onRetry: () => void
   readonly onResizeStart: (event: PointerEvent) => void
   readonly onResizeKeyDown: (event: KeyboardEvent) => void
+  readonly onSplitStart: (event: PointerEvent) => void
+  readonly onSplitKeyDown: (event: KeyboardEvent) => void
 }
 
 /**
@@ -821,6 +834,8 @@ function CommitFilesSlot(props: CommitFilesSlotProps) {
       to: { lane: segment.to, y: 1 },
       colour: segment.colour,
     }))
+
+  const infoWidth = (): number => inlineInfoWidth(props.bodyWidth, props.infoRatio)
 
   return (
     <div
@@ -864,7 +879,11 @@ function CommitFilesSlot(props: CommitFilesSlotProps) {
       </div>
 
       <div class="gg-row-slot-body">
-        <div class="gg-inline-info" data-testid="inline-info">
+        <div
+          class="gg-inline-info"
+          data-testid="inline-info"
+          style={infoWidth() > 0 ? `width:${infoWidth()}px` : undefined}
+        >
           <div class="gg-inline-info-subject" title={props.commit.subject}>
             {props.commit.subject || "(no subject)"}
           </div>
@@ -918,6 +937,21 @@ function CommitFilesSlot(props: CommitFilesSlotProps) {
             </For>
           </details>
         </div>
+
+        <div
+          class="gg-inline-split"
+          data-testid="inline-split"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize commit info column"
+          aria-valuemin={Math.round(INLINE_INFO_MIN_RATIO * 100)}
+          aria-valuemax={Math.round(INLINE_INFO_MAX_RATIO * 100)}
+          aria-valuenow={Math.round(clampInlineInfoRatio(props.infoRatio) * 100)}
+          tabIndex={0}
+          title="Drag to resize the commit info column"
+          onPointerDown={(event) => props.onSplitStart(event)}
+          onKeyDown={(event) => props.onSplitKeyDown(event)}
+        />
 
         <div class="gg-row-slot-files">
           <div class="gg-row-slot-head">
@@ -1392,6 +1426,10 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const [uncommittedExpanded, setUncommittedExpanded] = createSignal(false)
   const [slotHeightOverrides, setSlotHeightOverrides] =
     createSignal<Readonly<Record<string, number>>>({})
+  /** Session-only share of the inline slot body used by the info pane. */
+  const [inlineInfoRatio, setInlineInfoRatio] = createSignal(
+    DEFAULT_INLINE_INFO_RATIO,
+  )
   const [collapsedGroups, setCollapsedGroups] = createSignal<ReadonlySet<string>>(new Set<string>())
 
   const [fetchDialog, setFetchDialog] = createSignal<FetchDialogState | undefined>()
@@ -1417,6 +1455,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   let resizeObserver: ResizeObserver | undefined
   let panelObserver: ResizeObserver | undefined
   let resizeDragCleanup: (() => void) | undefined
+  let inlineSplitCleanup: (() => void) | undefined
   let slotResizeCleanup: (() => void) | undefined
   let slotResizeFrame: { readonly id: number; readonly timeout: boolean } | undefined
   let fetchRequestVersion = 0
@@ -2609,6 +2648,49 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     window.addEventListener("pointercancel", cancel)
   }
 
+  function startInlineSplit(event: PointerEvent): void {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.button !== 0) return
+    const startX = event.clientX
+    const startRatio = untrack(() => inlineInfoRatio())
+    const width = untrack(() => inlineBodyWidth())
+    const move = (moveEvent: PointerEvent): void => {
+      setInlineInfoRatio(
+        resizeInlineInfoRatio(startRatio, moveEvent.clientX - startX, width),
+      )
+    }
+    const stop = (): void => {
+      window.removeEventListener("pointermove", move)
+      window.removeEventListener("pointerup", stop)
+      window.removeEventListener("pointercancel", stop)
+      inlineSplitCleanup = undefined
+    }
+    inlineSplitCleanup?.()
+    inlineSplitCleanup = stop
+    window.addEventListener("pointermove", move)
+    window.addEventListener("pointerup", stop)
+    window.addEventListener("pointercancel", stop)
+  }
+
+  function nudgeInlineRatio(event: KeyboardEvent): void {
+    const step = event.shiftKey ? 0.05 : 0.02
+    let next: number | undefined
+    if (event.key === "ArrowLeft") {
+      next = untrack(() => inlineInfoRatio()) - step
+    } else if (event.key === "ArrowRight") {
+      next = untrack(() => inlineInfoRatio()) + step
+    } else if (event.key === "Home") {
+      next = INLINE_INFO_MIN_RATIO
+    } else if (event.key === "End") {
+      next = INLINE_INFO_MAX_RATIO
+    }
+    if (next === undefined) return
+    event.preventDefault()
+    event.stopPropagation()
+    setInlineInfoRatio(clampInlineInfoRatio(next))
+  }
+
   function startSlotResize(key: string, event: PointerEvent): void {
     event.preventDefault()
     event.stopPropagation()
@@ -2794,11 +2876,13 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resolveColumnLayout(panelWidth(), columnPreferences()),
   )
   const graphColumnWidth = createMemo(() => resolvedColumns().widths.graph)
+  const inlineBodyWidth = createMemo(() =>
+    Math.max(0, panelWidth() - graphColumnWidth()),
+  )
   const graphWidth = createMemo(() =>
     graphContentWidth(maxLanes(), LANE_SPACING, LANE_PADDING),
   )
   const laneSpacing = createMemo(() => graphLaneSpacing())
-  const denseGraph = createMemo(() => isGraphClipped(graphWidth(), graphColumnWidth()))
   const maxRefs = createMemo(() =>
     Math.min(
       visibleRefCount(panelWidth()),
@@ -4106,6 +4190,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resizeObserver?.disconnect()
     panelObserver?.disconnect()
     resizeDragCleanup?.()
+    inlineSplitCleanup?.()
     slotResizeCleanup?.()
     cancelFrame(slotResizeFrame)
     slotResizeFrame = undefined
@@ -4411,24 +4496,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
             </For>
           </div>
 
-          <Show when={denseGraph()}>
-            <div class="gg-dense-graph" data-testid="dense-graph">
-              <span>
-                {maxLanes()} lanes; narrow columns hide branches on the right. Drag the column
-                wider to reveal them.
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  closeMenus()
-                  setBranchSelectorOpen(true)
-                }}
-              >
-                Filter branches…
-              </button>
-            </div>
-          </Show>
-
           <div
             class="gg-history-scroll"
             data-testid="history-scroll"
@@ -4543,6 +4610,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                     commit={selectedCommit()!}
                     graphWidth={graphWidth()}
                     columnWidth={graphColumnWidth()}
+                    bodyWidth={inlineBodyWidth()}
+                    infoRatio={inlineInfoRatio()}
                     laneSpacing={laneSpacing()}
                     nodes={commitTree()}
                     files={commitFiles()}
@@ -4576,6 +4645,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                       const commit = selectedCommit()
                       if (commit) nudgeSlotHeight(commit.hash, event)
                     }}
+                    onSplitStart={(event) => startInlineSplit(event)}
+                    onSplitKeyDown={(event) => nudgeInlineRatio(event)}
                   />
                 )}
               </Show>
