@@ -4,7 +4,9 @@ import { pathToFileURL } from "node:url"
 import type { IncomingMessage, ServerResponse } from "node:http"
 import type { Plugin, ViteDevServer } from "vite"
 import type { GitGraphManager } from "../src/server/repository/manager.js"
+import type { WorkspaceWatcher } from "../src/server/repository/watcher.js"
 import {
+  EVENTS_PATH,
   FIXTURE_BASE,
   FIXTURE_MARKER_KIND,
   FIXTURE_MARKER_NAME,
@@ -12,6 +14,7 @@ import {
   FIXTURE_TEMP_PARENT,
   FR_PORT,
   FR_ROOT,
+  GRAPH_CHANGED_EVENT,
   LOOPBACK_HOST,
   MAX_BODY_BYTES,
   MUTATION_METHOD_SET,
@@ -63,12 +66,20 @@ type ManagerConstructor = new (
   root: string,
   options?: { deps?: { mutations?: unknown } },
 ) => RuntimeManager
+type WatcherConstructor = new (
+  manager: RuntimeManager,
+  onChange: (repositoryId: string) => void,
+) => WorkspaceWatcher
 
 type Runtime = {
   manager: RuntimeManager
+  watcher: WorkspaceWatcher
   handlers: HandlerMap
   definition: RuntimeDefinition
 }
+
+/** One connected SSE client; the response is only used for writes/cleanup. */
+type EventClient = ServerResponse
 
 type BridgeOptions = {
   projectRoot: string
@@ -158,6 +169,27 @@ function requestPreview(req: IncomingMessage, guard: OriginGuard): string {
   if (typeof contentType !== "string") return "content-type"
   if (contentType.split(";")[0]?.trim().toLowerCase() !== "application/json") {
     return "content-type"
+  }
+  return "ok"
+}
+
+/**
+ * Guard for the read-only SSE stream.
+ *
+ * Browsers may omit `Origin` on a same-origin GET (and non-browser clients such
+ * as `curl` never send it), so a present Origin must match exactly while a
+ * missing Origin is accepted together with the loopback Host check. No CORS
+ * headers are ever sent, so cross-site pages cannot read the stream.
+ */
+function eventsPreview(req: IncomingMessage, guard: OriginGuard): string {
+  if (req.method !== "GET") return "method"
+  if (req.headers.host !== guard.host) return "host"
+  if (req.headers.origin !== undefined && req.headers.origin !== guard.origin) {
+    return "origin"
+  }
+  const fetchSite = req.headers["sec-fetch-site"]
+  if (typeof fetchSite === "string" && fetchSite !== "same-origin" && fetchSite !== "none") {
+    return "fetch-site"
   }
   return "ok"
 }
@@ -383,12 +415,16 @@ async function loadModules(
   projectRoot: string,
   root: string,
   mode: UiMode,
+  onGraphChanged: (repositoryId: string) => void,
 ): Promise<Runtime & { mutationEngine: boolean }> {
-  const [managerModule, rpcModule, mutations] = await Promise.all([
+  const [managerModule, rpcModule, watcherModule, mutations] = await Promise.all([
     server.ssrLoadModule(
       pathToFileURL(path.join(projectRoot, "src/server/repository/manager.ts")).href,
     ),
     server.ssrLoadModule(pathToFileURL(path.join(projectRoot, "src/rpc.ts")).href),
+    server.ssrLoadModule(
+      pathToFileURL(path.join(projectRoot, "src/server/repository/watcher.ts")).href,
+    ),
     mode === "mutation-fixture" ? loadMutationEngine(server, projectRoot) : undefined,
   ])
 
@@ -396,11 +432,15 @@ async function loadModules(
   const createHandlers = managerModule.createGitGraphHandlers as
     | ((manager: RuntimeManager) => HandlerMap)
     | undefined
+  const WorkspaceWatcherClass = watcherModule.WorkspaceWatcher as
+    | WatcherConstructor
+    | undefined
   const definition = rpcModule.GitGraphRpc as RuntimeDefinition | undefined
 
   if (
     typeof Manager !== "function" ||
     typeof createHandlers !== "function" ||
+    typeof WorkspaceWatcherClass !== "function" ||
     !definition ||
     typeof definition !== "object"
   ) {
@@ -414,6 +454,9 @@ async function loadModules(
   const manager = new Manager(root, managerOptions)
   return {
     manager,
+    // The real production watcher, fed by the same manager as RPC. It only
+    // observes git metadata, so FR remains read-only.
+    watcher: new WorkspaceWatcherClass(manager, onGraphChanged),
     handlers: createHandlers(manager),
     definition,
     mutationEngine: mode === "mutation-fixture" && mutations !== undefined,
@@ -448,14 +491,49 @@ export function gitGraphDevHarness(options: BridgeOptions): Plugin {
       let disposed = false
       let definition: RuntimeDefinition | undefined
 
-      const ready = loadModules(server, options.projectRoot, root, options.mode)
+      /**
+       * Connected SSE clients. The watcher is the only producer; the bridge
+       * never fabricates or polls an event.
+       */
+      const eventClients = new Set<EventClient>()
+
+      const broadcastGraphChanged = (repositoryId: string): void => {
+        if (eventClients.size === 0) return
+        const payload = JSON.stringify({
+          type: GRAPH_CHANGED_EVENT,
+          location: { directory: root },
+          data: { repositoryId },
+        })
+        const frame = `event: ${GRAPH_CHANGED_EVENT}\ndata: ${payload}\n\n`
+        for (const client of eventClients) {
+          if (client.writableEnded || client.destroyed) {
+            eventClients.delete(client)
+            continue
+          }
+          try {
+            client.write(frame)
+          } catch {
+            eventClients.delete(client)
+          }
+        }
+      }
+
+      const ready = loadModules(
+        server,
+        options.projectRoot,
+        root,
+        options.mode,
+        broadcastGraphChanged,
+      )
         .then((loaded) => {
           if (disposed) {
+            loaded.watcher.dispose()
             loaded.manager.dispose()
             throw new Error("Git Graph bridge was disposed during startup")
           }
           runtime = loaded
           definition = loaded.definition
+          void loaded.watcher.start()
 
           const missing = [...allowedMethods].filter(
             (method) =>
@@ -464,6 +542,9 @@ export function gitGraphDevHarness(options: BridgeOptions): Plugin {
           )
           server.config.logger.info(
             `[git-graph-dev] ${options.mode} bridge ready (root ${root}, host ${guard.host})`,
+          )
+          server.config.logger.info(
+            `[git-graph-dev] real workspace watcher started; SSE ${EVENTS_PATH}`,
           )
           if (missing.length > 0) {
             server.config.logger.info(
@@ -491,6 +572,15 @@ export function gitGraphDevHarness(options: BridgeOptions): Plugin {
       server.middlewares.use((req, res, next) => {
         if (!req.url) return next()
         const url = new URL(req.url, guard.origin)
+        if (url.pathname === EVENTS_PATH) {
+          void handleEvents(req, res, url, ready, guard, eventClients).catch(() => {
+            if (!res.writableEnded && !res.destroyed) {
+              sendError(res, 500, "rpc.internal", "Internal harness error")
+            }
+            eventClients.delete(res)
+          })
+          return
+        }
         if (!url.pathname.startsWith(RPC_PATH_PREFIX)) return next()
         void handleRpc(req, res, url, ready, server, () => definition, {
           guard,
@@ -504,12 +594,74 @@ export function gitGraphDevHarness(options: BridgeOptions): Plugin {
       const dispose = () => {
         if (disposed) return
         disposed = true
+        for (const client of eventClients) {
+          try {
+            client.end()
+          } catch {
+            // Already closed.
+          }
+        }
+        eventClients.clear()
+        runtime?.watcher.dispose()
         runtime?.manager.dispose()
         runtime = undefined
         definition = undefined
       }
       server.httpServer?.once("close", dispose)
     },
+  }
+
+  /**
+   * Read-only SSE endpoint. It exposes watcher notifications only; there is no
+   * RPC method or query parameter that can select a repository or write.
+   */
+  async function handleEvents(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    ready: Promise<Runtime>,
+    guard: OriginGuard,
+    eventClients: Set<EventClient>,
+  ): Promise<void> {
+    const preview = eventsPreview(req, guard)
+    if (preview !== "ok") {
+      if (preview === "method") res.setHeader("allow", "GET")
+      sendError(
+        res,
+        preview === "method" ? 405 : 403,
+        "rpc.unauthorized",
+        "Request rejected by the harness origin guard",
+      )
+      return
+    }
+    if (url.search !== "") {
+      sendError(res, 400, "invalid_input", "Query parameters are not supported", {
+        reason: "query",
+      })
+      return
+    }
+
+    try {
+      await ready
+    } catch {
+      sendError(res, 503, "rpc.unavailable", "Git Graph bridge is not available")
+      return
+    }
+    if (res.writableEnded || res.destroyed) return
+
+    res.statusCode = 200
+    res.setHeader("content-type", "text/event-stream; charset=utf-8")
+    res.setHeader("cache-control", "no-store")
+    res.setHeader("x-content-type-options", "nosniff")
+    res.setHeader("x-accel-buffering", "no")
+    res.flushHeaders()
+    // Comment frame so intermediaries flush the stream; no synthetic event.
+    res.write(`retry: 1000\n: connected\n\n`)
+
+    eventClients.add(res)
+    const cleanup = () => eventClients.delete(res)
+    req.once("aborted", cleanup)
+    res.once("close", cleanup)
   }
 
   async function handleRpc(

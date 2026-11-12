@@ -14,6 +14,13 @@ export interface RowLayoutInput {
   /** Fixed height of every commit row. Values below 1 are clamped to 1. */
   readonly rowHeight: number
   /**
+   * Optional per-row heights (for example rows whose ref badges wrap). Entries
+   * are sanitized to at least 1px; missing entries fall back to `rowHeight`.
+   * When supplied, the layout uses prefix sums and binary search instead of the
+   * closed-form fixed-row math.
+   */
+  readonly rowHeights?: readonly number[]
+  /**
    * Optional fixed special rows above the commit list (for example the
    * working-tree "Uncommitted changes" row). They share the commit row height
    * and never receive a commit index. Defaults to 0.
@@ -52,6 +59,8 @@ export interface RowLayout {
   readonly slotTop: number | undefined
   /** Sanitized commit slot height; 0 when there is no commit slot. */
   readonly slotHeight: number
+  /** Height of one commit row; base `rowHeight` when no per-row heights apply. */
+  rowHeightAt(index: number): number
   /**
    * Top of a commit row in pixels. `index` is truncated and clamped to
    * `[0, count]`, so `rowTop(count) === totalHeight`. Rows after the expanded
@@ -91,6 +100,20 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
   const expandedIndex = validExpandedIndex(input.expandedIndex, count)
   const slotHeight =
     expandedIndex === undefined ? 0 : Math.max(0, finite(input.expandedHeight ?? 0, 0))
+
+  if (input.rowHeights !== undefined) {
+    return createVariableRowLayout({
+      count,
+      baseRowHeight: rowHeight,
+      rowHeights: input.rowHeights,
+      leadingBlockHeight,
+      leadingSlotTop,
+      leadingSlotHeight,
+      expandedIndex,
+      slotHeight,
+    })
+  }
+
   const slotStart = expandedIndex === undefined ? 0 : (expandedIndex + 1) * rowHeight
   const slotTop = expandedIndex === undefined ? undefined : leadingBlockHeight + slotStart
   const commitTotalHeight = count * rowHeight + slotHeight
@@ -224,6 +247,197 @@ export function createRowLayout(input: RowLayoutInput): RowLayout {
     totalHeight,
     slotTop,
     slotHeight,
+    rowHeightAt: () => rowHeight,
+    rowTop,
+    indexAtOffset,
+    range,
+  }
+}
+
+/**
+ * Prefix sums of sanitized row heights. `prefix[i]` is the top of row `i`, and
+ * `prefix[heights.length]` is the total height of the rows.
+ */
+export function buildRowHeightPrefix(heights: readonly number[]): number[] {
+  const prefix = new Array<number>(heights.length + 1)
+  prefix[0] = 0
+  for (let index = 0; index < heights.length; index += 1) {
+    const height = Math.max(1, finite(heights[index] ?? 1, 1))
+    prefix[index + 1] = prefix[index]! + height
+  }
+  return prefix
+}
+
+/**
+ * Binary search for the row containing `offset` in a prefix-sum array.
+ * Returns `-1` for an empty list, the first row for negative offsets and the
+ * last row for offsets at or beyond the end.
+ */
+export function rowIndexAtHeightOffset(
+  prefix: readonly number[],
+  offset: number,
+): number {
+  const count = prefix.length - 1
+  if (count <= 0) return -1
+  const target = Number.isFinite(offset) ? Math.max(0, offset) : 0
+  if (target >= prefix[count]!) return count - 1
+
+  let low = 0
+  let high = count - 1
+  while (low < high) {
+    const middle = Math.floor((low + high + 1) / 2)
+    if (prefix[middle]! <= target) low = middle
+    else high = middle - 1
+  }
+  return Math.min(count - 1, low)
+}
+
+interface VariableLayoutInput {
+  readonly count: number
+  readonly baseRowHeight: number
+  readonly rowHeights: readonly number[]
+  readonly leadingBlockHeight: number
+  readonly leadingSlotTop: number | undefined
+  readonly leadingSlotHeight: number
+  readonly expandedIndex: number | undefined
+  readonly slotHeight: number
+}
+
+function createVariableRowLayout(input: VariableLayoutInput): RowLayout {
+  const count = input.count
+  const heights = new Array<number>(count)
+  for (let index = 0; index < count; index += 1) {
+    heights[index] = Math.max(
+      1,
+      finite(input.rowHeights[index] ?? input.baseRowHeight, input.baseRowHeight),
+    )
+  }
+  const prefix = buildRowHeightPrefix(heights)
+  const commitSlotStart =
+    input.expandedIndex === undefined
+      ? undefined
+      : prefix[input.expandedIndex + 1]!
+  const slotTop =
+    commitSlotStart === undefined
+      ? undefined
+      : input.leadingBlockHeight + commitSlotStart
+  const commitTotalHeight = prefix[count]! + input.slotHeight
+  const totalHeight = input.leadingBlockHeight + commitTotalHeight
+
+  function rowHeightAt(index: number): number {
+    if (count === 0) return input.baseRowHeight
+    const safeIndex = Math.min(count - 1, Math.max(0, Math.trunc(finite(index, 0))))
+    return heights[safeIndex]!
+  }
+
+  function rowTop(index: number): number {
+    const safeIndex = clampIndex(index, count)
+    return (
+      input.leadingBlockHeight +
+      prefix[safeIndex]! +
+      (input.expandedIndex !== undefined && safeIndex > input.expandedIndex
+        ? input.slotHeight
+        : 0)
+    )
+  }
+
+  function indexAtOffset(y: number): number {
+    if (count === 0) return -1
+    const offset = Number.isNaN(y) ? 0 : Math.max(0, y)
+    if (offset < input.leadingBlockHeight) return -1
+    let local = offset - input.leadingBlockHeight
+
+    if (input.expandedIndex !== undefined && commitSlotStart !== undefined) {
+      const slotEnd = commitSlotStart + input.slotHeight
+      if (local >= commitSlotStart && local < slotEnd) {
+        return input.expandedIndex
+      }
+      if (local >= slotEnd) local -= input.slotHeight
+    }
+
+    return rowIndexAtHeightOffset(prefix, local)
+  }
+
+  function range(
+    scrollTop: number,
+    viewportHeight: number,
+    overscan?: number,
+  ): VirtualRange {
+    if (count === 0) return { start: 0, end: 0 }
+
+    const rawTop = Math.max(0, finite(scrollTop, 0))
+    const viewport = Math.max(0, finite(viewportHeight, 0))
+    if (
+      input.leadingBlockHeight > 0 &&
+      rawTop + viewport <= input.leadingBlockHeight
+    ) {
+      return { start: 0, end: 0 }
+    }
+
+    const localTop = Math.max(
+      0,
+      Math.max(rawTop, input.leadingBlockHeight) - input.leadingBlockHeight,
+    )
+    const visibleBottom =
+      Math.max(rawTop + viewport, input.leadingBlockHeight) -
+      input.leadingBlockHeight
+    const localBottom = Math.min(commitTotalHeight, visibleBottom)
+    if (localTop >= commitTotalHeight) return { start: count, end: count }
+
+    const extra = Math.max(
+      0,
+      Math.trunc(finite(overscan ?? DEFAULT_OVERSCAN, 0)),
+    )
+
+    const first = indexAtCommitOffset(localTop)
+    const hasVisibleSpan = localBottom > localTop
+    const last = hasVisibleSpan
+      ? indexAtCommitOffset(Math.max(localTop, localBottom - 0.001))
+      : first
+
+    let start = Math.max(0, first - extra)
+    let end = Math.min(
+      count,
+      Math.max(start, hasVisibleSpan ? last + 1 + extra : first + extra),
+    )
+
+    // Keep the expanded commit reachable while its slot intersects the window.
+    if (
+      input.expandedIndex !== undefined &&
+      commitSlotStart !== undefined &&
+      localTop < commitSlotStart + input.slotHeight &&
+      localBottom > commitSlotStart
+    ) {
+      start = Math.max(0, Math.min(start, input.expandedIndex))
+      end = Math.min(
+        count,
+        Math.max(end, input.expandedIndex + 1),
+      )
+    }
+
+    return { start, end }
+  }
+
+  /** Slot-aware index lookup in commit coordinates (leading block excluded). */
+  function indexAtCommitOffset(local: number): number {
+    if (input.expandedIndex !== undefined && commitSlotStart !== undefined) {
+      const slotEnd = commitSlotStart + input.slotHeight
+      if (local >= commitSlotStart && local < slotEnd) {
+        return input.expandedIndex
+      }
+      if (local >= slotEnd) local -= input.slotHeight
+    }
+    return rowIndexAtHeightOffset(prefix, local)
+  }
+
+  return {
+    leadingHeight: input.leadingBlockHeight - input.leadingSlotHeight,
+    leadingSlotTop: input.leadingSlotTop,
+    leadingSlotHeight: input.leadingSlotHeight,
+    totalHeight,
+    slotTop,
+    slotHeight: input.slotHeight,
+    rowHeightAt,
     rowTop,
     indexAtOffset,
     range,

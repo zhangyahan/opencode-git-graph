@@ -794,7 +794,8 @@ export const GG_STYLES = `
   grid-template-columns: var(--gg-history-cols, 240px minmax(0, 1fr) 150px 118px 74px);
   align-items: center;
   width: 100%;
-  height: 28px;
+  min-height: 28px;
+  height: auto;
   margin: 0;
   padding: 0 !important;
   border: 0 !important;
@@ -855,25 +856,24 @@ export const GG_STYLES = `
 }
 .gg-col-desc {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 4px;
+  align-content: center;
+  gap: 4px 6px;
   min-width: 0;
   overflow: hidden;
-  padding: 0 8px 0 2px;
+  padding: 6px 8px 6px 2px;
 }
 .gg-ref-badges {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  align-content: flex-start;
   gap: 3px;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 60%;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: none;
-}
-.gg-ref-badges::-webkit-scrollbar {
-  display: none;
+  max-width: 100%;
+  overflow: visible;
 }
 .gg-subject {
   flex: 1 1 auto;
@@ -881,14 +881,17 @@ export const GG_STYLES = `
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  line-height: 16px;
 }
 .git-graph-panel button.gg-ref-badge {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: none;
   overflow: visible;
   text-overflow: clip;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   padding: 0 4px;
   border-radius: 3px;
   border: 1px solid hsl(var(--gg-ref-hue, 215) 60% 55% / 0.48);
@@ -905,16 +908,6 @@ export const GG_STYLES = `
 }
 .gg-ref-kind-remote {
   border-radius: 2px !important;
-}
-.git-graph-panel button.gg-ref-more {
-  flex: 0 0 auto;
-  padding: 0 4px;
-  border-radius: 3px;
-  border: 1px solid var(--color-border, #444);
-  background: transparent;
-  color: var(--color-textMuted, #8a8a8a);
-  font-size: 10px;
-  line-height: 15px;
 }
 .gg-col-date,
 .gg-col-author {

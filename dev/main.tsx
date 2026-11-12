@@ -1,4 +1,4 @@
-import { For, createSignal } from "solid-js"
+import { For, Show, createSignal } from "solid-js"
 import { render } from "solid-js/web"
 import type { PanelProps, PanelTab } from "@opencode/plugin/gui"
 import { GitGraphPanel } from "../src/gui/panel"
@@ -16,6 +16,7 @@ const TAB: PanelTab = { id: "main", title: "Git Graph" }
 function App() {
   const [width, setWidth] = createSignal<(typeof WIDTHS)[number]>(520)
   const [directory] = createSignal(FIXED_DIRECTORY)
+  const [remountKey, setRemountKey] = createSignal(1)
   const client = createHarnessClient(MODE)
 
   /*
@@ -106,6 +107,15 @@ function App() {
             </button>
           )}
         </For>
+        <button
+          type="button"
+          class="harness-button"
+          data-testid="harness-remount-panel"
+          title="Unmount and remount the panel, like switching tabs or reopening the file"
+          onClick={() => setRemountKey((value) => value + 1)}
+        >
+          Remount panel
+        </button>
       </header>
 
       <main class="harness-stage">
@@ -115,7 +125,14 @@ function App() {
           data-panel-width={width()}
           style={{ width: `${width()}px` }}
         >
-          <GitGraphPanel panel={panel} />
+          {/*
+           * Keyed Show disposes the whole panel subtree and builds it again on
+           * every remount key change, so lifecycle cleanup and cache warm-up
+           * are exercised exactly like a host tab switch.
+           */}
+          <Show when={remountKey()} keyed>
+            {(key) => <GitGraphPanel panel={panel} />}
+          </Show>
         </section>
       </main>
     </div>

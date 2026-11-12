@@ -38,13 +38,12 @@ export function historyColumns(width: number): HistoryColumnVisibility {
 }
 
 /**
- * Ref badges shown before the subject. At side-panel widths the subject has to
- * win, so only the two short refs are shown; a `+N` badge summarises the rest.
- */
-/**
  * Ref chips shown before the subject. The description track is the real
- * budget: a 520px panel leaves ~206px, so one 72px chip plus the +N menu keeps
- * the subject readable. The menu still exposes every typed ref.
+ * budget.
+ *
+ * Historical helpers retained for the existing responsive-column tests. The
+ * history panel no longer folds refs into `+N`: every badge is rendered and
+ * the row grows through `row-heights.ts` instead.
  */
 export function visibleRefCount(width: number): number {
   const measured = Number.isFinite(width) ? width : 0

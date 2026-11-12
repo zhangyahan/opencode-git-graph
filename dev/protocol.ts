@@ -67,6 +67,19 @@ export function methodsForMode(mode: UiMode): ReadonlySet<string> {
 
 export const RPC_PATH_PREFIX = "/__gg/rpc/"
 
+/**
+ * Read-only Server-Sent Events endpoint used by the harness to relay the real
+ * `WorkspaceWatcher` notifications to the GUI.
+ */
+export const EVENTS_PATH = "/__gg/events"
+
+/**
+ * Local RPC event name, matching the production client (`rpc.events.on` uses
+ * the event key from `GitGraphRpc.events`, not the wire prefix). The host
+ * attaches the location and the wire type is `rpc.git-graph.graphChanged`.
+ */
+export const GRAPH_CHANGED_EVENT = "graphChanged"
+
 /** Request bodies above this size are rejected before parsing. */
 export const MAX_BODY_BYTES = 64 * 1024
 

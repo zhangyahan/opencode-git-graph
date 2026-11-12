@@ -95,7 +95,9 @@ const SOURCE_FILES = [
   "src/gui/ref-utils.ts",
   "src/gui/confirm-dialog.tsx",
   "src/rpc.ts",
+  "src/index.ts",
   "src/server/repository/manager.ts",
+  "src/server/repository/watcher.ts",
   "src/server/git/compare.ts",
   "src/server/git/log.ts",
   "src/server/git/file-content.ts",
@@ -105,6 +107,10 @@ const SOURCE_FILES = [
   "src/gui/history-columns.ts",
   "src/gui/format.ts",
   "src/gui/inline-split.ts",
+  "src/gui/label.ts",
+  "src/gui/graph-events.ts",
+  "src/gui/panel-cache.ts",
+  "src/gui.tsx",
   "src/gui/changes.ts",
   "src/gui/fetch-dialog.tsx",
   "src/gui/slot-size.ts",
@@ -168,6 +174,7 @@ const SELECTORS = {
     ".gg-mutation-notice",
   ],
   slotResizeHandle: [SLOT_HANDLE_SELECTOR],
+  remountPanel: ['[data-testid="harness-remount-panel"]'],
   inlineInfoDivider: INLINE_INFO_DIVIDER_SELECTORS,
   inlineBody: [".gg-row-slot-body"],
   inlineInfoResolved: ['[data-testid="inline-info"]'],
@@ -284,6 +291,65 @@ function sourceMtimes() {
   )
 }
 
+/**
+ * Tab registration lives in `src/gui.tsx`, which the dev harness does not
+ * render. This is a source-level readiness check only: it must never be counted
+ * as a UI pass. Desktop icon/text rendering remains a manual item.
+ */
+function sourceRegistrationCheck() {
+  const file = "src/gui.tsx"
+  const labelFile = "src/gui/label.ts"
+  const path = join(ROOT, file)
+  const labelPath = join(ROOT, labelFile)
+  const text = existsSync(path) ? readFileSync(path, "utf8") : ""
+  const label = existsSync(labelPath) ? readFileSync(labelPath, "utf8") : ""
+  const titleValue =
+    /GIT_GRAPH_TAB_TITLE\s*=\s*"([^"]+)"/.exec(label)?.[1] ??
+    /title:\s*"([^"]+)"/.exec(text)?.[1] ??
+    null
+  const iconValue =
+    /GIT_GRAPH_TAB_ICON[^\n=]*=\s*"([^"]+)"/.exec(label)?.[1] ??
+    /icon:\s*"([^"]+)"/.exec(text)?.[1] ??
+    null
+  const labelRendersIconAndText =
+    (text.includes("<ctx.ui.Icon name={GIT_GRAPH_TAB_ICON}") &&
+      text.includes("<span>{GIT_GRAPH_TAB_TITLE}</span>")) ||
+    (/<ctx\.ui\.Icon[^>]*name="branch"/.test(text) &&
+      /<span>\{?["']?Git Graph/.test(text))
+  const entries = [
+    {
+      name: "tab/menu title is Git Graph",
+      ok: titleValue === "Git Graph",
+      detail: { titleFile: label ? labelFile : file, titleValue },
+    },
+    {
+      name: "tab label renders the host branch icon and text",
+      ok: labelRendersIconAndText,
+      detail: { file, labelFile },
+    },
+    {
+      name: "tab/mobile/menu icon is branch",
+      ok: iconValue === "branch" && (text.match(/GIT_GRAPH_TAB_ICON|icon:/g) ?? []).length >= 2,
+      detail: { iconValue },
+    },
+    {
+      name: "panel registration is side/wide-safe",
+      ok: /ctx\.add\(Panel,[\s\S]*?region:\s*"side"/.test(text),
+      detail: { file },
+    },
+  ]
+  return {
+    name: "tab label icon + text",
+    file,
+    labelFile,
+    sourceCheck: true,
+    desktopManual: true,
+    uiPass: false,
+    ok: entries.every((entry) => entry.ok),
+    entries,
+  }
+}
+
 function checkResult(checks, name, ok, detail) {
   checks.push({ name, ok: Boolean(ok), detail })
 }
@@ -367,27 +433,81 @@ async function currentScrollTop(page) {
 }
 
 async function scrollToRowIndex(page, index) {
-  await page.evaluate((wanted) => {
-    const scroller = document.querySelector('[data-testid="history-scroll"]')
-    const rows = [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)")]
-    const rowHeight =
-      rows.length > 1
-        ? Number(rows[1].dataset.rowTop) - Number(rows[0].dataset.rowTop)
-        : rows[0]?.getBoundingClientRect().height || 28
-    const leadingOffset =
-      rows.length > 0
-        ? Number(rows[0].dataset.rowTop) - Number(rows[0].dataset.index) * rowHeight
-        : 0
-    scroller.scrollTop = Math.min(
-      Math.max(0, wanted * rowHeight + leadingOffset),
-      Math.max(0, scroller.scrollHeight - scroller.clientHeight),
-    )
-  }, index)
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    const state = await page.evaluate((wanted) => {
+      const scroller = document.querySelector('[data-testid="history-scroll"]')
+      if (!scroller) return { done: false, reason: "no-scroller" }
+      const rows = [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)")]
+        .map((row) => ({
+          index: Number(row.dataset.index),
+          top: Number(row.dataset.rowTop),
+          height: row.getBoundingClientRect().height,
+        }))
+        .filter((row) => Number.isFinite(row.index) && Number.isFinite(row.top))
+      if (rows.length === 0) return { done: false, reason: "no-rows" }
+      const viewTop = scroller.scrollTop
+      const viewBottom = viewTop + scroller.clientHeight
+      const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight)
+      const exact = rows.find((row) => row.index === wanted)
+      if (exact) {
+        if (exact.top < viewTop || exact.top + exact.height > viewBottom) {
+          scroller.scrollTop = Math.max(
+            0,
+            Math.min(maxTop, exact.top - Math.min(80, scroller.clientHeight / 3)),
+          )
+          return { done: false, reason: "exact-adjust" }
+        }
+        return { done: true, reason: "exact-visible" }
+      }
+      const sorted = [...rows].sort((left, right) => left.index - right.index)
+      const nearest = rows.reduce(
+        (best, row) =>
+          Math.abs(row.index - wanted) < Math.abs(best.index - wanted) ? row : best,
+        rows[0],
+      )
+      const span = sorted.at(-1).index - sorted[0].index
+      const average =
+        span > 0 ? (sorted.at(-1).top - sorted[0].top) / span : nearest.height || 28
+      const delta = wanted - nearest.index
+      let next = Math.max(0, Math.min(maxTop, viewTop + delta * (average || 28)))
+      if (Math.abs(next - viewTop) < 1) {
+        next = Math.max(
+          0,
+          Math.min(maxTop, viewTop + (delta > 0 ? average || 28 : -(average || 28))),
+        )
+      }
+      scroller.scrollTop = next
+      return { done: false, reason: "seek", nearest: nearest.index, average }
+    }, index)
+    if (state.done) break
+    await waitRaf(page, 2)
+  }
   await page.waitForFunction(
-    (wanted) => Boolean(document.querySelector(`.gg-graph-row[data-index="${wanted}"]`)),
+    (wanted) =>
+      [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)")].some(
+        (row) => Number(row.dataset.index) === wanted,
+      ),
     index,
     { timeout: 20_000 },
   )
+  await page.evaluate((wanted) => {
+    const scroller = document.querySelector('[data-testid="history-scroll"]')
+    const row = [...document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)")].find(
+      (candidate) => Number(candidate.dataset.index) === wanted,
+    )
+    if (!scroller || !row) return
+    const top = Number(row.dataset.rowTop)
+    const height = row.getBoundingClientRect().height
+    if (top < scroller.scrollTop || top + height > scroller.scrollTop + scroller.clientHeight) {
+      scroller.scrollTop = Math.max(
+        0,
+        Math.min(
+          scroller.scrollHeight - scroller.clientHeight,
+          top - Math.min(80, scroller.clientHeight / 3),
+        ),
+      )
+    }
+  }, index)
   await waitRaf(page, 2)
 }
 
@@ -402,6 +522,20 @@ async function visibleRowHashes(page) {
 }
 
 async function refBadgeByName(page, name) {
+  await page
+    .waitForFunction(
+      (wanted) =>
+        [...document.querySelectorAll('[data-testid="ref-badge"]')].some(
+          (badge) => badge.getAttribute("data-ref-name") === wanted,
+        ),
+      name,
+      { timeout: 15_000 },
+    )
+    .catch(() => {})
+  const exact = page.locator(
+    `[data-testid="ref-badge"][data-ref-name="${String(name).replace(/"/g, '\\"')}"]`,
+  )
+  if ((await exact.count()) > 0) return exact.first()
   const badge = page
     .locator(`${SELECTORS.refBadge.join(",")}`)
     .filter({ hasText: name })
@@ -484,6 +618,7 @@ async function layoutSnapshot(page) {
       rows: rows.map((row) => ({
         index: Number(row.dataset.index),
         top: Number(row.dataset.rowTop),
+        height: row.getBoundingClientRect().height,
         hash: row.dataset.commit,
         expanded: row.getAttribute("aria-expanded") === "true",
         paths: row.querySelectorAll(".gg-graph-svg path").length,
@@ -997,12 +1132,104 @@ async function refBadgeSnapshot(page) {
     const more = [...document.querySelectorAll('[data-testid="ref-more"], .gg-ref-more')]
       .map((element) => (element.textContent ?? "").replace(/\s+/g, " ").trim())
       .find((text) => text.length > 0)
-    return { badges, more: more ?? null }
+    const containers = [...document.querySelectorAll(".gg-ref-badges")].map((container) => {
+      const style = getComputedStyle(container)
+      return {
+        commit: container.closest(".gg-graph-row")?.getAttribute("data-commit") ?? null,
+        count: container.querySelectorAll('[data-testid="ref-badge"]').length,
+        names: [...container.querySelectorAll('[data-testid="ref-badge"]')].map(
+          (badge) => badge.getAttribute("data-ref-name") ?? (badge.textContent ?? "").trim(),
+        ),
+        scrollWidth: container.scrollWidth,
+        clientWidth: container.clientWidth,
+        overflowX: style.overflowX,
+        horizontalScroll: container.scrollWidth > container.clientWidth + 1,
+      }
+    })
+    return {
+      badges,
+      more: more ?? null,
+      moreCount: more ? 1 : 0,
+      containers,
+    }
   })
 }
 
 
-/* ---------- release extension helpers (WIP selectors are documented in README) ---------- */
+async function rowRefsState(page, hash) {
+  return page.evaluate((wanted) => {
+    const row = [...document.querySelectorAll(".gg-graph-row[data-commit]")].find(
+      (candidate) => candidate.getAttribute("data-commit") === wanted,
+    )
+    if (!row) return { present: false }
+    const rowRect = row.getBoundingClientRect()
+    const desc = row.querySelector(".gg-col-desc")
+    const descRect = desc?.getBoundingClientRect() ?? null
+    const container = row.querySelector(".gg-ref-badges")
+    const containerRect = container?.getBoundingClientRect() ?? null
+    const badges = [...row.querySelectorAll('[data-testid="ref-badge"]')].map((badge) => {
+      const style = getComputedStyle(badge)
+      const rect = badge.getBoundingClientRect()
+      return {
+        name: badge.getAttribute("data-ref-name") ?? (badge.textContent ?? "").trim(),
+        text: (badge.textContent ?? "").replace(/\s+/g, " ").trim(),
+        scrollWidth: badge.scrollWidth,
+        clientWidth: badge.clientWidth,
+        scrollHeight: badge.scrollHeight,
+        clientHeight: badge.clientHeight,
+        textOverflow: style.textOverflow,
+        whiteSpace: style.whiteSpace,
+        noEllipsis: style.textOverflow !== "ellipsis",
+        fullyVisible:
+          badge.scrollWidth <= badge.clientWidth + 1 &&
+          badge.scrollHeight <= badge.clientHeight + 1,
+        rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
+        insideRow:
+          rect.left >= rowRect.left - 1 &&
+          rect.right <= rowRect.right + 1 &&
+          rect.top >= rowRect.top - 1 &&
+          rect.bottom <= rowRect.bottom + 1,
+        insideDescription:
+          descRect === null ||
+          (rect.left >= descRect.left - 1 &&
+            rect.right <= descRect.right + 1 &&
+            rect.top >= descRect.top - 1 &&
+            rect.bottom <= descRect.bottom + 1),
+      }
+    })
+    const containerStyle = container ? getComputedStyle(container) : null
+    const more = row.querySelector('[data-testid="ref-more"]')
+    return {
+      present: true,
+      rowHeight: rowRect.height,
+      rowTop: Number(row.dataset.rowTop),
+      rowBottom: rowRect.bottom,
+      rowScrollWidth: row.scrollWidth,
+      rowClientWidth: row.clientWidth,
+      rowOverflow: row.scrollWidth > row.clientWidth + 1,
+      badges,
+      container: container
+        ? {
+            scrollWidth: container.scrollWidth,
+            clientWidth: container.clientWidth,
+            scrollHeight: container.scrollHeight,
+            clientHeight: container.clientHeight,
+            overflowX: containerStyle?.overflowX ?? null,
+            horizontalScroll: container.scrollWidth > container.clientWidth + 1,
+            rect: containerRect
+              ? {
+                  left: containerRect.left,
+                  top: containerRect.top,
+                  right: containerRect.right,
+                  bottom: containerRect.bottom,
+                }
+              : null,
+          }
+        : null,
+      more: more ? (more.textContent ?? "").replace(/\s+/g, " ").trim() : null,
+    }
+  }, hash)
+}
 
 function runGit(cwd, args, { allowFailure = false } = {}) {
   try {
@@ -1029,6 +1256,271 @@ function runGit(cwd, args, { allowFailure = false } = {}) {
 function runGitAllowFailure(cwd, args) {
   return runGit(cwd, args, { allowFailure: true })
 }
+
+function recordRpcRequests(page) {
+  const entries = []
+  page.on("request", (request) => {
+    if (!request.url().includes("/__gg/rpc/")) return
+    entries.push({
+      method: request.url().split("/__gg/rpc/")[1],
+      input: parseInput(request),
+      at: Date.now(),
+    })
+  })
+  return entries
+}
+
+function countRpcSince(entries, index, method) {
+  return entries.slice(index).filter((entry) => entry.method === method).length
+}
+
+async function waitRequestQuiet(entries, quietMs = 700, timeout = 7_000) {
+  const started = Date.now()
+  let lastLength = entries.length
+  let lastChange = Date.now()
+  while (Date.now() - started < timeout) {
+    if (entries.length !== lastLength) {
+      lastLength = entries.length
+      lastChange = Date.now()
+    }
+    if (Date.now() - lastChange >= quietMs) return true
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  return false
+}
+
+function createTempCommit(repoRoot, prefix) {
+  const name = `${prefix}-${Date.now().toString(36)}.txt`
+  writeFileSync(join(repoRoot, name), `fixture ${Date.now()}\n`)
+  runGit(repoRoot, ["add", "--", name])
+  runGit(repoRoot, ["commit", "-m", `${prefix} fixture ${Date.now()}`])
+  return { name, head: runGit(repoRoot, ["rev-parse", "HEAD"]) }
+}
+
+/**
+ * The TEMP branch/tag flow needs at least two commit rows and one real file
+ * change. Create throwaway commits in TEMP if the fixture is too small, then
+ * let the UI load them. TEMP writes are allowed; FR is never touched.
+ */
+async function ensureTempHistory(tempRepo, minimum = 2) {
+  const readLog = async () =>
+    (await fetchRpc(TEMP_ORIGIN, "getLog", { repositoryId: tempRepo.id, limit: 20 })).body.result
+  let log = await readLog()
+  let hasFiles = false
+  for (const commit of log.commits.slice(0, 5)) {
+    const files = (await fetchRpc(TEMP_ORIGIN, "getCommitFiles", {
+      repositoryId: tempRepo.id,
+      hash: commit.hash,
+      parentIndex: 0,
+    })).body.result.files
+    if (files.length > 0) {
+      hasFiles = true
+      break
+    }
+  }
+  const created = []
+  let guard = 0
+  while ((log.commits.length < minimum || !hasFiles) && guard < 4) {
+    created.push(createTempCommit(tempRepo.rootPath, "gg-history-seed"))
+    log = await readLog()
+    hasFiles = true
+    guard += 1
+  }
+  return { created, hasFiles, commits: log.commits.length }
+}
+
+async function repoHasRemoteOnlyHistory(repo) {
+  const local = (await fetchRpc(FR_ORIGIN, "getLog", {
+    repositoryId: repo.id,
+    limit: 50,
+    showRemotes: false,
+    showTags: true,
+  })).body.result.commits.map((commit) => commit.hash)
+  const all = (await fetchRpc(FR_ORIGIN, "getLog", {
+    repositoryId: repo.id,
+    limit: 50,
+    showRemotes: true,
+    showTags: true,
+  })).body.result.commits.map((commit) => commit.hash)
+  const localSet = new Set(local)
+  return all.some((hash) => !localSet.has(hash))
+}
+
+async function findRepoWithRemoteOnlyHistory(repositories, preferred) {
+  const ordered = [
+    ...(preferred ? [preferred] : []),
+    ...repositories.filter((repo) => repo.id !== preferred?.id),
+  ]
+  for (const repo of ordered) {
+    if (repo.type !== "normal" && repo.type !== "worktree") continue
+    if (await repoHasRemoteOnlyHistory(repo)) return repo
+  }
+  return null
+}
+
+async function findRepoWithRefKind(repositories, kind, preferred) {
+  const ordered = [
+    ...(preferred ? [preferred] : []),
+    ...repositories.filter((repo) => repo.id !== preferred?.id),
+  ]
+  for (const repo of ordered) {
+    if (repo.type !== "normal" && repo.type !== "worktree") continue
+    const refs = (await fetchRpc(FR_ORIGIN, "getRefs", { repositoryId: repo.id })).body.result.refs
+    const ref = refs.find((candidate) => candidate.kind === kind)
+    if (ref) return { repo, ref, refs }
+  }
+  return null
+}
+
+/**
+ * Fallback for environments where no FR repository has a remote-only commit in
+ * the first page. Build a real remote-tracking ref in the isolated TEMP fixture,
+ * then verify the same showRemotes behavior through the real UI.
+ */
+async function runShowRemotesTempFallback(browser) {
+  const repositories = (await fetchRpc(TEMP_ORIGIN, "listRepositories", {})).body.result.repositories
+  let chosen = null
+  let status = null
+  for (const repo of repositories) {
+    const next = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: repo.id })).body.result
+    if (
+      next.counts.staged === 0 &&
+      next.counts.unstaged === 0 &&
+      next.counts.untracked === 0 &&
+      next.counts.conflicted === 0
+    ) {
+      chosen = repo
+      status = next
+      break
+    }
+  }
+  if (!chosen || !status) return null
+  const root = chosen.rootPath
+  const baseBranch = status.branch
+  const baseHead = status.head
+  const branch = `gg-show-remotes-${Date.now().toString(36)}`
+  const remoteRef = "refs/remotes/origin/gg-show-remotes"
+  let created = null
+  let context = null
+  try {
+    runGit(root, ["checkout", "-b", branch])
+    created = createTempCommit(root, "gg-show-remotes")
+    runGit(root, ["update-ref", remoteRef, created.head])
+    runGit(root, ["checkout", baseBranch])
+    runGit(root, ["branch", "-D", branch])
+    context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+    const page = await context.newPage()
+    await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(chosen.id)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    const before = await visibleRowHashes(page)
+    const input = await triggerHistoryRequest(page, (value) => value.showRemotes === false, async () => {
+      await page.locator(SELECTORS.showRemotes[0]).click()
+    })
+    const after = await visibleRowHashes(page)
+    await triggerHistoryRequest(page, (value) => value.showRemotes !== false, async () => {
+      await page.locator(SELECTORS.showRemotes[0]).click()
+    })
+    return {
+      source: "TEMP",
+      input,
+      before,
+      after,
+      changed: before.join(",") !== after.join(","),
+      remoteRef,
+      commit: created.head,
+    }
+  } finally {
+    await context?.close().catch(() => {})
+    runGitAllowFailure(root, ["update-ref", "-d", remoteRef])
+    runGitAllowFailure(root, ["checkout", baseBranch])
+    runGitAllowFailure(root, ["reset", "--hard", baseHead])
+    runGitAllowFailure(root, ["branch", "-D", branch])
+    if (created) {
+      try {
+        unlinkSync(join(root, created.name))
+      } catch {
+        /* best-effort TEMP cleanup */
+      }
+    }
+  }
+}
+
+async function waitForVisibleCommit(page, hash, timeout = 10_000) {
+  await page.waitForFunction(
+    (wanted) =>
+      [...document.querySelectorAll(".gg-graph-row[data-commit]")].some(
+        (row) => row.getAttribute("data-commit") === wanted,
+      ),
+    hash,
+    { timeout },
+  )
+}
+
+async function waitForCurrentBranch(page, branch, timeout = 10_000) {
+  await page.waitForFunction(
+    (wanted) =>
+      (document.querySelector('[data-testid="current-branch"]')?.textContent ?? "").includes(wanted),
+    branch,
+    { timeout },
+  )
+}
+
+async function waitForRemoteBadge(page, refName, commitHash, timeout = 10_000) {
+  await page.waitForFunction(
+    ({ wanted, hash }) => {
+      const row = document.querySelector(`.gg-graph-row[data-commit="${hash}"]`)
+      if (!row) return false
+      return [...row.querySelectorAll('[data-testid="ref-badge"]')].some(
+        (badge) => badge.getAttribute("data-ref-name") === wanted,
+      )
+    },
+    { wanted: refName, hash: commitHash },
+    { timeout },
+  )
+}
+
+async function remountPanel(page) {
+  await page.evaluate(() => {
+    window.__ggOldPanel = document.querySelector(".git-graph-panel")
+  })
+  await page.locator(SELECTORS.remountPanel[0]).click()
+  await page.waitForFunction(
+    () => {
+      const panel = document.querySelector(".git-graph-panel")
+      return Boolean(panel && panel !== window.__ggOldPanel)
+    },
+    null,
+    { timeout: 10_000 },
+  )
+}
+
+async function panelPaintState(page) {
+  return page.evaluate(() => {
+    const panel = document.querySelector(".git-graph-panel")
+    const scroller = document.querySelector('[data-testid="history-scroll"]')
+    const expanded = document.querySelector(".gg-graph-row.gg-expanded")
+    const text = panel?.innerText ?? ""
+    return {
+      present: Boolean(panel),
+      rows: document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)").length,
+      scrollTop: scroller?.scrollTop ?? null,
+      expandedHash: expanded?.getAttribute("data-commit") ?? null,
+      slotPresent: Boolean(document.querySelector('[data-testid="inline-slot"]')),
+      loadingSkeleton:
+        /Loading repositories|Loading history|Loading refs|Loading commits/i.test(text) ||
+        Boolean(panel?.querySelector(".gg-skeleton, [data-testid=\"repository-skeleton\"]")),
+      branch: (document.querySelector('[data-testid="current-branch"]')?.textContent ?? "").trim(),
+    }
+  })
+}
+
 
 function localFileUrl(path) {
   return `file:///${path.replace(/\\/g, "/").replace(/^\/+/, "")}`
@@ -1113,6 +1605,68 @@ async function slotSnapshot(page) {
       visibleHashes: visible,
     }
   })
+}
+
+async function uncommittedSlotSnapshot(page) {
+  return page.evaluate(() => {
+    const q = (selector, root = document) => root.querySelector(selector)
+    const scroller = q('[data-testid="history-scroll"]')
+    const row = q('[data-testid="uncommitted-row"], .gg-uncommitted-row')
+    const slot = q('[data-testid="uncommitted-slot"]')
+    const handle = slot ? slot.querySelector('[data-testid="slot-resize-handle"]') : null
+    const spacer = q(".gg-history-spacer")
+    const rect = (element) => {
+      if (!element) return null
+      const r = element.getBoundingClientRect()
+      return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }
+    }
+    return {
+      rowPresent: Boolean(row),
+      row: rect(row),
+      slotPresent: Boolean(slot),
+      slot: rect(slot),
+      slotHeight: slot ? slot.getBoundingClientRect().height : null,
+      slotStyleHeight: slot ? Number.parseFloat(slot.style.height) : null,
+      handle: rect(handle),
+      handleCount: slot ? slot.querySelectorAll('[data-testid="slot-resize-handle"]').length : 0,
+      spacerLeadingSlotHeight: spacer ? Number(spacer.dataset.leadingSlotHeight ?? NaN) : null,
+      expanded: row?.getAttribute("aria-expanded") === "true",
+      scrollTop: scroller ? scroller.scrollTop : null,
+      scrollHeight: scroller ? scroller.scrollHeight : null,
+      clientHeight: scroller ? scroller.clientHeight : null,
+      distanceToBottom: scroller
+        ? scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop
+        : null,
+    }
+  })
+}
+
+async function dragUncommittedSlotHandle(page, deltaY) {
+  const selector = '[data-testid="uncommitted-slot"] [data-testid="slot-resize-handle"]'
+  const handle = page.locator(selector).first()
+  await handle.waitFor({ state: "visible", timeout: 10_000 })
+  const box = await handle.boundingBox()
+  if (!box) throw new Error("uncommitted slot resize handle has no box")
+  const before = await uncommittedSlotSnapshot(page)
+  const viewport = page.viewportSize() ?? { width: 1280, height: 900 }
+  const x = box.x + box.width / 2
+  const y = box.y + box.height / 2
+  const targetY = Math.max(2, Math.min(viewport.height - 2, y + deltaY))
+  await page.mouse.move(x, y)
+  await page.mouse.down()
+  await page.mouse.move(x, targetY, { steps: 10 })
+  await page.mouse.up()
+  await page.waitForFunction(
+    (previous) => {
+      const slot = document.querySelector('[data-testid="uncommitted-slot"]')
+      return Boolean(slot && Math.abs(slot.getBoundingClientRect().height - previous) > 0.5)
+    },
+    before.slotHeight,
+    { timeout: 10_000 },
+  ).catch(() => {})
+  await waitRaf(page, 3)
+  const after = await uncommittedSlotSnapshot(page)
+  return { before, after, deltaY: targetY - y }
 }
 
 async function waitSlotHeightSettled(page, previousHeight) {
@@ -1672,7 +2226,7 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
     const viewportTop = after.scroller.scrollTop
     const viewportBottom = viewportTop + after.scroller.clientHeight
     const visibleRows = after.rows.filter(
-      (row) => row.top < viewportBottom && row.top + (after.rowHeight ?? 28) > viewportTop,
+      (row) => row.top < viewportBottom && row.top + (row.height ?? after.rowHeight ?? 28) > viewportTop,
     )
     const last = visibleRows.at(-1)
     metrics.compareScroll = { before, after, compare, scrollBeforeCompare, compareRequests }
@@ -1695,7 +2249,7 @@ async function compareScrollScenario(browser, frPrimary, checks, metrics) {
       "comparison Back leaves no DOM blank in the viewport",
       visibleRows.length > 0 &&
         visibleRows[0].top <= viewportTop + 2 &&
-        last.top + (after.rowHeight ?? 28) >= viewportBottom - 4,
+        last.top + (last.height ?? after.rowHeight ?? 28) >= viewportBottom - 4,
       { visibleFirst: visibleRows[0] ?? null, visibleLast: last ?? null, viewportTop, viewportBottom },
     )
 
@@ -2852,6 +3406,297 @@ async function inlineLayoutScenario(browser, frPrimary, checks, metrics) {
   }
 }
 
+async function dynamicRefRowScenario(browser, frPrimary, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  try {
+    const page = await context.newPage()
+    await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 1,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+    await waitLoaded(page, 100)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    await page.locator('[data-testid="harness-width-1100"]').click()
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="harness-panel-shell"]')?.dataset.panelWidth === "1100",
+      null,
+      { timeout: 15_000 },
+    )
+    await waitRaf(page, 2)
+
+    const refs = (await fetchRpc(FR_ORIGIN, "getRefs", { repositoryId: frPrimary.id })).body.result.refs
+    const log = (await fetchRpc(FR_ORIGIN, "getLog", { repositoryId: frPrimary.id, limit: 100 })).body.result
+    const refsByHash = new Map()
+    for (const ref of refs) {
+      if (ref.kind === "head") continue
+      const list = refsByHash.get(ref.hash) ?? []
+      list.push(ref)
+      refsByHash.set(ref.hash, list)
+    }
+    const ranked = log.commits
+      .map((commit, index) => ({ commit, index, refs: refsByHash.get(commit.hash) ?? [] }))
+      .sort(
+        (left, right) =>
+          right.refs.reduce((sum, ref) => sum + ref.name.length, 0) -
+          left.refs.reduce((sum, ref) => sum + ref.name.length, 0),
+      )
+    const preferred = ranked.filter(
+      (entry) => entry.refs.length >= 3 && entry.refs.length <= 12,
+    )
+    let candidate = null
+    // Prefer a multi-ref commit that also has files, so the slot/Back checks are real.
+    for (const entry of preferred.slice(0, 20)) {
+      const files = (await fetchRpc(FR_ORIGIN, "getCommitFiles", {
+        repositoryId: frPrimary.id,
+        hash: entry.commit.hash,
+        parentIndex: 0,
+      })).body.result.files
+      if (files.length > 0) {
+        candidate = entry
+        break
+      }
+    }
+    candidate ??= preferred[0] ?? ranked[0]
+    if (!candidate) {
+      checkResult(checks, "dynamic ref row fixture has refs", false, { refs: refs.length, commits: log.commits.length })
+      return
+    }
+    const expectedNames = [...new Set(candidate.refs.map((ref) => ref.name))]
+    await scrollToRowIndex(page, candidate.index)
+    await page.waitForFunction(
+      (hash) => Boolean(document.querySelector(`.gg-graph-row[data-commit="${hash}"]`)),
+      candidate.commit.hash,
+      { timeout: 20_000 },
+    )
+    await waitRaf(page, 2)
+    const state = await rowRefsState(page, candidate.commit.hash)
+    metrics.dynamicRef = {
+      hash: candidate.commit.hash,
+      index: candidate.index,
+      expectedNames,
+      state,
+    }
+    const allBadgesVisible =
+      state.present &&
+      state.more === null &&
+      state.container !== null &&
+      !state.container.horizontalScroll &&
+      state.badges.every(
+        (badge) =>
+          badge.noEllipsis &&
+          badge.fullyVisible &&
+          badge.insideRow &&
+          badge.insideDescription,
+      )
+    checkResult(
+      checks,
+      "a multi-ref commit renders every ref name without +N or horizontal scrolling",
+      allBadgesVisible &&
+        expectedNames.length >= 3 &&
+        expectedNames.every((name) =>
+          state.badges.some((badge) => badge.name === name && badge.text.includes(name)),
+        ) &&
+        new Set(state.badges.map((badge) => badge.name)).size === state.badges.length,
+      { expectedNames, state },
+    )
+    checkResult(
+      checks,
+      "the multi-ref commit row grows beyond the 28px base height",
+      state.present && state.rowHeight > 28.5,
+      { rowHeight: state.rowHeight, rowTop: state.rowTop },
+    )
+    const nextRow = await page.evaluate((hash) => {
+      const row = [...document.querySelectorAll(".gg-graph-row[data-commit]")].find(
+        (candidateRow) => candidateRow.getAttribute("data-commit") === hash,
+      )
+      const next = [...(row?.parentElement?.querySelectorAll(".gg-graph-row[data-commit]") ?? [])].find(
+        (candidateRow) => Number(candidateRow.dataset.index) === Number(row?.dataset.index) + 1,
+      )
+      if (!row || !next) return null
+      return {
+        top: Number(next.dataset.rowTop),
+        height: next.getBoundingClientRect().height,
+      }
+    }, candidate.commit.hash)
+    checkResult(
+      checks,
+      "variable row heights keep the virtual prefix sum contiguous",
+      nextRow === null ||
+        Math.abs(nextRow.top - (state.rowTop + state.rowHeight)) <= 1,
+      { rowTop: state.rowTop, rowHeight: state.rowHeight, nextRow },
+    )
+
+    // Search by the real short hash, then return to the multi-ref row.
+    const searchInput = page.locator(SELECTORS.search[0])
+    await searchInput.fill(candidate.commit.hash.slice(0, 7))
+    await page.keyboard.press("Enter")
+    await page.waitForFunction(
+      (hash) =>
+        Boolean(document.querySelector(`.gg-graph-row[data-commit="${hash}"].gg-search-match`)),
+      candidate.commit.hash,
+      { timeout: 10_000 },
+    ).catch(() => {})
+    const searched = await rowRefsState(page, candidate.commit.hash)
+    checkResult(
+      checks,
+      "search finds the multi-ref commit and keeps all ref badges visible",
+      searched.present &&
+        searched.more === null &&
+        searched.rowHeight > 28.5 &&
+        searched.badges.length >= expectedNames.length,
+      { searched },
+    )
+    await searchInput.fill("")
+    await page.keyboard.press("Enter")
+    await waitRaf(page, 2)
+    await scrollToRowIndex(page, candidate.index)
+
+    // Expand the tall row: the slot must start at the row's real bottom.
+    const row = page.locator(`.gg-graph-row[data-commit="${candidate.commit.hash}"]`)
+    await row.locator(".gg-subject").click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await page.waitForFunction(
+      () => {
+        const tree = document.querySelector('[data-testid="inline-files"]')
+        return Boolean(tree) && !tree.querySelector(".gg-status")
+      },
+      null,
+      { timeout: 20_000 },
+    ).catch(() => {})
+    await waitRaf(page, 2)
+    const expandedLayout = await page.evaluate((hash) => {
+      const row = [...document.querySelectorAll(".gg-graph-row[data-commit]")].find(
+        (candidateRow) => candidateRow.getAttribute("data-commit") === hash,
+      )
+      const slot = document.querySelector('[data-testid="inline-slot"]')
+      if (!row || !slot) return null
+      const rowRect = row.getBoundingClientRect()
+      const slotRect = slot.getBoundingClientRect()
+      const next = [...row.parentElement.querySelectorAll(".gg-graph-row[data-commit]")].find(
+        (candidateRow) => Number(candidateRow.dataset.index) === Number(row.dataset.index) + 1,
+      )
+      const nextRect = next?.getBoundingClientRect() ?? null
+      return {
+        rowHeight: rowRect.height,
+        rowTop: rowRect.top,
+        rowBottom: rowRect.bottom,
+        slotTop: slotRect.top,
+        slotHeight: slotRect.height,
+        nextTop: nextRect?.top ?? null,
+      }
+    }, candidate.commit.hash)
+    checkResult(
+      checks,
+      "inline slot starts at the tall row bottom and shifts following rows by its height",
+      Boolean(expandedLayout) &&
+        Math.abs(expandedLayout.slotTop - expandedLayout.rowBottom) <= 1 &&
+        (expandedLayout.nextTop === null ||
+          Math.abs(expandedLayout.nextTop - (expandedLayout.slotTop + expandedLayout.slotHeight)) <= 1),
+      expandedLayout,
+    )
+    const beforeSlotDrag = await slotSnapshot(page)
+    const slotDrag = await dragSlotHandle(page, 36)
+    const afterSlotDrag = slotDrag.after
+    const afterDragRow = await rowRefsState(page, candidate.commit.hash)
+    checkResult(
+      checks,
+      "slot height drag stays compatible with the variable-height row",
+      beforeSlotDrag.slotHeight !== null &&
+        afterSlotDrag.slotHeight !== null &&
+        Math.abs(afterSlotDrag.slotHeight - beforeSlotDrag.slotHeight) >= 2 &&
+        afterDragRow.present &&
+        Math.abs(afterDragRow.rowHeight - state.rowHeight) <= 1,
+      { before: beforeSlotDrag.slotHeight, after: afterSlotDrag.slotHeight, rowHeight: afterDragRow.rowHeight },
+    )
+
+    // Open a real file diff and use Back; the tall row/slot/scroll must survive.
+    const fileRow = page.locator(`${SELECTORS.inlineFiles[0]} .gg-file-row`).first()
+    if ((await fileRow.count()) > 0) {
+      const scrollBeforeDiff = await currentScrollTop(page)
+      await fileRow.click()
+      await waitForAny(page, [SELECTORS.commitDiff[0], '[data-testid="commit-diff-page"]'])
+      await page.waitForFunction(
+        () => Boolean(document.querySelector('[data-testid="details-back"]')),
+        null,
+        { timeout: 10_000 },
+      )
+      await page.locator(SELECTORS.detailsBack[0]).click()
+      await page.waitForFunction(
+        () => !document.querySelector('[data-testid="commit-diff-page"]') && Boolean(document.querySelector('[data-testid="inline-slot"]')),
+        null,
+        { timeout: 20_000 },
+      )
+      await waitRaf(page, 3)
+      const backState = await rowRefsState(page, candidate.commit.hash)
+      checkResult(
+        checks,
+        "Back from a tall-row file diff restores the row, slot and scroll",
+        backState.present &&
+          backState.rowHeight > 28.5 &&
+          backState.more === null &&
+          Math.abs((await currentScrollTop(page)) - scrollBeforeDiff) <= 1,
+        { backState, scrollBeforeDiff, scrollAfter: await currentScrollTop(page) },
+      )
+    } else {
+      checkResult(checks, "tall-row file diff Back is exercisable", false, { hash: candidate.commit.hash })
+    }
+
+    // Collapse before resizing so the width check measures the row, not the slot.
+    await row.locator(".gg-subject").click()
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="inline-slot"]'),
+      null,
+      { timeout: 10_000 },
+    ).catch(() => {})
+    await waitRaf(page, 2)
+
+    const widthStates = {}
+    for (const width of [520, 1100]) {
+      await page.locator(`[data-testid="harness-width-${width}"]`).click()
+      await page.waitForFunction(
+        (expected) =>
+          document.querySelector('[data-testid="harness-panel-shell"]')?.dataset.panelWidth ===
+          String(expected),
+        width,
+        { timeout: 15_000 },
+      )
+      await waitRaf(page, 2)
+      await scrollToRowIndex(page, candidate.index)
+      await page.waitForFunction(
+        (hash) => Boolean(document.querySelector(`.gg-graph-row[data-commit="${hash}"]`)),
+        candidate.commit.hash,
+        { timeout: 20_000 },
+      )
+      const widthState = await rowRefsState(page, candidate.commit.hash)
+      const layout = await layoutSnapshot(page)
+      widthStates[width] = { state: widthState, overflow: layout.panelOverflowX, doc: layout.doc }
+      checkResult(
+        checks,
+        `${width}px reflows the multi-ref row without losing badges or overflowing`,
+        widthState.present &&
+          widthState.rowHeight > 28.5 &&
+          widthState.more === null &&
+          widthState.container !== null &&
+          !widthState.container.horizontalScroll &&
+          widthState.badges.length >= expectedNames.length &&
+          layout.panelOverflowX <= 1 &&
+          layout.doc.scrollWidth <= layout.doc.clientWidth,
+        { width, state: widthState, panelOverflow: layout.panelOverflowX, doc: layout.doc },
+      )
+    }
+    metrics.dynamicRef.widths = widthStates
+    await screenshot(page, "18c-fr-dynamic-ref-row.png", { fullPage: true })
+  } catch (error) {
+    checkResult(checks, "dynamic ref row scenario executes", false, { error: String(error) })
+  } finally {
+    await context.close().catch(() => {})
+  }
+}
+
 async function selectedFilterScenario(browser, tempRepo, checks, metrics) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } })
   const page = await context.newPage()
@@ -3612,6 +4457,410 @@ async function slotResizeScenario(browser, frPrimary, checks, metrics) {
 }
 
 /**
+ * Real filesystem/git events outside the page must reach the panel without a
+ * Refresh click. Each phase records the RPC burst so a coalescing regression
+ * (multiple full getLog refreshes per git event) is visible.
+ */
+async function watcherRefreshScenario(browser, tempRepo, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  const page = await context.newPage()
+  const requests = recordRpcRequests(page)
+  let remote = null
+  let baseHead = null
+  let baseBranch = "main"
+  let createdCommit = null
+  try {
+    let status0 = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    if (status0.branch !== "main") {
+      runGit(tempRepo.rootPath, ["checkout", "main"])
+      status0 = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    }
+    baseHead = status0.head
+    baseBranch = status0.branch
+    await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 2,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(tempRepo.id)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    await waitForCurrentBranch(page, baseBranch, 15_000)
+    await waitRequestQuiet(requests)
+
+    // 1) External commit must appear without pressing Refresh.
+    const commitPhase = requests.length
+    createdCommit = createTempCommit(tempRepo.rootPath, "gg-watch-commit")
+    await waitForVisibleCommit(page, createdCommit.head, 10_000)
+    await waitNotBusy(page)
+    await waitRequestQuiet(requests)
+    const commitLogs = countRpcSince(requests, commitPhase, "getLog")
+    const commitState = await panelPaintState(page)
+    metrics.watcher = {
+      baseHead,
+      baseBranch,
+      createdHead: createdCommit.head,
+      commit: { logs: commitLogs, state: commitState },
+    }
+    checkResult(
+      checks,
+      "watcher shows an externally created commit without pressing Refresh",
+      commitState.rows > 0 && !commitState.loadingSkeleton,
+      { logs: commitLogs, state: commitState },
+    )
+    checkResult(
+      checks,
+      "external commit refresh coalesces to 1-3 getLog requests",
+      commitLogs >= 1 && commitLogs <= 3,
+      { getLog: commitLogs },
+    )
+
+    // 2) External checkout must update the current-branch label.
+    const refs = (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs
+    const feature = refs.find((ref) => ref.kind === "branch" && ref.name === "feature")
+    const checkoutPhase = requests.length
+    if (feature) {
+      runGit(tempRepo.rootPath, ["checkout", "feature"])
+      await waitForCurrentBranch(page, "feature", 10_000)
+      await waitNotBusy(page)
+      await waitRequestQuiet(requests)
+    }
+    const checkoutLogs = countRpcSince(requests, checkoutPhase, "getLog")
+    const checkoutStatus = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    const checkoutState = await panelPaintState(page)
+    metrics.watcher.checkout = { hasFeature: Boolean(feature), logs: checkoutLogs, status: checkoutStatus.branch, state: checkoutState }
+    checkResult(
+      checks,
+      "watcher updates current-branch after an external checkout",
+      Boolean(feature) && checkoutStatus.branch === "feature" && checkoutState.branch.includes("feature"),
+      metrics.watcher.checkout,
+    )
+    checkResult(
+      checks,
+      "external checkout does not create a getLog refresh storm (0-3)",
+      checkoutLogs <= 3,
+      { getLog: checkoutLogs },
+    )
+
+    // 3) External fetch of a local bare remote must update the remote badge.
+    const fetchStatus = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    remote = setupFetchRemote(tempRepo, fetchStatus)
+    const fetchPhase = requests.length
+    runGit(tempRepo.rootPath, ["fetch", remote.remoteName])
+    const remoteRef = `${remote.remoteName}/fetch-target`
+    const remoteRefHash = runGit(tempRepo.rootPath, ["rev-parse", `refs/remotes/${remoteRef}`])
+    await page.locator(SELECTORS.historyScroll[0]).evaluate((element) => {
+      element.scrollTop = 0
+    })
+    await waitRaf(page, 2)
+    await waitForRemoteBadge(page, remoteRef, remoteRefHash, 10_000)
+    await waitNotBusy(page)
+    await waitRequestQuiet(requests)
+    const fetchLogs = countRpcSince(requests, fetchPhase, "getLog")
+    const fetchRefs = countRpcSince(requests, fetchPhase, "getRefs")
+    const fetchState = await panelPaintState(page)
+    metrics.watcher.fetch = { remote: remote.remoteName, remoteRef, remoteRefHash, logs: fetchLogs, refs: fetchRefs, state: fetchState }
+    checkResult(
+      checks,
+      "watcher advances the remote badge after an external local fetch",
+      fetchRefs >= 1 && remoteRefHash === fetchStatus.head,
+      { getLog: fetchLogs, getRefs: fetchRefs, remoteRefHash, expected: fetchStatus.head, state: fetchState },
+    )
+    checkResult(
+      checks,
+      "external fetch does not create a getLog refresh storm (0-3)",
+      fetchLogs <= 3,
+      { getLog: fetchLogs },
+    )
+    metrics.watcher.maxGetLogPerEvent = Math.max(commitLogs, checkoutLogs, fetchLogs)
+    checkResult(
+      checks,
+      "watcher coalesces each external event within 3 getLog requests",
+      metrics.watcher.maxGetLogPerEvent <= 3 && commitLogs >= 1,
+      { commitLogs, checkoutLogs, fetchLogs },
+    )
+  } catch (error) {
+    checkResult(checks, "watcher auto-refresh scenario executes", false, { error: String(error) })
+  } finally {
+    if (remote) remote.cleanup()
+    if (baseHead) {
+      runGitAllowFailure(tempRepo.rootPath, ["checkout", baseBranch])
+      runGitAllowFailure(tempRepo.rootPath, ["reset", "--hard", baseHead])
+    }
+    if (createdCommit) {
+      try {
+        unlinkSync(join(tempRepo.rootPath, createdCommit.name))
+      } catch {
+        /* best-effort TEMP cleanup */
+      }
+    }
+    await context.close().catch(() => {})
+  }
+}
+
+/**
+ * The host disposes the panel on tab/file switches. The module-level cache must
+ * repaint history before any spinner and validate HEAD/refs in the background
+ * without re-fetching the commit page when they did not move.
+ */
+async function remountCacheScenario(browser, tempRepo, checks, metrics) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
+  const page = await context.newPage()
+  const requests = recordRpcRequests(page)
+  let baseHead = null
+  let baseBranch = "main"
+  let createdCommit = null
+  try {
+    let status0 = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    if (status0.branch !== "main") {
+      runGit(tempRepo.rootPath, ["checkout", "main"])
+      status0 = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
+    }
+    baseHead = status0.head
+    baseBranch = status0.branch
+    await page.goto(TEMP_BASE, { waitUntil: "domcontentloaded" })
+    await page.waitForFunction(
+      () => document.querySelectorAll('[data-testid="repository-select"] option').length >= 2,
+      null,
+      { timeout: 30_000 },
+    )
+    await page.locator(SELECTORS.repository[0]).selectOption(tempRepo.id)
+    await waitRows(page, 1)
+    await waitNotBusy(page)
+    await waitForCurrentBranch(page, baseBranch, 15_000)
+    await waitRequestQuiet(requests)
+
+    const log = (await fetchRpc(TEMP_ORIGIN, "getLog", { repositoryId: tempRepo.id, limit: 100 })).body.result
+    let candidate = -1
+    for (let index = 1; index < Math.min(8, log.commits.length); index += 1) {
+      const files = (await fetchRpc(TEMP_ORIGIN, "getCommitFiles", {
+        repositoryId: tempRepo.id,
+        hash: log.commits[index].hash,
+        parentIndex: 0,
+      })).body.result.files
+      if (files.length > 0) {
+        candidate = index
+        break
+      }
+    }
+    if (candidate < 0) {
+      checkResult(checks, "remount fixture has a mid-history commit with files", false, { commits: log.commits.length })
+      return
+    }
+    await scrollToRowIndex(page, candidate)
+    await page.locator(`.gg-graph-row[data-index="${candidate}"] .gg-subject`).click()
+    await waitForAny(page, SELECTORS.inlineSlot)
+    await page.waitForFunction(
+      () => {
+        const files = document.querySelector('[data-testid="inline-files"]')
+        return Boolean(files) && !files.querySelector(".gg-status")
+      },
+      null,
+      { timeout: 20_000 },
+    ).catch(() => {})
+    await waitRaf(page, 2)
+
+    const before = await panelPaintState(page)
+    const rowHeight = await page
+      .locator(".gg-graph-row:not(.gg-uncommitted-row)")
+      .first()
+      .evaluate((row) => row.getBoundingClientRect().height)
+      .catch(() => 28)
+    const refsBefore = refsSignature(
+      (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs,
+    )
+    const remountPhase = requests.length
+    await page.evaluate(() => {
+      const shell = document.querySelector('[data-testid="harness-panel-shell"]')
+      const skeletonNow = () => {
+        const panel = document.querySelector(".git-graph-panel")
+        if (!panel) return false
+        const text = panel.innerText ?? ""
+        return (
+          /Loading repositories|Loading history|Loading refs|Loading commits/i.test(text) ||
+          Boolean(panel.querySelector('.gg-skeleton, [data-testid="repository-skeleton"]'))
+        )
+      }
+      window.__ggSkeletonSeen = false
+      window.__ggSkeletonObserver?.disconnect?.()
+      window.__ggSkeletonObserver = new MutationObserver(() => {
+        if (skeletonNow()) window.__ggSkeletonSeen = true
+      })
+      if (shell) {
+        window.__ggSkeletonObserver.observe(shell, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        })
+      }
+    })
+    const remountStarted = Date.now()
+    await remountPanel(page)
+    await page.waitForFunction(
+      () => {
+        const panel = document.querySelector(".git-graph-panel")
+        const text = panel?.innerText ?? ""
+        return Boolean(
+          panel &&
+            document.querySelectorAll(".gg-graph-row:not(.gg-uncommitted-row)").length > 0 &&
+            !/Loading repositories|Loading history|Loading refs|Loading commits/i.test(text) &&
+            !panel.querySelector('.gg-skeleton, [data-testid="repository-skeleton"]'),
+        )
+      },
+      null,
+      { timeout: 5_000 },
+    )
+    const paintMs = Date.now() - remountStarted
+    const immediate = await panelPaintState(page)
+    const skeletonSeen = await page.evaluate(() => {
+      const seen = window.__ggSkeletonSeen === true
+      window.__ggSkeletonObserver?.disconnect?.()
+      return seen
+    })
+    immediate.skeletonSeen = skeletonSeen
+    immediate.paintMs = paintMs
+    await page.waitForFunction(
+      ({ top, hash }) => {
+        const scroller = document.querySelector('[data-testid="history-scroll"]')
+        const expanded = document.querySelector(".gg-graph-row.gg-expanded")
+        return Boolean(
+          scroller &&
+            Math.abs(scroller.scrollTop - top) <= 1 &&
+            expanded?.getAttribute("data-commit") === hash &&
+            document.querySelector('[data-testid="inline-slot"]'),
+        )
+      },
+      { top: before.scrollTop ?? 0, hash: before.expandedHash },
+      { timeout: 10_000 },
+    )
+    await waitRequestQuiet(requests)
+    const restored = await panelPaintState(page)
+    const remountLogs = countRpcSince(requests, remountPhase, "getLog")
+    const remountStatusCalls = countRpcSince(requests, remountPhase, "getStatus")
+    const remountRefCalls = countRpcSince(requests, remountPhase, "getRefs")
+    const refsAfter = refsSignature(
+      (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs,
+    )
+    metrics.remount = {
+      candidate,
+      before,
+      immediate,
+      restored,
+      remountLogs,
+      remountStatusCalls,
+      remountRefCalls,
+      refsUnchanged: refsBefore === refsAfter,
+    }
+    checkResult(
+      checks,
+      "panel remount paints cached history immediately without a repository loading skeleton",
+      immediate.present &&
+        immediate.rows > 0 &&
+        !immediate.loadingSkeleton &&
+        !immediate.skeletonSeen &&
+        immediate.paintMs < 2_000 &&
+        immediate.branch.length > 0,
+      { immediate },
+    )
+    checkResult(
+      checks,
+      "panel remount restores scrollTop and the expanded commit within 1px/same hash",
+      restored.scrollTop !== null &&
+        before.scrollTop !== null &&
+        Math.abs(restored.scrollTop - before.scrollTop) <= 1 &&
+        restored.expandedHash === before.expandedHash &&
+        restored.slotPresent,
+      { before, restored },
+    )
+    checkResult(
+      checks,
+      "unchanged HEAD/refs remount validates without re-running getLog",
+      remountLogs === 0,
+      { getLog: remountLogs, getStatus: remountStatusCalls, getRefs: remountRefCalls },
+    )
+    checkResult(
+      checks,
+      "remount keeps refs unchanged and the restored panel remains interactive",
+      refsBefore === refsAfter && restored.slotPresent,
+      { refsUnchanged: refsBefore === refsAfter, restored },
+    )
+
+    const interactionIndex = Math.min(candidate + 1, log.commits.length - 1)
+    const interactionRow = page.locator(`.gg-graph-row[data-index="${interactionIndex}"]`)
+    if (await interactionRow.count()) {
+      await scrollToRowIndex(page, interactionIndex)
+      await interactionRow.locator(".gg-subject").click()
+      await waitForAny(page, SELECTORS.inlineSlot)
+      await waitRaf(page, 2)
+      const interacted = await panelPaintState(page)
+      checkResult(
+        checks,
+        "remount cache painting does not block later row interaction",
+        interacted.rows > 0 && interacted.slotPresent && !interacted.loadingSkeleton,
+        { interacted },
+      )
+    } else {
+      checkResult(checks, "remount cache painting does not block later row interaction", false, { candidate })
+    }
+
+    // External commit on TEMP: remount (or the watcher event) must add it
+    // without losing the approximate reading position.
+    const externalBefore = await panelPaintState(page)
+    const externalPhase = requests.length
+    createdCommit = createTempCommit(tempRepo.rootPath, "gg-remount-commit")
+    await remountPanel(page)
+    await waitRaf(page, 2)
+    const externalAfter = await panelPaintState(page)
+    await page.locator(SELECTORS.historyScroll[0]).evaluate((element) => {
+      element.scrollTop = 0
+    })
+    await waitRaf(page, 2)
+    await waitForVisibleCommit(page, createdCommit.head, 10_000)
+    await waitNotBusy(page)
+    await waitRequestQuiet(requests)
+    const externalLogs = countRpcSince(requests, externalPhase, "getLog")
+    metrics.remountExternal = {
+      head: createdCommit.head,
+      before: externalBefore,
+      after: externalAfter,
+      logs: externalLogs,
+    }
+    checkResult(
+      checks,
+      "external commit is visible after remount with the reading position broadly preserved",
+      externalAfter.rows > 0 &&
+        !externalAfter.loadingSkeleton &&
+        externalAfter.scrollTop !== null &&
+        externalBefore.scrollTop !== null &&
+        Math.abs(externalAfter.scrollTop - externalBefore.scrollTop) <= rowHeight * 3,
+      { before: externalBefore, after: externalAfter, rowHeight, logs: externalLogs },
+    )
+    checkResult(
+      checks,
+      "external commit remount stays within a bounded getLog refresh",
+      externalLogs <= 3,
+      { getLog: externalLogs },
+    )
+  } catch (error) {
+    checkResult(checks, "cache remount scenario executes", false, { error: String(error) })
+  } finally {
+    if (baseHead) {
+      runGitAllowFailure(tempRepo.rootPath, ["checkout", baseBranch])
+      runGitAllowFailure(tempRepo.rootPath, ["reset", "--hard", baseHead])
+    }
+    if (createdCommit) {
+      try {
+        unlinkSync(join(tempRepo.rootPath, createdCommit.name))
+      } catch {
+        /* best-effort TEMP cleanup */
+      }
+    }
+    await context.close().catch(() => {})
+  }
+}
+
+/**
  * Bottom-follow needs the expanded slot to actually sit at the real bottom.
  * The FR history auto-paginates, which keeps moving that bottom, so this uses
  * the small TEMP fixture (6 rows, hasMore=false) in a short viewport: the
@@ -3716,6 +4965,25 @@ async function slotBottomFollowScenario(browser, tempRepo, checks, metrics) {
 async function uncommittedCleanScenario(browser, frPrimary, checks, metrics) {
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
   try {
+    const repositories = (await fetchRpc(FR_ORIGIN, "listRepositories", {})).body.result.repositories
+    const isCleanStatus = (value) =>
+      value.counts.staged === 0 &&
+      value.counts.unstaged === 0 &&
+      value.counts.untracked === 0 &&
+      value.counts.conflicted === 0
+    let cleanRepo = frPrimary
+    let status = (await fetchRpc(FR_ORIGIN, "getStatus", { repositoryId: cleanRepo.id })).body.result
+    if (!isCleanStatus(status)) {
+      for (const candidate of repositories) {
+        if (candidate.id === frPrimary.id) continue
+        const next = (await fetchRpc(FR_ORIGIN, "getStatus", { repositoryId: candidate.id })).body.result
+        if (isCleanStatus(next)) {
+          cleanRepo = candidate
+          status = next
+          break
+        }
+      }
+    }
     const page = await context.newPage()
     await page.goto(FR_BASE, { waitUntil: "domcontentloaded" })
     await page.waitForFunction(
@@ -3723,11 +4991,10 @@ async function uncommittedCleanScenario(browser, frPrimary, checks, metrics) {
       null,
       { timeout: 30_000 },
     )
-    await page.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+    await page.locator(SELECTORS.repository[0]).selectOption(cleanRepo.id)
     await waitLoaded(page, 100)
     await waitRows(page, 1)
     await waitNotBusy(page)
-    const status = (await fetchRpc(FR_ORIGIN, "getStatus", { repositoryId: frPrimary.id })).body.result
     const snapshot = await uncommittedSnapshot(page)
     const legacyCount = await page.locator(LEGACY_CHANGES_SELECTOR).count()
     const counts = status.counts
@@ -3746,7 +5013,47 @@ async function uncommittedCleanScenario(browser, frPrimary, checks, metrics) {
       { statusCounts: counts, text: snapshot.text, fileCount: snapshot.fileCount },
     )
     checkResult(checks, "legacy standalone Changes section is absent", legacyCount === 0, { legacyCount })
-    metrics.uncommittedClean = { counts, snapshot, legacyCount }
+    await openUncommitted(page)
+    await waitRaf(page, 2)
+    const cleanSlot = await uncommittedSlotSnapshot(page)
+    let cleanSlotState = { notPresent: false, slotPresent: cleanSlot.slotPresent }
+    if (cleanSlot.slotPresent) {
+      const cleanDecoration = await hoverDecoration(
+        page,
+        '[data-testid="uncommitted-slot"] [data-testid="slot-resize-handle"]',
+      )
+      const cleanSpans =
+        Boolean(cleanSlot.slot && cleanSlot.handle) &&
+        Math.abs(cleanSlot.handle.left - cleanSlot.slot.left) <= 1.5 &&
+        Math.abs(cleanSlot.handle.right - cleanSlot.slot.right) <= 1.5
+      checkResult(
+        checks,
+        "FR clean uncommitted slot exposes the full-line resize handle",
+        cleanSlot.handleCount === 1 && cleanSpans && !cleanDecoration.smallWidgetInside,
+        { cleanSlot, cleanDecoration },
+      )
+      if (cleanSlot.handleCount === 1) {
+        const cleanDrag = await dragUncommittedSlotHandle(page, 32)
+        cleanSlotState = { ...cleanSlotState, drag: cleanDrag }
+        checkResult(
+          checks,
+          "FR clean uncommitted slot can be resized by pointer",
+          cleanDrag.before.slotHeight !== null &&
+            cleanDrag.after.slotHeight !== null &&
+            Math.abs(cleanDrag.after.slotHeight - cleanDrag.before.slotHeight) >= 2,
+          { before: cleanDrag.before.slotHeight, after: cleanDrag.after.slotHeight },
+        )
+      }
+    } else {
+      cleanSlotState = { notPresent: true }
+      checkResult(
+        checks,
+        "FR clean uncommitted slot resize is notPresent",
+        true,
+        { notPresent: true, counts },
+      )
+    }
+    metrics.uncommittedClean = { counts, snapshot, legacyCount, slotResize: cleanSlotState }
     await screenshot(page, "18-fr-uncommitted-clean.png", { fullPage: true })
   } catch (error) {
     checkResult(checks, "clean uncommitted row scenario executes", false, { error: String(error) })
@@ -3863,7 +5170,117 @@ async function uncommittedScenario(browser, tempRepo, checks, metrics) {
 
     await verifyDiff("Staged", fixture.stagedPath, "index")
     await verifyDiff("Unstaged", fixture.unstagedPath, "working-tree")
-    metrics.uncommitted = { counts, snapshot: opened, legacyCount }
+
+    // Uncommitted slot uses the same bottom-divider resize contract as commit
+    // slots. A short viewport makes the slot content overflow so both bottom and
+    // non-bottom drags are meaningful.
+    await page.setViewportSize({ width: 1280, height: 420 })
+    await waitRaf(page, 3)
+    await page.locator(SELECTORS.historyScroll[0]).evaluate((element) => {
+      element.scrollTop = 0
+    })
+    await waitRaf(page, 2)
+    await openUncommitted(page)
+    const initialSlot = await uncommittedSlotSnapshot(page)
+    const slotDecoration = await hoverDecoration(
+      page,
+      '[data-testid="uncommitted-slot"] [data-testid="slot-resize-handle"]',
+    )
+    const handleSpansSlot =
+      Boolean(initialSlot.slot && initialSlot.handle) &&
+      Math.abs(initialSlot.handle.left - initialSlot.slot.left) <= 1.5 &&
+      Math.abs(initialSlot.handle.right - initialSlot.slot.right) <= 1.5 &&
+      Math.abs(initialSlot.handle.bottom - initialSlot.slot.bottom) <= 1.5 &&
+      initialSlot.handle.height >= 1 &&
+      initialSlot.handle.height <= 12
+    checkResult(
+      checks,
+      "Uncommitted slot exposes the full-line bottom resize handle",
+      initialSlot.slotPresent &&
+        initialSlot.handleCount === 1 &&
+        handleSpansSlot &&
+        !slotDecoration.smallWidgetInside,
+      { initialSlot, slotDecoration },
+    )
+    const grow = await dragUncommittedSlotHandle(page, -36)
+    checkResult(
+      checks,
+      "Uncommitted slot pointer drag changes its height",
+      grow.before.slotHeight !== null &&
+        grow.after.slotHeight !== null &&
+        Math.abs(grow.after.slotHeight - grow.before.slotHeight) >= 2,
+      { before: grow.before.slotHeight, after: grow.after.slotHeight },
+    )
+    checkResult(
+      checks,
+      "Uncommitted slot drag away from the bottom preserves the scroll position",
+      grow.before.scrollTop !== null &&
+        grow.after.scrollTop !== null &&
+        Math.abs(grow.after.scrollTop - grow.before.scrollTop) <= 1 &&
+        grow.before.row &&
+        grow.after.row &&
+        Math.abs(grow.after.row.top - grow.before.row.top) <= 1,
+      { before: grow.before, after: grow.after },
+    )
+    const minimum = await dragUncommittedSlotHandle(page, -4000)
+    checkResult(
+      checks,
+      "Uncommitted slot drag clamps to the 96px minimum",
+      minimum.after.slotHeight !== null &&
+        minimum.after.slotHeight >= SLOT_MIN_HEIGHT - 0.5 &&
+        minimum.after.slotHeight <= SLOT_MIN_HEIGHT + 1.5,
+      { height: minimum.after.slotHeight },
+    )
+    const maximum = await dragUncommittedSlotHandle(page, 4000)
+    const viewportHeight = maximum.after.clientHeight ?? 0
+    const expectedMax = Math.max(SLOT_MIN_HEIGHT, Math.min(560, viewportHeight - 80))
+    checkResult(
+      checks,
+      "Uncommitted slot drag grows to the dynamic viewport maximum",
+      maximum.after.slotHeight !== null &&
+        maximum.after.slotHeight > minimum.after.slotHeight &&
+        Math.abs(maximum.after.slotHeight - expectedMax) <= 1,
+      { height: maximum.after.slotHeight, expectedMax, viewportHeight },
+    )
+    const mid = await dragUncommittedSlotHandle(page, -80)
+    await page.locator(SELECTORS.historyScroll[0]).evaluate((element) => {
+      element.scrollTop = element.scrollHeight
+    })
+    await waitRaf(page, 2)
+    const bottomBefore = await dragUncommittedSlotHandle(page, 20)
+    checkResult(
+      checks,
+      "Uncommitted slot drag at the bottom keeps the scroller bottom-following",
+      bottomBefore.after.distanceToBottom !== null &&
+        Math.abs(bottomBefore.after.distanceToBottom) <= 1.5,
+      { before: bottomBefore.before, after: bottomBefore.after },
+    )
+    const savedHeight = bottomBefore.after.slotHeight
+    const uncommittedRow = page.locator(UNCOMMITTED_ROW_SELECTOR).first()
+    await uncommittedRow.click({ position: { x: 8, y: 8 } })
+    await page.waitForFunction(
+      () => !document.querySelector('[data-testid="uncommitted-slot"]'),
+      null,
+      { timeout: 10_000 },
+    )
+    await uncommittedRow.click({ position: { x: 8, y: 8 } })
+    await waitForAny(page, SELECTORS.uncommittedBody)
+    await page.waitForFunction(
+      () => Boolean(document.querySelector('[data-testid="uncommitted-slot"]')),
+      null,
+      { timeout: 10_000 },
+    )
+    await waitRaf(page, 3)
+    const reopenedSlot = await uncommittedSlotSnapshot(page)
+    checkResult(
+      checks,
+      "Uncommitted slot height persists for the session after collapse/reopen",
+      savedHeight !== null &&
+        reopenedSlot.slotHeight !== null &&
+        Math.abs(reopenedSlot.slotHeight - savedHeight) <= 1,
+      { savedHeight, reopened: reopenedSlot.slotHeight },
+    )
+    metrics.uncommitted = { counts, snapshot: opened, legacyCount, slotResize: { initialSlot, grow, minimum: minimum.after, maximum: maximum.after, bottom: bottomBefore, reopenedSlot } }
   } catch (error) {
     checkResult(checks, "Uncommitted changes scenario executes", false, { error: String(error) })
   } finally {
@@ -4231,6 +5648,7 @@ async function auditSelectors(browser, base, label, minimumOptions) {
     ...SELECTORS.showTags,
     ...SELECTORS.denseGraph,
     ...SELECTORS.fetchButton,
+    ...SELECTORS.remountPanel,
     ...SELECTORS.uncommittedRow,
   ])
   await auditGroup("legacy-absent", [LEGACY_CHANGES_SELECTOR])
@@ -4305,6 +5723,7 @@ async function auditSelectors(browser, base, label, minimumOptions) {
         group.some((candidate) => allEntries.some((entry) => entry.selector === candidate && entry.count > 0)),
     )
   result.expectedAbsent = allEntries.filter((entry) => expectedAbsent.has(entry.selector))
+  result.sourceCheck = sourceRegistrationCheck()
   result.missing = Object.entries(result.groups).flatMap(([group, entries]) =>
     entries
       .filter((entry) => entry.count === 0 && !expectedAbsent.has(entry.selector))
@@ -4322,6 +5741,8 @@ async function fullRun(browser, executablePath) {
   const checks = []
   const metrics = {}
   const notes = []
+  const sourceCheck = sourceRegistrationCheck()
+  metrics.sourceCheck = sourceCheck
   const events = { fr: { console: [], page: [], requestFailures: [], http: [], aborts: [], rpc: [] }, temp: { console: [], page: [], requestFailures: [], http: [], aborts: [], rpc: [] } }
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, locale: "en-US" })
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: FR_ORIGIN })
@@ -4505,7 +5926,10 @@ async function fullRun(browser, executablePath) {
         refBadges1100.badges.every(
           (badge) => badge.noEllipsis && (badge.fullyVisible || badge.multiline),
         ) &&
-        (refBadges1100.more === null || /^\+\d+$/.test(refBadges1100.more)),
+        refBadges1100.more === null &&
+        refBadges1100.containers.every(
+          (container) => !container.horizontalScroll && container.count > 0,
+        ),
       { currentLabel1100, refBadges1100 },
     )
     await screenshot(fr, "01-fr-graph-date-1100.png", { fullPage: true })
@@ -4622,7 +6046,10 @@ async function fullRun(browser, executablePath) {
         refBadges520.badges.every(
           (badge) => badge.noEllipsis && (badge.fullyVisible || badge.multiline),
         ) &&
-        (refBadges520.more === null || /^\+\d+$/.test(refBadges520.more)) &&
+        refBadges520.more === null &&
+        refBadges520.containers.every(
+          (container) => !container.horizontalScroll && container.count > 0,
+        ) &&
         dense520 === 0,
       { doc: narrow.doc, body: narrow.body, panelOverflow: narrow.panelOverflowX, currentLabel520, refBadges520, dense520 },
     )
@@ -4688,51 +6115,118 @@ async function fullRun(browser, executablePath) {
     }
 
     for (const kind of ["remote", "tag"]) {
-      const ref = refs.find((entry) => entry.kind === kind)
-      if (!ref) {
+      const source = await findRepoWithRefKind(frRepos, kind, frPrimary)
+      if (!source) {
         checkResult(checks, `${kind} ref fixture exists`, false, {})
         continue
       }
-      const canonical = canonicalRef(ref)
-      await openBranchSelector(fr)
-      const selectedMode = await anyLocator(fr, SELECTORS.branchFilterSelected)
-      if (selectedMode) await selectedMode.click()
-      const checkbox = fr.locator(`${SELECTORS.branchFilterRef[0]}[data-ref-kind="${kind}"][value="${canonical}"]`)
-      if ((await checkbox.count()) === 0) {
-        checkResult(checks, `${kind} filter checkbox is reachable`, false, { canonical })
-        await closeBranchSelector(fr)
-        continue
+      const switchedForKind = source.repo.id !== frPrimary.id
+      if (switchedForKind) {
+        await fr.locator(SELECTORS.repository[0]).selectOption(source.repo.id)
+        await waitRows(fr, 1)
+        await waitNotBusy(fr)
+        await waitLoaded(fr, 100).catch(() => {})
       }
-      const requestPromise = fr.waitForRequest(
-        (request) => {
-          if (!request.url().endsWith("/__gg/rpc/getLog")) return false
-          const input = parseInput(request)
-          return Array.isArray(input?.refs) && input.refs.includes(canonical)
-        },
-        { timeout: 20_000 },
-      )
-      await checkbox.click()
-      await fr.locator(SELECTORS.applyBranchFilter[0]).click()
-      const input = parseInput(await requestPromise)
-      await closeBranchSelector(fr)
-      checkResult(checks, `${kind} filter sends the canonical ref`, input.refs.includes(canonical), { canonical })
-      await applyHistoryFilter(fr, async (page) => {
-        await page.locator(SELECTORS.branchFilterAll[0]).click()
-      })
+      try {
+        const ref = source.ref
+        const canonical = canonicalRef(ref)
+        await openBranchSelector(fr)
+        const selectedMode = await anyLocator(fr, SELECTORS.branchFilterSelected)
+        if (selectedMode) await selectedMode.click()
+        const checkbox = fr.locator(`${SELECTORS.branchFilterRef[0]}[data-ref-kind="${kind}"][value="${canonical}"]`)
+        if ((await checkbox.count()) === 0) {
+          checkResult(checks, `${kind} filter checkbox is reachable`, false, { canonical })
+          await closeBranchSelector(fr)
+          continue
+        }
+        const requestPromise = fr.waitForRequest(
+          (request) => {
+            if (!request.url().endsWith("/__gg/rpc/getLog")) return false
+            const input = parseInput(request)
+            return Array.isArray(input?.refs) && input.refs.includes(canonical)
+          },
+          { timeout: 20_000 },
+        )
+        await checkbox.click()
+        await fr.locator(SELECTORS.applyBranchFilter[0]).click()
+        const input = parseInput(await requestPromise)
+        await closeBranchSelector(fr)
+        checkResult(checks, `${kind} filter sends the canonical ref`, input.refs.includes(canonical), { canonical })
+        await applyHistoryFilter(fr, async (page) => {
+          await page.locator(SELECTORS.branchFilterAll[0]).click()
+        })
+      } finally {
+        if (switchedForKind) {
+          await closeBranchSelectorIfOpen(fr).catch(() => {})
+          await fr.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+          await waitLoaded(fr, 100)
+          await waitRows(fr, 1)
+          await waitNotBusy(fr)
+        }
+      }
     }
 
     const showRemotes = await anyLocator(fr, SELECTORS.showRemotes)
     if (showRemotes) {
-      const beforeHashes = await visibleRowHashes(fr)
-      const input = await triggerHistoryRequest(fr, (value) => value.showRemotes === false, async () => {
-        await fr.locator(SELECTORS.showRemotes[0]).click()
-      })
-      const afterHashes = await visibleRowHashes(fr)
-      checkResult(checks, "showRemotes is sent in the history request", input.showRemotes === false, input)
-      checkResult(checks, "showRemotes changes the loaded history", beforeHashes.join(",") !== afterHashes.join(","), { before: beforeHashes.slice(0, 3), after: afterHashes.slice(0, 3) })
-      await triggerHistoryRequest(fr, (value) => value.showRemotes !== false, async () => {
-        await fr.locator(SELECTORS.showRemotes[0]).click()
-      })
+      let remotesResult = null
+      const remoteHistoryRepo = await findRepoWithRemoteOnlyHistory(frRepos, frPrimary)
+      let switchedForRemotes = false
+      if (remoteHistoryRepo) {
+        if (remoteHistoryRepo.id !== frPrimary.id) {
+          await fr.locator(SELECTORS.repository[0]).selectOption(remoteHistoryRepo.id)
+          await waitRows(fr, 1)
+          await waitNotBusy(fr)
+          await waitLoaded(fr, 100).catch(() => {})
+          switchedForRemotes = true
+        }
+        const beforeHashes = await visibleRowHashes(fr)
+        const input = await triggerHistoryRequest(fr, (value) => value.showRemotes === false, async () => {
+          await fr.locator(SELECTORS.showRemotes[0]).click()
+        })
+        const afterHashes = await visibleRowHashes(fr)
+        await triggerHistoryRequest(fr, (value) => value.showRemotes !== false, async () => {
+          await fr.locator(SELECTORS.showRemotes[0]).click()
+        })
+        remotesResult = {
+          source: "FR",
+          repositorySwitched: switchedForRemotes,
+          input,
+          before: beforeHashes,
+          after: afterHashes,
+          changed: beforeHashes.join(",") !== afterHashes.join(","),
+        }
+        if (switchedForRemotes) {
+          await fr.locator(SELECTORS.repository[0]).selectOption(frPrimary.id)
+          await waitLoaded(fr, 100)
+          await waitRows(fr, 1)
+          await waitNotBusy(fr)
+        }
+      }
+      if (!remotesResult) {
+        remotesResult = await runShowRemotesTempFallback(browser).catch(() => null)
+      }
+      if (remotesResult) {
+        checkResult(
+          checks,
+          "showRemotes is sent in the history request",
+          remotesResult.input.showRemotes === false,
+          remotesResult,
+        )
+        checkResult(
+          checks,
+          "showRemotes changes the loaded history",
+          remotesResult.changed,
+          {
+            source: remotesResult.source,
+            repositorySwitched: remotesResult.repositorySwitched ?? false,
+            before: remotesResult.before.slice(0, 3),
+            after: remotesResult.after.slice(0, 3),
+          },
+        )
+      } else {
+        checkResult(checks, "showRemotes is sent in the history request", false, { reason: "no remote-only fixture" })
+        checkResult(checks, "showRemotes changes the loaded history", false, { reason: "no remote-only fixture" })
+      }
     } else {
       checkResult(checks, "showRemotes selector exists", false, { selectors: SELECTORS.showRemotes })
     }
@@ -5048,6 +6542,11 @@ async function fullRun(browser, executablePath) {
       checkResult(checks, "inline layout scenario executes", false, { error: String(error) })
     }
     try {
+      await dynamicRefRowScenario(browser, frPrimary, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "dynamic ref row scenario executes", false, { error: String(error) })
+    }
+    try {
       await slotResizeScenario(browser, frPrimary, checks, metrics)
     } catch (error) {
       checkResult(checks, "slot resize scenario executes", false, { error: String(error) })
@@ -5076,6 +6575,11 @@ async function fullRun(browser, executablePath) {
     await waitLoaded(temp, 100).catch(() => waitRows(temp, 1))
     await waitRows(temp, 1)
     await waitNotBusy(temp)
+    const tempHistory = await ensureTempHistory(tempRepo, 2)
+    if (tempHistory.created.length > 0 || (await temp.locator(SELECTORS.row[0]).count()) < 2) {
+      await temp.locator(SELECTORS.refresh[0]).click().catch(() => {})
+      await waitRows(temp, 2, 20_000)
+    }
     const tempStatus0 = (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result
     const tempRefs0 = (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs
     const tempBranches = tempRefs0.filter((ref) => ref.kind === "branch")
@@ -5119,6 +6623,8 @@ async function fullRun(browser, executablePath) {
     await screenshot(temp, "08-temp-checkout-success.png", { locator: temp.locator('[data-testid="harness-panel-shell"]') })
 
     // Create branch from a commit through the real context menu.
+    await waitRows(temp, 2, 20_000)
+    await scrollToRowIndex(temp, 1)
     const tempRow = temp.locator(SELECTORS.row[0]).nth(1)
     const tempCommit = await tempRow.getAttribute("data-commit")
     await tempRow.locator(".gg-subject").click({ button: "right" })
@@ -5142,12 +6648,30 @@ async function fullRun(browser, executablePath) {
         { timeout: 30_000 },
       )
       checkResult(checks, "ref-menu checkout can switch to the created branch", (await fetchRpc(TEMP_ORIGIN, "getStatus", { repositoryId: tempRepo.id })).body.result.branch === branchName, {})
+      await waitNotBusy(temp).catch(() => {})
+      await waitRows(temp, 1, 20_000)
+      await temp.locator(SELECTORS.historyScroll[0]).evaluate((element) => {
+        element.scrollTop = 0
+      })
+      await waitRaf(temp, 2)
+      await temp.waitForFunction(
+        (name) =>
+          [...document.querySelectorAll('[data-testid="ref-badge"]')].some(
+            (badge) => badge.getAttribute("data-ref-name") === name,
+          ),
+        branchName,
+        { timeout: 30_000 },
+      )
       const longLabel = await fullTextState(temp, SELECTORS.currentBranch[0], branchName)
       const longBadge = await fullTextState(temp, SELECTORS.refBadge.join(","), branchName)
       const longRefs = await refBadgeSnapshot(temp)
-      const longBadgeOk = longBadge.present && longBadge.includesName
-        ? longBadge.noEllipsis && (longBadge.fullyVisible || longBadge.multiline)
-        : longRefs.more !== null && /^\+\d+$/.test(longRefs.more)
+      const longBadgeOk =
+        longBadge.present &&
+        longBadge.includesName &&
+        longBadge.noEllipsis &&
+        (longBadge.fullyVisible || longBadge.multiline) &&
+        longRefs.more === null &&
+        longRefs.containers.every((container) => !container.horizontalScroll)
       checkResult(
         checks,
         "current-branch and ref badge show a long name fully without ellipsis",
@@ -5205,7 +6729,14 @@ async function fullRun(browser, executablePath) {
       await menuAction(temp, SELECTORS.commitMenu, "create-tag")
       const tagName = `gg-release-tag-${annotated ? "a" : "l"}-${Date.now().toString(36)}`
       await fillFieldIfPresent(temp, "name", tagName)
-      if (annotated) await fillFieldIfPresent(temp, "message", "release acceptance annotated tag")
+      if (annotated) {
+        await waitRaf(temp, 1)
+        await fillFieldIfPresent(temp, "message", "release acceptance annotated tag")
+        await waitRaf(temp, 1)
+        // Re-assert the name after the optional multiline field settles; a
+        // controlled-dialog re-render must not merge the two values.
+        await fillFieldIfPresent(temp, "name", tagName)
+      }
       await confirmDialog(temp)
       const refsWithTag = (await fetchRpc(TEMP_ORIGIN, "getRefs", { repositoryId: tempRepo.id })).body.result.refs
       checkResult(checks, `create ${annotated ? "annotated" : "light"} tag adds the real tag ref`, refsWithTag.some((ref) => ref.kind === "tag" && ref.name === tagName), { annotated })
@@ -5373,6 +6904,16 @@ async function fullRun(browser, executablePath) {
     } catch (error) {
       checkResult(checks, "confirmed fetch scenario executes", false, { error: String(error) })
     }
+    try {
+      await watcherRefreshScenario(browser, tempRepo, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "watcher auto-refresh scenario executes", false, { error: String(error) })
+    }
+    try {
+      await remountCacheScenario(browser, tempRepo, checks, metrics)
+    } catch (error) {
+      checkResult(checks, "cache remount scenario executes", false, { error: String(error) })
+    }
   } catch (error) {
     fatal = error instanceof Error ? error.message : String(error)
     notes.push(`Fatal: ${fatal}`)
@@ -5406,10 +6947,13 @@ async function fullRun(browser, executablePath) {
     events,
     hmrEvents,
     sourceMtimes: { start: sourceStart, end: sourceEnd },
+    sourceChecks: [sourceCheck],
     selectorAssumptions: {
       slotResizeHandle: SLOT_HANDLE_SELECTOR,
+      remountPanel: SELECTORS.remountPanel,
       columnDividers: "resize-column-<graph|description|date|author|commit> (~5px header divider hit area)",
       denseGraphAbsent: '[data-testid="dense-graph"]',
+      refsRendering: "all ref-badge names in the commit row DOM; no ref-more; .gg-ref-badges must not scroll horizontally; tall rows use dynamic rowTop prefix sums",
       inlineInfoDivider: INLINE_INFO_DIVIDER_SELECTORS,
       dateFormat: "YYYY-MM-DD HH:mm (16 chars) with the original ISO value in title",
       labelOverflow: "current-branch and visible ref badges keep full text; +N aggregation is allowed",
@@ -5430,6 +6974,7 @@ async function fullRun(browser, executablePath) {
       "TEMP result.json may contain private repository/hash/path details. The committed acceptance summary is anonymous.",
     notCovered: [
       "Desktop window/panel chrome, tab strip, drag/resize and side-region rules",
+      "Tab label icon+text rendering in the real Desktop host (sourceCheck only; desktopManual)",
       "MenuItem registration for session.panel",
       "OpenCode session switching, project/sidebar data, host theme injection and host event bus",
       "Network push/pull/reset clean, credential prompts, SSH/HTTPS authentication and interactive prune confirmation",

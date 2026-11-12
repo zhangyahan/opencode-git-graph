@@ -39,6 +39,7 @@ import {
   GitRepositorySchema,
   GitStatusSchema,
   GitTargetSchema,
+  GraphChangedEventSchema,
   ListRepositoriesInputSchema,
   ListRepositoriesOutputSchema,
   LogRefSchema,
@@ -163,8 +164,14 @@ type _CheckoutInput = Assert<
 >
 const FULL_HASH = "0123456789abcdef".repeat(2) + "01234567"
 
+// Compile-time check that the event payload stays a plain object.
+const graphChangedPayload: z.infer<typeof GraphChangedEventSchema> = {
+  repositoryId: repository.id,
+  kind: "refs",
+}
+
 describe("git-graph RPC contract", () => {
-  it("declares every method and no events", () => {
+  it("declares every method and the graphChanged event", () => {
     expect(GitGraphRpc.id).toBe("git-graph")
     expect(Object.keys(GitGraphRpc.methods)).toEqual([
       "ping",
@@ -185,7 +192,28 @@ describe("git-graph RPC contract", () => {
       "deleteTag",
       "fetchRemote",
     ])
-    expect(Object.keys(GitGraphRpc.events)).toEqual([])
+    expect(Object.keys(GitGraphRpc.events)).toEqual(["graphChanged"])
+  })
+
+  it("validates the graphChanged event payload as a strict object", () => {
+    expect(GitGraphRpc.events.graphChanged.schema).toBe(GraphChangedEventSchema)
+    expect(GraphChangedEventSchema.parse({ repositoryId: repository.id })).toEqual({
+      repositoryId: repository.id,
+    })
+    expect(GraphChangedEventSchema.parse(graphChangedPayload)).toEqual(graphChangedPayload)
+    expect(
+      GraphChangedEventSchema.parse({ repositoryId: repository.id, kind: "worktree" }),
+    ).toEqual({ repositoryId: repository.id, kind: "worktree" })
+
+    for (const invalid of [
+      {},
+      { repositoryId: "" },
+      { repositoryId: 1 },
+      { repositoryId: repository.id, kind: "index" },
+      { repositoryId: repository.id, extra: true },
+    ]) {
+      expect(GraphChangedEventSchema.safeParse(invalid).success).toBe(false)
+    }
   })
 
   it("declares the unified error set on every repository method", () => {

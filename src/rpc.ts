@@ -414,6 +414,18 @@ export const FetchRemoteOutputSchema = z
   })
   .strict()
 
+/**
+ * Payload of the `graphChanged` event. The host attaches the location, so the
+ * plugin only sends the repository whose refs/HEAD/index moved. `kind` lets the
+ * consumer distinguish ref-only changes from worktree/index changes when known.
+ */
+export const GraphChangedEventSchema = z
+  .object({
+    repositoryId: z.string().min(1),
+    kind: z.enum(["refs", "worktree"]).optional(),
+  })
+  .strict()
+
 /** Expected failures shared by all repository methods. Error messages never
  * include filesystem paths outside the repository id supplied by the caller.
  */
@@ -527,5 +539,7 @@ export const GitGraphRpc = Rpc.define({
       errors: mutationErrors,
     },
   },
-  events: {},
+  events: {
+    graphChanged: { schema: GraphChangedEventSchema },
+  },
 })

@@ -81,7 +81,7 @@ selectors listed in that historical section are the names used by that run.
 #### Next-freeze refinements (executed)
 
 `release.mjs` encodes the layout refinements listed below. The frozen run on the
-current fixture completed **188/188 checks** (172 baseline + 16 refinements).
+current fixture completed **220/220 checks** (188 baseline + 32 frozen-extension checks).
 The FR picker assertion is environment-independent: at least one repository,
 every dropdown option loads/switches, and worktree labels are checked only when
 worktrees exist. This fixture reports 12 repositories / 0 worktrees and records
@@ -92,7 +92,8 @@ worktree labels as `notPresent`; that is a pass, not a lowered product threshold
 | graph crop | FR | the graph still clips right lanes, keeps the fixed 14px lane step and has no horizontal scrollbar, but `[data-testid="dense-graph"]` is absent at every width |
 | column divider itself | FR | `resize-column-<id>` (including graph) is the ~5px header divider hit area, not a separate grip; a real pointer drag changes the width; header and row widths stay in sync; widths persist across reload; 520px has no horizontal overflow |
 | date format | FR | the Date cell is exactly 16 characters in `YYYY-MM-DD HH:mm` form with no seconds and the original ISO value in `title` |
-| full labels | FR + TEMP | the top `current-branch` label and visible `ref-badge` names are not ellipsized (`text-overflow` is not `ellipsis`, and the text fits or wraps fully); `+N` aggregation is still allowed; 520px has no horizontal overflow. TEMP additionally creates and checks out a long branch name and returns to the original branch afterwards |
+| full labels | FR + TEMP | every branch/ref name must be rendered in the DOM and fully visible: no `+N`/`ref-more`, no ellipsis, no horizontal scrolling in `.gg-ref-badges`; a multi-ref row grows taller than 28px and reflows without clipping. The top `current-branch` label follows the same full-text rule; 520px has no horizontal overflow. TEMP additionally creates and checks out a long branch name and returns to the original branch afterwards |
+| dynamic ref rows | FR | choose the commit with the most refs (preferring one with files), assert every expected ref name is present/visible, no `ref-more`, no horizontal container scroll, row height >28px and prefix-sum contiguity; then verify search, inline slot placement/drag, commit-diff Back and 520/1100 reflow keep the row and badges intact |
 | inline three columns | FR | the left info column is wider (at least 200px and at least ~28% of info+files), the file column is narrower; left info text wraps without ellipsis or clipping and shows multiple lines for long text; the left/middle divider drags to change the ratio, clamps to about 25%-60%, survives collapse/reopen, and never overflows |
 | slot bottom divider | FR + TEMP | `slot-resize-handle` is the full-width bottom divider hit area (no separate small grip); drag clamps to 96px, grows to the dynamic viewport maximum, persists for the session, and keeps bottom-follow behaviour |
 
@@ -102,22 +103,73 @@ groups, file eye/content actions, list/tree toggles, comparison scroll/back,
 write confirmation and cancellation, and the TEMP return to the original branch
 (`main` for the fixture).
 
+Environment-data handling is dynamic, not a lowered product threshold:
+
+- The FR picker contract only requires a non-empty repository list; worktrees
+  are `notPresent` when none exist.
+- `showRemotes` switches to a repository that actually has a
+  remote-tracking-only commit in the first page; the assertion still requires the
+  history to change when remotes are hidden.
+- The remote/tag filter loop switches to a repository containing that ref kind
+  when the primary does not have one; a genuinely missing kind remains a failure.
+- The FR clean Uncommitted check selects a clean repository if the primary has
+  local changes.
+- TEMP ensures the selected repository has at least two commits and a real file
+  change; if the fixture is too small, throwaway commits are created in TEMP and
+  the UI must render at least two rows before the branch/tag flow.
+
 New selector assumptions to confirm after the freeze:
 
 | assumption | selectors currently probed |
 | --- | --- |
 | header divider is the resize hit area | `[data-testid="resize-column-<id>"]`; the script checks a 3-8px width, divider-edge alignment and the absence of a small pseudo-element grip |
 | repository picker | at least one option; every dropdown option is selected and must load (status/branch and commits or an explicit 0-loaded state); worktree options must contain `(worktree)`, and zero worktrees is recorded as `notPresent` |
+| remount panel | `[data-testid="harness-remount-panel"]` truly disposes and rebuilds the panel; the check waits for a new `.git-graph-panel` element |
+| watcher refresh | no private event API is assumed: the script waits for the new hash in `.gg-graph-row[data-commit]`, `current-branch` text, or a visible `ref-badge` on the fetched `data-commit`; `getLog` counts are read from real RPC requests |
+| tab label | `src/gui.tsx` sourceCheck only (`Git Graph` + branch icon); Desktop rendering is manual and not a script UI pass |
+| refs visibility | all `[data-testid="ref-badge"]` names must exist in the row; `[data-testid="ref-more"]` must be absent; `.gg-ref-badges` must have no horizontal scroll (`scrollWidth <= clientWidth + 1`) |
+| dynamic row height | tall ref rows use `data-row-top` prefix sums; the script checks `row height > 28px`, contiguous `rowTop`, and that slot/search/Back/520/1100 keep the row intact |
+| uncommitted slot handle | `[data-testid="uncommitted-slot"] [data-testid="slot-resize-handle"]` must span the slot width; drag bounds use the same 96px/dynamic-max policy as commit slots |
 | dense hint removed | `[data-testid="dense-graph"]` must have count 0 |
 | inline left/middle divider | first present of `inline-split`, `inline-info-resize`, `inline-column-resize`, `inline-info-divider`, `inline-info-splitter`, `inline-resize`, `inline-splitter`, `.gg-inline-split`, `.gg-inline-info-resize`, `.gg-inline-splitter` |
 | inline info/file columns | `[data-testid="inline-info"]` plus `.gg-row-slot-files` inside `inline-slot` |
 | slot divider | `[data-testid="slot-resize-handle"]` must span the full slot width; no centered small grip |
-| full labels | `[data-testid="current-branch"]` and `[data-testid="ref-badge"]`; `[data-testid="ref-more"]` is accepted as `+N` |
+| full labels | `[data-testid="current-branch"]` and `[data-testid="ref-badge"]`; `[data-testid="ref-more"]` must be absent; `.gg-ref-badges` has no horizontal scroll |
 | date | 16-character text plus an ISO `title` on `commit-date` / the inline Date row |
 
 If the frozen build renames the inline divider, update only
 `INLINE_INFO_DIVIDER_SELECTORS`; the rest of the scenario is independent of the
 exact name.
+
+#### Watcher / remount / dynamic-ref / uncommitted-slot round (executed)
+
+The **188/188** run above remains the baseline. The following scenarios are
+included in the final **220/220** frozen run; they are not counted as UI passes
+unless the real browser assertions ran.
+
+| scenario | environment | what the script asserts |
+| --- | --- | --- |
+| external watcher refresh | TEMP | With the panel open on `main`, a real local `git commit` made outside the browser must make the new commit appear without clicking Refresh (waits on the new `data-commit` with a 10s `waitForFunction`, no fixed sleep). A real external `git checkout feature` must update `current-branch`; a real external `git fetch` of a local bare remote must advance the remote badge on the fetched commit. Each event's `getLog` burst is recorded and must stay within 1-3 (checkout/fetch allow 0-3 because they may only need status/refs). |
+| cache remount | TEMP | Load `primary`, scroll to mid-history, expand a file-bearing commit and record `scrollTop`/expanded hash/refs. Click `harness-remount-panel`; the new panel must paint history immediately with no repository/loading skeleton, restore `scrollTop` within 1px and the same expanded hash/slot, keep refs unchanged, and run **no** full `getLog` when HEAD/refs are unchanged (`getStatus`/`getRefs` are allowed). A later row click must still work. |
+| external commit + remount | TEMP | After a real external commit, remount (or the watcher event) must show the new commit silently while keeping the reading position broadly stable (not reset to 0, within 3 row heights), with a bounded 1-3 `getLog` refresh. |
+| dynamic multi-ref row | FR | all ref names for the busiest commit are in the DOM and visible with no `+N`, ellipsis or refs-group horizontal scroll; the row grows >28px; search, slot placement/drag, file-diff Back and 520/1100 reflow keep the row, badges and virtual prefix sums correct. |
+| uncommitted slot resize | TEMP dirty + FR clean | after expanding `uncommitted-row`, the `uncommitted-slot` bottom `slot-resize-handle` is a full-line hit area; a real pointer drag changes its height, clamps to 96px and the dynamic viewport maximum, keeps non-bottom scroll/row top stable, follows the bottom when parked there, and persists after collapse/reopen. FR clean(0) validates the handle/drag when the slot exists, otherwise records `notPresent` without failing. |
+| tab label icon+text | source + Desktop | `src/gui.tsx` is statically checked for `title: "Git Graph"`, `name="branch"`/`icon: "branch"` and side-panel registration. This is recorded as `sourceCheck: true, desktopManual: true, uiPass: false`; it is **not** counted as a UI pass. Real tab icon/text rendering remains Desktop manual. |
+
+The watcher/cache fixtures only write to TEMP: each scenario records the original
+HEAD/branch, creates a throwaway commit or switches branches with real local git,
+removes any throwaway local bare remote, then resets to the original HEAD/branch
+and leaves `main` clean. FR is never written.
+
+> Integration dependency: the dev harness must expose the production
+> `rpc.events.on("graphChanged")` channel (and its local bridge) before the
+> watcher scenario can pass. The `harness-remount-panel` button is already
+> present. If the event channel is absent, the watcher scenario fails
+> explicitly; it is not skipped or recorded as a UI pass.
+
+The watcher scenario assumes the standard TEMP fixture still has local `main`
+and `feature` branches and enough history for `feature~1`. A missing branch or
+parent is reported as a fixture failure, not silently skipped.
 
 #### Extended scenarios (frozen and passed)
 
@@ -191,11 +243,15 @@ node dev/ui-test/release.mjs --audit   # confirm the new inline divider and labe
 node dev/ui-test/release.mjs
 ```
 
-The frozen refinement run completed **188/188 checks**; see
+The frozen final run completed **220/220 checks**; see
 `dev/UI-ACCEPTANCE.md`. The FR picker contract is dynamic: it requires at least
 one repository and verifies that every dropdown option loads/switches, with
 worktree labels only when worktrees are present. The current fixture reports
 12 repositories / 0 worktrees, so worktree labels are `notPresent`.
+
+The watcher / remount / dynamic-ref / uncommitted-slot scenarios above were
+executed in that frozen run. The tab-label source check remains
+`sourceCheck/desktopManual` and is not counted as a UI pass.
 
 Environment overrides:
 

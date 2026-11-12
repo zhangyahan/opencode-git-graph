@@ -51,9 +51,16 @@ describe("history chrome structure", () => {
     expect(styles).toContain("cursor: col-resize")
   })
 
-  it("keeps ref and branch names unclipped", () => {
-    expect(styles).toContain(".gg-ref-badges")
-    expect(styles).toContain("overflow-x: auto")
+  it("keeps ref and branch names unclipped and never folds them into +N", () => {
+    const refBadges = styles.slice(
+      styles.indexOf(".gg-ref-badges {"),
+      styles.indexOf(".gg-subject {"),
+    )
+    expect(refBadges).toContain("flex-wrap: wrap")
+    expect(refBadges).not.toContain("overflow-x: auto")
+    expect(panel).not.toContain("ref-more")
+    expect(panel).not.toContain("hiddenBadges")
+    expect(panel).not.toContain("maxRefs")
     expect(styles).toContain(".gg-branch-name")
     expect(styles).toContain("overflow-wrap: anywhere")
   })

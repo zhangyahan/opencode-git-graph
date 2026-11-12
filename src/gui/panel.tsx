@@ -73,6 +73,19 @@ import {
 } from "./inline-split.js"
 import { CommitDiffView } from "./commit-diff-view.js"
 import { LatestRequest } from "./requests.js"
+import {
+  BoundedPanelCache,
+  PANEL_CACHE_LIMIT,
+  commitFilesKey,
+  type PanelCacheSnapshot,
+} from "./panel-cache.js"
+import {
+  GRAPH_REFRESH_DEBOUNCE_MS,
+  GraphChangeCoalescer,
+  decideGraphChange,
+  refsFingerprint,
+  type GraphChangedEvent,
+} from "./graph-events.js"
 import { buildFileTree, collectDirectoryPaths, type FileTreeNode } from "./tree.js"
 import {
   findStatusFile,
@@ -94,9 +107,11 @@ import { GG_STYLES } from "./styles.js"
 import {
   detailsLayout,
   HISTORY_COLUMN_LABELS,
-  refBadgeCountForBudget,
-  visibleRefCount,
 } from "./history-columns.js"
+import {
+  estimateCommitRowHeight,
+  rowHeightCacheKey,
+} from "./row-heights.js"
 import { formatCommitDate, formatRefLabel, refHue, shortHash } from "./format.js"
 import { searchMatches } from "./search.js"
 import { repositoryOptionLabel } from "./repository-label.js"
@@ -173,6 +188,13 @@ interface PendingViewRestore {
   readonly scrollTop: number
 }
 
+/** First visible commit and the offset inside that row. */
+interface ScrollAnchor {
+  readonly index: number
+  readonly offset: number
+  readonly hash: string | undefined
+}
+
 type MutationDialogState =
   | {
       readonly kind: "checkout"
@@ -218,12 +240,6 @@ interface RefMenuState {
   readonly y: number
 }
 
-interface OverflowMenuState {
-  readonly badges: readonly RefBadgeInfo[]
-  readonly x: number
-  readonly y: number
-}
-
 interface CommitMenuState {
   readonly commit: GitCommit
   readonly x: number
@@ -244,6 +260,15 @@ interface FetchDialogState {
 
 /** One bounded cache per window, shared by every mount of this panel. */
 const SELECTION_CACHE = new BoundedSelectionCache<SelectionSnapshot>(SELECTION_CACHE_LIMIT)
+
+/**
+ * The panel is unmounted on a tab switch or when a file opens. This map lives
+ * for the window lifetime (a plugin reload recreates it), so remounting can
+ * restore the last rendered state immediately instead of showing a spinner.
+ */
+const PANEL_CACHE = new BoundedPanelCache<PanelCacheSnapshot>(PANEL_CACHE_LIMIT)
+/** Coalesce churn from scroll and selection changes into one cache write. */
+const PANEL_CACHE_WRITE_DELAY_MS = 250
 
 const PALETTE = [
   "#7aa2f7",
@@ -350,15 +375,12 @@ interface GraphRowProps {
   readonly searchState: SearchState
   readonly showDate: boolean
   readonly showAuthor: boolean
-  readonly maxRefs: number
-  readonly refs: readonly GitRef[]
+  readonly badges: readonly RefBadgeInfo[]
   readonly compareBase: boolean
   readonly onSelect: (event: MouseEvent) => void
   readonly onRefMenu: (badge: RefBadgeInfo, event: MouseEvent) => void
-  readonly onOverflowMenu: (
-    badges: readonly RefBadgeInfo[],
-    event: MouseEvent,
-  ) => void
+  readonly onRowMount: (element: HTMLDivElement) => void
+  readonly onRowUnmount: (element: HTMLDivElement) => void
   readonly onContextMenu: (event: MouseEvent) => void
   readonly onKeyDown: (event: KeyboardEvent) => void
 }
@@ -366,12 +388,18 @@ interface GraphRowProps {
 function GraphRow(props: GraphRowProps) {
   const lines = () => graphRowLines(props.view.row, props.view.previous)
   const nodeX = () => graphLaneX(props.view.row.lane, props.laneSpacing, LANE_PADDING)
-  const badges = () => refBadgesForCommit(props.refs, props.view.commit)
-  const visibleBadges = () => badges().slice(0, props.maxRefs)
-  const hiddenBadges = () => badges().slice(props.maxRefs)
+  const badges = () => props.badges
+  let element: HTMLDivElement | undefined
+  onCleanup(() => {
+    if (element) props.onRowUnmount(element)
+  })
 
   return (
     <div
+      ref={(next) => {
+        element = next
+        props.onRowMount(next)
+      }}
       role="button"
       tabIndex={props.disabled ? -1 : 0}
       class={[
@@ -384,7 +412,7 @@ function GraphRow(props: GraphRowProps) {
       ]
         .filter(Boolean)
         .join(" ")}
-      style={{ top: `${props.top}px`, height: `${props.rowHeight}px` }}
+      style={{ top: `${props.top}px` }}
       onClick={(event) => {
         if (!props.disabled) props.onSelect(event)
       }}
@@ -403,6 +431,8 @@ function GraphRow(props: GraphRowProps) {
       data-commit={props.view.commit.hash}
       data-index={props.view.index}
       data-row-top={props.top}
+      data-row-height={props.rowHeight}
+      data-ref-count={badges().length}
       data-parents={props.view.commit.parents.length}
       data-compare-base={props.compareBase ? "true" : undefined}
       aria-disabled={props.disabled}
@@ -448,8 +478,8 @@ function GraphRow(props: GraphRowProps) {
 
       <div class="gg-col-desc">
         <Show when={badges().length > 0}>
-          <span class="gg-ref-badges">
-            <For each={visibleBadges()}>
+          <span class="gg-ref-badges" data-testid="ref-badges">
+            <For each={badges()}>
               {(badge) => (
                 <button
                   type="button"
@@ -473,27 +503,6 @@ function GraphRow(props: GraphRowProps) {
                 </button>
               )}
             </For>
-            <Show when={hiddenBadges().length > 0}>
-              <button
-                type="button"
-                class="gg-ref-more gg-ref-badge"
-                data-testid="ref-more"
-                title={hiddenBadges()
-                  .map((badge) => `${refKindLabel(badge.kind)}: ${badge.name}`)
-                  .join(", ")}
-                onClick={(event) => {
-                  event.stopPropagation()
-                  props.onOverflowMenu(hiddenBadges(), event)
-                }}
-                onContextMenu={(event) => {
-                  event.preventDefault()
-                  event.stopPropagation()
-                  props.onOverflowMenu(hiddenBadges(), event)
-                }}
-              >
-                +{hiddenBadges().length}
-              </button>
-            </Show>
           </span>
         </Show>
         <span class="gg-subject">{props.view.commit.subject || "(no subject)"}</span>
@@ -1372,7 +1381,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const [historyOrder, setHistoryOrder] = createSignal<HistoryOrder>("date")
   const [branchSelectorOpen, setBranchSelectorOpen] = createSignal(false)
   const [refMenu, setRefMenu] = createSignal<RefMenuState | undefined>()
-  const [overflowMenu, setOverflowMenu] = createSignal<OverflowMenuState | undefined>()
   const [commitMenu, setCommitMenu] = createSignal<CommitMenuState | undefined>()
   const [jumpNotice, setJumpNotice] = createSignal<string | undefined>()
 
@@ -1417,6 +1425,8 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const [viewportHeight, setViewportHeight] = createSignal(320)
   const [scrollTop, setScrollTop] = createSignal(0)
   const [panelWidth, setPanelWidth] = createSignal(520)
+  const [measuredRowHeights, setMeasuredRowHeights] =
+    createSignal<ReadonlyMap<string, number>>(new Map<string, number>())
   const [columnPreferences, setColumnPreferences] =
     createSignal<ColumnPreferences>(readColumnPreferences())
   const [autoLoadState, setAutoLoadState] =
@@ -1439,6 +1449,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const [fetchError, setFetchError] = createSignal<string | undefined>()
 
   const repositoriesRequest = new LatestRequest()
+  const silentRepositoriesRequest = new LatestRequest()
   const graphRequest = new LatestRequest()
   const filesRequest = new LatestRequest()
   const diffRequest = new LatestRequest()
@@ -1454,6 +1465,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   let scroller: HTMLDivElement | undefined
   let resizeObserver: ResizeObserver | undefined
   let panelObserver: ResizeObserver | undefined
+  let rowObserver: ResizeObserver | undefined
+  let scrollAnchor: ScrollAnchor | undefined
+  let widthRestoreFrame: { readonly id: number; readonly timeout: boolean } | undefined
   let resizeDragCleanup: (() => void) | undefined
   let inlineSplitCleanup: (() => void) | undefined
   let slotResizeCleanup: (() => void) | undefined
@@ -1470,6 +1484,10 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   let restoreFrame: { readonly id: number; readonly timeout: boolean } | undefined
   let restoreAttempt = 0
   let autoSettleFrame: { readonly id: number; readonly timeout: boolean } | undefined
+  let panelCacheWriteTimer: ReturnType<typeof setTimeout> | undefined
+  let pendingPanelCache: PanelCacheSnapshot | undefined
+  let graphRefreshTimer: ReturnType<typeof setTimeout> | undefined
+  const graphChangeCoalescer = new GraphChangeCoalescer()
 
   const currentDirectory = () => props.panel.session.directory
 
@@ -1497,6 +1515,164 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       ...(selectedRepositoryId() ? { repositoryId: selectedRepositoryId() } : {}),
       ...(commit ? { commitHash: commit.hash, parentIndex: selectedParentIndex() } : {}),
       ...(file ? { filePath: file.path, fileSource: file.source } : {}),
+    }
+  }
+
+  /* ---------- remount cache ---------- */
+
+  /**
+   * Capture the state worth restoring after the panel remounts. Only signals
+   * are read: scroll is mirrored into its signal by the scroll handler, so the
+   * snapshot does not depend on the DOM being present.
+   */
+  function capturePanelCache(): PanelCacheSnapshot {
+    const currentFilters = filters()
+    const commit = selectedCommit()
+    return {
+      repositories: repositories().slice(),
+      selectedRepositoryId: selectedRepositoryId() ?? null,
+      status: status() ?? null,
+      commits: commits().slice(),
+      hasMore: hasMore(),
+      nextSkip: nextSkip(),
+      filters: {
+        refs: currentFilters.refs.slice(),
+        showRemotes: currentFilters.showRemotes,
+        showTags: currentFilters.showTags,
+      },
+      firstParent: firstParent(),
+      historyOrder: historyOrder(),
+      refs: refs().slice(),
+      selectedCommitHash: commit?.hash ?? null,
+      selectedParentIndex: selectedParentIndex(),
+      expandedDirectories: [...expandedDirectories()],
+      commitFiles: commitFiles().slice(),
+      commitFilesKey: commit
+        ? commitFilesKey(commit.hash, selectedParentIndex())
+        : null,
+      uncommittedExpanded: uncommittedExpanded(),
+      collapsedGroups: [...collapsedGroups()],
+      inlineView: inlineView(),
+      slotHeightOverrides: { ...slotHeightOverrides() },
+      inlineInfoRatio: inlineInfoRatio(),
+      scrollTop: scrollTop(),
+      searchQuery: searchQuery(),
+    }
+  }
+
+  function cancelPanelCacheWrite(): void {
+    if (panelCacheWriteTimer !== undefined) {
+      globalThis.clearTimeout(panelCacheWriteTimer)
+      panelCacheWriteTimer = undefined
+    }
+    pendingPanelCache = undefined
+  }
+
+  function flushPanelCacheWrite(): void {
+    if (panelCacheWriteTimer !== undefined) {
+      globalThis.clearTimeout(panelCacheWriteTimer)
+      panelCacheWriteTimer = undefined
+    }
+    if (!activeKey || !pendingPanelCache) return
+    PANEL_CACHE.set(activeKey, pendingPanelCache)
+    pendingPanelCache = undefined
+  }
+
+  /** Write immediately; used before a directory switch and on unmount. */
+  function persistPanelCacheNow(): void {
+    cancelPanelCacheWrite()
+    if (!activeKey) return
+    PANEL_CACHE.set(activeKey, untrack(capturePanelCache))
+  }
+
+  function schedulePanelCacheWrite(snapshot: PanelCacheSnapshot): void {
+    pendingPanelCache = snapshot
+    if (panelCacheWriteTimer !== undefined) return
+    panelCacheWriteTimer = globalThis.setTimeout(() => {
+      panelCacheWriteTimer = undefined
+      flushPanelCacheWrite()
+    }, PANEL_CACHE_WRITE_DELAY_MS)
+  }
+
+  /**
+   * Put cached signals back before the first paint. No loading flags are set;
+   * the background validator decides whether a silent getLog is needed.
+   */
+  function applyPanelCache(entry: PanelCacheSnapshot): void {
+    const cachedRepositoryId = entry.selectedRepositoryId ?? undefined
+    const repositoryExists =
+      cachedRepositoryId !== undefined &&
+      entry.repositories.some((repository) => repository.id === cachedRepositoryId)
+    const commit =
+      repositoryExists && entry.selectedCommitHash
+        ? entry.commits.find((candidate) => candidate.hash === entry.selectedCommitHash)
+        : undefined
+    const filesMatch =
+      commit !== undefined &&
+      entry.commitFilesKey === commitFilesKey(commit.hash, entry.selectedParentIndex)
+
+    setRepositories(entry.repositories.slice())
+    setSelectedRepositoryId(repositoryExists ? cachedRepositoryId : undefined)
+    setStatus(entry.status ?? undefined)
+    setCommits(entry.commits.slice())
+    setHasMore(entry.hasMore)
+    setNextSkip(entry.nextSkip)
+    setFilters({
+      refs: entry.filters.refs.slice(),
+      showRemotes: entry.filters.showRemotes,
+      showTags: entry.filters.showTags,
+    })
+    setFirstParent(entry.firstParent)
+    setHistoryOrder(entry.historyOrder)
+    setRefs(entry.refs.slice())
+    setSelectedCommit(commit)
+    setSelectedParentIndex(entry.selectedParentIndex)
+    setCommitFiles(filesMatch ? entry.commitFiles.slice() : [])
+    setFilesLoading(false)
+    setFilesError(undefined)
+    setExpandedDirectories(new Set(entry.expandedDirectories))
+    setSelectedFile(undefined)
+    setDiff(undefined)
+    setDiffLoading(false)
+    setDiffError(undefined)
+    setCommitDiffOpen(false)
+    setUncommittedExpanded(entry.uncommittedExpanded)
+    setCollapsedGroups(new Set(entry.collapsedGroups))
+    setInlineView(entry.inlineView)
+    setSlotHeightOverrides(entry.slotHeightOverrides)
+    setInlineInfoRatio(entry.inlineInfoRatio)
+    setSearchQuery(entry.searchQuery)
+    setScrollTop(entry.scrollTop)
+
+    // The scroll container is not mounted yet; reuse the existing RAF restore
+    // path, which waits for the spacer (and any expanded slot) to be laid out.
+    if (entry.scrollTop > 0 || commit) {
+      pendingViewRestore = {
+        key: activeKey,
+        repositoryId: cachedRepositoryId,
+        commitHash: commit?.hash,
+        generation: selectionGeneration.current(),
+        scrollTop: entry.scrollTop,
+      }
+      cancelRestoreFrame()
+    }
+
+    if (repositoryExists && cachedRepositoryId) {
+      if (commit && !filesMatch) {
+        void loadCommitFiles(commit, entry.selectedParentIndex, undefined, {
+          expandDirectories: entry.expandedDirectories,
+        })
+      }
+      // Render from cache now; compare HEAD/refs in the background and only
+      // fetch history again when the fingerprint changed.
+      void validateCachedRepository(cachedRepositoryId, entry)
+      return
+    }
+
+    if (entry.repositories.length > 0) {
+      void loadRepository(entry.repositories[0]!.id)
+    } else {
+      void refreshRepositoryListSilently()
     }
   }
 
@@ -1585,6 +1761,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     )
     scroller.scrollTop = top
     setScrollTop(scroller.scrollTop)
+    captureScrollAnchor(scroller)
     if (scroller.clientHeight > 0) setViewportHeight(scroller.clientHeight)
   }
 
@@ -1719,7 +1896,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setComparisonBase(undefined)
 
     setRefMenu(undefined)
-    setOverflowMenu(undefined)
     setCommitMenu(undefined)
 
     clearPendingViewRestore()
@@ -1910,6 +2086,199 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     }
 
     if (options?.awaitRefs) await refsPromise
+  }
+
+  /**
+   * Event-driven list refresh. Unlike `refreshRepositories`, this never sets
+   * the repositories loading flag; the existing select simply gains any new
+   * repository. If the selected repository vanished, fall back to the first.
+   */
+  async function refreshRepositoryListSilently(): Promise<void> {
+    const { route, rpc } = currentRpc()
+    const { directory } = route
+    const key = selectionKey(route.serverId, route.directory)
+    if (!directory) return
+
+    try {
+      const result = await silentRepositoriesRequest.run((signal) =>
+        rpc.listRepositories({ refresh: true }, requestOptions(directory, signal)),
+      )
+      if (!result.accepted || key !== activeKey) return
+
+      const list = result.value.repositories
+      setRepositories(list)
+      const currentId = selectedRepositoryId()
+      if (currentId && list.some((repository) => repository.id === currentId)) return
+      const next = list[0]
+      if (!next) {
+        setSelectedRepositoryId(undefined)
+        resetRepositoryState()
+        return
+      }
+      await loadRepository(next.id)
+    } catch {
+      // A watcher-driven refresh is background work; the visible state stays.
+    }
+  }
+
+  /**
+   * Compare a restored snapshot with the live HEAD and typed refs. An
+   * unchanged fingerprint means the cached commit page is still valid, so no
+   * getLog request is made. A move refreshes silently with the same page size.
+   */
+  async function validateCachedRepository(
+    repositoryId: string,
+    entry: PanelCacheSnapshot,
+  ): Promise<void> {
+    const { route, rpc } = currentRpc()
+    const { directory } = route
+    const key = selectionKey(route.serverId, route.directory)
+    if (!directory) return
+    const version = historyVersion
+
+    try {
+      const result = await graphRequest.run(async (signal) => {
+        const requestOptionsForLoad = requestOptions(directory, signal)
+        const [nextStatus, nextRefs] = await Promise.all([
+          rpc.getStatus({ repositoryId }, requestOptionsForLoad),
+          rpc.getRefs({ repositoryId }, requestOptionsForLoad),
+        ])
+        return { status: nextStatus, refs: nextRefs.refs }
+      })
+      if (!result.accepted) return
+      if (
+        key !== activeKey ||
+        selectedRepositoryId() !== repositoryId ||
+        version !== historyVersion
+      ) {
+        return
+      }
+
+      const sameHead =
+        (entry.status?.head ?? null) === (result.value.status.head ?? null)
+      const sameRefs = refsFingerprint(entry.refs) === refsFingerprint(result.value.refs)
+      // Working-tree changes are visible immediately; they do not force a log.
+      setStatus(result.value.status)
+      setRefs(result.value.refs)
+      if (sameHead && sameRefs) return
+      await refreshRepositorySilently()
+    } catch {
+      // Validation is best effort; the restored cache remains usable.
+    }
+  }
+
+  /**
+   * Quiet refresh: getStatus + getLog + getRefs, with the current loaded row
+   * count as the limit (never back to the first 100) and no loading flash.
+   */
+  async function refreshRepositorySilently(): Promise<void> {
+    const repositoryId = selectedRepositoryId()
+    if (!repositoryId) {
+      await refreshRepositoryListSilently()
+      return
+    }
+    const { route, rpc } = currentRpc()
+    const { directory } = route
+    const key = selectionKey(route.serverId, route.directory)
+    if (!directory || key !== activeKey) return
+    const version = historyVersion
+    const settings = logSettings()
+    const limit = Math.max(1, commits().length)
+    const caps = capabilities()
+
+    try {
+      const result = await graphRequest.run(async (signal) => {
+        const requestOptionsForLoad = requestOptions(directory, signal)
+        const input = historyLogInput(
+          repositoryId,
+          limit,
+          0,
+          settings,
+          caps.extendedLog,
+        )
+        const [nextStatus, log, nextRefs] = await Promise.all([
+          rpc.getStatus({ repositoryId }, requestOptionsForLoad),
+          extendedClient(rpc).getLog(
+            input as unknown as ExtendedLogInput,
+            requestOptionsForLoad,
+          ),
+          rpc.getRefs({ repositoryId }, requestOptionsForLoad),
+        ])
+        return { status: nextStatus, log, refs: nextRefs.refs }
+      })
+      if (!result.accepted) return
+      if (
+        key !== activeKey ||
+        selectedRepositoryId() !== repositoryId ||
+        version !== historyVersion
+      ) {
+        return
+      }
+
+      const nextCommits = mergeCommits([], result.value.log.commits)
+      setStatus(result.value.status)
+      setRefs(result.value.refs)
+      setCommits(nextCommits)
+      setNextSkip(result.value.log.commits.length)
+      setHasMore(result.value.log.hasMore && result.value.log.commits.length > 0)
+      setHistoryError(undefined)
+
+      // Keep an expanded commit only while it still exists in the new page.
+      const commit = selectedCommit()
+      if (commit && !nextCommits.some((candidate) => candidate.hash === commit.hash)) {
+        collapseCommit()
+      }
+      // The scroll container may shrink after a force-push style refresh.
+      postFrame(() => {
+        if (!scroller) return
+        const top = clampScrollOffset(
+          scrollTop(),
+          scroller.scrollHeight,
+          scroller.clientHeight,
+        )
+        if (top !== scroller.scrollTop) scroller.scrollTop = top
+        setScrollTop(scroller.scrollTop)
+      })
+    } catch {
+      // Silent refresh must never replace the rendered history with an error.
+    }
+  }
+
+  function cancelGraphRefresh(): void {
+    if (graphRefreshTimer !== undefined) {
+      globalThis.clearTimeout(graphRefreshTimer)
+      graphRefreshTimer = undefined
+    }
+    graphChangeCoalescer.clear()
+  }
+
+  function scheduleGraphRefresh(): void {
+    if (graphRefreshTimer !== undefined) globalThis.clearTimeout(graphRefreshTimer)
+    graphRefreshTimer = globalThis.setTimeout(() => {
+      graphRefreshTimer = undefined
+      const pending = graphChangeCoalescer.take()
+      if (pending.repositories && pending.repository) {
+        void (async () => {
+          await refreshRepositoryListSilently()
+          await refreshRepositorySilently()
+        })()
+      } else if (pending.repositories) {
+        void refreshRepositoryListSilently()
+      } else if (pending.repository) {
+        void refreshRepositorySilently()
+      }
+    }, GRAPH_REFRESH_DEBOUNCE_MS)
+  }
+
+  function handleGraphChanged(event: GraphChangedEvent): void {
+    const scope = decideGraphChange(
+      event,
+      currentDirectory(),
+      untrack(selectedRepositoryId),
+    )
+    if (scope === "ignore") return
+    graphChangeCoalescer.push(scope)
+    scheduleGraphRefresh()
   }
 
   async function loadHistoryFirstPage(repositoryId: string): Promise<void> {
@@ -2130,7 +2499,10 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     commit: GitCommit,
     parentIndex: number,
     restoreFilePath?: string,
-    options?: { readonly keepFile?: boolean },
+    options?: {
+      readonly keepFile?: boolean
+      readonly expandDirectories?: readonly string[]
+    },
   ): Promise<void> {
     const repositoryId = selectedRepositoryId()
     if (!repositoryId) return
@@ -2177,7 +2549,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setFilesLoading(false)
     const files = result.value.files
     setCommitFiles(files)
-    setExpandedDirectories(new Set(collectDirectoryPaths(buildFileTree(files))))
+    setExpandedDirectories(
+      new Set(
+        options?.expandDirectories ??
+          collectDirectoryPaths(buildFileTree(files)),
+      ),
+    )
     if (pendingViewRestore && !commitDiffOpen()) scheduleViewRestore()
 
     if (restoreFilePath) {
@@ -2599,14 +2976,137 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     resizeObserver.observe(element)
   }
 
+  /** Remember the commit at the top edge so a width reflow can preserve it. */
+  function captureScrollAnchor(element: HTMLDivElement | undefined = scroller): void {
+    if (!element) return
+    const layout = untrack(rowLayout)
+    const top = element.scrollTop
+    const index = layout.indexAtOffset(top)
+    if (index < 0) {
+      scrollAnchor = { index: -1, offset: top, hash: undefined }
+      return
+    }
+    scrollAnchor = {
+      index,
+      offset: Math.max(0, top - layout.rowTop(index)),
+      hash: untrack(rows)[index]?.commit.hash,
+    }
+  }
+
+  function cancelWidthRestore(): void {
+    cancelFrame(widthRestoreFrame)
+    widthRestoreFrame = undefined
+  }
+
+  /**
+   * Re-apply the captured top commit after the description track changes
+   * width. The frame waits for the new grid/row layout so `rowTop` is final.
+   */
+  function scheduleWidthRestore(): void {
+    const anchor = scrollAnchor
+    if (!anchor || !scroller) return
+    cancelWidthRestore()
+    widthRestoreFrame = postFrame(() => {
+      widthRestoreFrame = undefined
+      if (!scroller || !anchor) return
+      const layout = untrack(rowLayout)
+      if (anchor.index < 0) {
+        const target = clampScrollOffset(
+          anchor.offset,
+          scroller.scrollHeight,
+          scroller.clientHeight,
+        )
+        if (Math.abs(scroller.scrollTop - target) > 0.5) {
+          scroller.scrollTop = target
+          setScrollTop(scroller.scrollTop)
+        }
+        return
+      }
+      if (untrack(rows)[anchor.index]?.commit.hash !== anchor.hash) return
+      const target = clampScrollOffset(
+        layout.rowTop(anchor.index) + anchor.offset,
+        scroller.scrollHeight,
+        scroller.clientHeight,
+      )
+      if (Math.abs(scroller.scrollTop - target) > 0.5) {
+        scroller.scrollTop = target
+        setScrollTop(scroller.scrollTop)
+      }
+    })
+  }
+
+  /** Apply a measured panel width without losing the first visible commit. */
+  function changePanelWidth(width: number): void {
+    if (!Number.isFinite(width) || width <= 0) return
+    if (Math.abs(width - panelWidth()) < 0.5) return
+    captureScrollAnchor()
+    setPanelWidth(width)
+    scheduleWidthRestore()
+  }
+
+  function measureRow(element: HTMLElement): void {
+    const hash = element.dataset.commit
+    if (!hash) return
+    const height = element.getBoundingClientRect().height
+    if (!Number.isFinite(height) || height <= 0) return
+    const descriptionWidth = untrack(() => resolvedColumns().widths.description)
+    const labels = untrack(() => {
+      const badges = badgeMap().get(hash) ?? []
+      return badges.map((badge) => formatRefLabel(badge.name))
+    })
+    const key = rowHeightCacheKey(hash, descriptionWidth, labels)
+    setMeasuredRowHeights((previous) => {
+      const existing = previous.get(key)
+      if (existing !== undefined && Math.abs(existing - height) <= 0.5) {
+        return previous
+      }
+      const next = new Map(previous)
+      next.set(key, Math.round(height * 100) / 100)
+      if (next.size > 4_000) {
+        // Bound the session cache; the virtual window only ever reads a few
+        // hundred neighbouring rows at a time.
+        const trimmed = new Map<string, number>()
+        let skip = next.size - 2_000
+        for (const [entryKey, entryHeight] of next) {
+          if (skip > 0) {
+            skip -= 1
+            continue
+          }
+          trimmed.set(entryKey, entryHeight)
+        }
+        return trimmed
+      }
+      return next
+    })
+  }
+
+  function ensureRowObserver(): ResizeObserver | undefined {
+    if (rowObserver) return rowObserver
+    if (typeof ResizeObserver === "undefined") return undefined
+    rowObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        measureRow(entry.target as HTMLElement)
+      }
+    })
+    return rowObserver
+  }
+
+  function attachRowElement(element: HTMLDivElement): void {
+    ensureRowObserver()?.observe(element)
+  }
+
+  function detachRowElement(element: HTMLDivElement): void {
+    rowObserver?.unobserve(element)
+  }
+
   function attachPanel(element: HTMLDivElement): void {
     panelObserver?.disconnect()
     panelObserver = undefined
-    if (element.clientWidth > 0) setPanelWidth(element.clientWidth)
+    if (element.clientWidth > 0) changePanelWidth(element.clientWidth)
     if (typeof ResizeObserver === "undefined") return
     panelObserver = new ResizeObserver((entries) => {
       const width = entries[0]?.contentRect.width
-      if (typeof width === "number" && width > 0) setPanelWidth(width)
+      if (typeof width === "number" && width > 0) changePanelWidth(width)
     })
     panelObserver.observe(element)
   }
@@ -2621,6 +3121,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const move = (moveEvent: PointerEvent) => {
       // `resizeColumnPreferences` uses positive delta = wider for this column,
       // which matches dragging the handle to the right for every column.
+      captureScrollAnchor()
       setColumnPreferences(
         resizeColumnPreferences(
           base,
@@ -2840,6 +3341,23 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const index = expandedRowIndex()
     return index === undefined ? undefined : rows()[index]
   })
+  /**
+   * Badges grouped once per commit. The row renderer and the height estimator
+   * must use exactly the same list, otherwise measured and estimated heights
+   * could disagree.
+   */
+  const badgeMap = createMemo(() => {
+    const map = new Map<string, RefBadgeInfo[]>()
+    const currentRefs = refs()
+    const graphRows = rows()
+    const graphHistory = graphCommits()
+    for (let index = 0; index < graphRows.length; index += 1) {
+      const commit = graphHistory[index]
+      if (!commit) continue
+      map.set(commit.hash, refBadgesForCommit(currentRefs, commit))
+    }
+    return map
+  })
   function resolveSlotHeight(key: string, automatic: number): number {
     const stored = slotHeightOverrides()[key]
     return stored === undefined ? automatic : clampSlotHeight(stored, viewportHeight())
@@ -2858,16 +3376,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       defaultSlotHeight(uncommittedContentRows(), viewportHeight()),
     )
   })
-  const rowLayout = createMemo(() =>
-    createRowLayout({
-      count: rows().length,
-      rowHeight: ROW_HEIGHT,
-      leadingRows: 1,
-      leadingSlotHeight: uncommittedSlotHeight(),
-      expandedIndex: expandedRowIndex(),
-      expandedHeight: slotHeight(),
-    }),
-  )
 
   const maxLanes = createMemo(() =>
     rows().reduce((maximum, row) => Math.max(maximum, row.lanes), 1),
@@ -2883,12 +3391,69 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     graphContentWidth(maxLanes(), LANE_SPACING, LANE_PADDING),
   )
   const laneSpacing = createMemo(() => graphLaneSpacing())
-  const maxRefs = createMemo(() =>
-    Math.min(
-      visibleRefCount(panelWidth()),
-      refBadgeCountForBudget(resolvedColumns().widths.description),
-    ),
+  /** First-frame estimate for every row; measured values override it. */
+  const rowHeights = createMemo(() => {
+    const descriptionWidth = resolvedColumns().widths.description
+    const measured = measuredRowHeights()
+    const badgesByHash = badgeMap()
+    const graphRows = rows()
+    const graphHistory = graphCommits()
+    return graphRows.map((row, index) => {
+      const commit = graphHistory[index]
+      const badges = badgesByHash.get(row.commit.hash) ?? []
+      const labels = badges.map((badge) => formatRefLabel(badge.name))
+      const cached = measured.get(
+        rowHeightCacheKey(row.commit.hash, descriptionWidth, labels),
+      )
+      if (cached !== undefined) return cached
+      return estimateCommitRowHeight({
+        baseHeight: ROW_HEIGHT,
+        descriptionWidth,
+        badgeLabels: labels,
+        subject: commit?.subject,
+      })
+    })
+  })
+  const rowLayout = createMemo(() =>
+    createRowLayout({
+      count: rows().length,
+      rowHeight: ROW_HEIGHT,
+      rowHeights: rowHeights(),
+      leadingRows: 1,
+      leadingSlotHeight: uncommittedSlotHeight(),
+      expandedIndex: expandedRowIndex(),
+      expandedHeight: slotHeight(),
+    }),
   )
+
+  /**
+   * Height estimates change when badges wrap differently or a rendered row is
+   * measured. Shift `scrollTop` by the same amount as the anchor row's top, so
+   * the first visible commit stays put instead of jumping by a line height.
+   */
+  let previousLayoutForAnchor: ReturnType<typeof createRowLayout> | undefined
+  createEffect(() => {
+    const layout = rowLayout()
+    const previous = previousLayoutForAnchor
+    previousLayoutForAnchor = layout
+    if (!previous) return
+    const anchor = untrack(() => scrollAnchor)
+    const element = scroller
+    if (!anchor || !element || anchor.index < 0 || slotResizeCleanup) return
+    const currentRows = untrack(rows)
+    if (currentRows[anchor.index]?.commit.hash !== anchor.hash) return
+    const delta = layout.rowTop(anchor.index) - previous.rowTop(anchor.index)
+    if (Math.abs(delta) <= 0.5) return
+    const target = clampScrollOffset(
+      element.scrollTop + delta,
+      element.scrollHeight,
+      element.clientHeight,
+    )
+    if (Math.abs(target - element.scrollTop) > 0.5) {
+      element.scrollTop = target
+      setScrollTop(element.scrollTop)
+    }
+  })
   const detailsOrientation = createMemo(() => detailsLayout(panelWidth()))
   const historyStyle = createMemo(
     () => `--gg-history-cols:${resolvedColumns().gridTemplate};`,
@@ -3143,6 +3708,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const top = clampScrollOffset(rowTop, scroller.scrollHeight, scroller.clientHeight)
     scroller.scrollTop = top
     setScrollTop(scroller.scrollTop)
+    captureScrollAnchor(scroller)
     // Search can programmatically park the viewport at the bottom; the auto
     // guard keeps that from turning into an unbounded fetch loop.
     maybeAutoLoad()
@@ -3182,7 +3748,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
 
   function closeMenus(): void {
     setRefMenu(undefined)
-    setOverflowMenu(undefined)
     setCommitMenu(undefined)
   }
 
@@ -3207,12 +3772,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     const { x, y } = eventPoint(event)
     closeMenus()
     setRefMenu({ ref, x, y })
-  }
-
-  function openOverflowMenu(badges: readonly RefBadgeInfo[], event: MouseEvent): void {
-    const { x, y } = eventPoint(event)
-    closeMenus()
-    setOverflowMenu({ badges, x, y })
   }
 
   function openCommitMenu(commit: GitCommit, event: MouseEvent): void {
@@ -4062,12 +4621,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       : []
   }
 
-  const overflowMenuItems = (): MenuAction[] =>
-    (overflowMenu()?.badges ?? []).map((badge, index) => ({
-      id: `ref:${index}`,
-      label: `${refKindLabel(badge.kind)}: ${badge.name}`,
-    }))
-
   const commitMenuItems = (): MenuAction[] => {
     const state = commitMenu()
     return state
@@ -4076,21 +4629,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           capabilities: capabilities(),
         })
       : []
-  }
-
-  function handleOverflowMenuAction(id: string): void {
-    const state = overflowMenu()
-    setOverflowMenu(undefined)
-    if (!state) return
-    const index = Number(id.replace(/^ref:/, ""))
-    const badge = state.badges[index]
-    if (!badge) return
-    const ref = typedRefForBadge(refs(), badge)
-    if (!ref) {
-      void copyText(badge.name, "Ref name")
-      return
-    }
-    setRefMenu({ ref, x: state.x, y: state.y })
   }
 
   function handlePanelKeyDown(event: KeyboardEvent): void {
@@ -4115,7 +4653,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       return
     }
     if (event.key === "Escape") {
-      if (refMenu() || overflowMenu() || commitMenu()) {
+      if (refMenu() || commitMenu()) {
         event.preventDefault()
         closeMenus()
         return
@@ -4177,18 +4715,81 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
 
     if (activeKey) {
       selectionCache.set(activeKey, untrack(() => captureSelection()))
+      persistPanelCacheNow()
     }
+    cancelGraphRefresh()
     activeKey = key
-    pendingRestore = selectionCache.get(key)
-    const restoreToken = selectionGeneration.current()
     resetAll()
     if (!route.directory) return
+
+    const cached = PANEL_CACHE.get(key)
+    if (cached) {
+      pendingRestore = undefined
+      applyPanelCache(cached)
+      return
+    }
+
+    pendingRestore = selectionCache.get(key)
+    const restoreToken = selectionGeneration.current()
     void refreshRepositories(false, pendingRestore, restoreToken)
   })
 
+  /**
+   * Persist after meaningful state changes, throttled. Scroll updates land in
+   * the snapshot too, so the next mount restores the same row.
+   */
+  createEffect(() => {
+    const snapshot = capturePanelCache()
+    if (!activeKey) return
+    if (
+      snapshot.repositories.length === 0 &&
+      snapshot.commits.length === 0 &&
+      snapshot.selectedRepositoryId === null &&
+      snapshot.status === null
+    ) {
+      return
+    }
+    schedulePanelCacheWrite(snapshot)
+  })
+
+  /**
+   * Follow the current session's server client. Read `server.client` on every
+   * effect run so a replaced client (restart/re-auth) gets a new subscription;
+   * `onCleanup` removes the old one before the next run and on unmount.
+   */
+  createEffect(() => {
+    const session = props.panel.session
+    const directory = session.directory
+    const client = session.server.client
+    if (!directory || !client) return
+
+    const controller = new AbortController()
+    let stop: (() => void) | undefined
+    try {
+      const rpc = client.rpc(GitGraphRpc)
+      stop = rpc.events.on(
+        "graphChanged",
+        (event) => handleGraphChanged(event),
+        { signal: controller.signal },
+      )
+    } catch {
+      // A host without the event channel still renders from cached/loaded data.
+      stop = undefined
+    }
+    onCleanup(() => {
+      controller.abort()
+      stop?.()
+    })
+  })
+
   onCleanup(() => {
+    persistPanelCacheNow()
+    cancelGraphRefresh()
     resizeObserver?.disconnect()
     panelObserver?.disconnect()
+    rowObserver?.disconnect()
+    rowObserver = undefined
+    cancelWidthRestore()
     resizeDragCleanup?.()
     inlineSplitCleanup?.()
     slotResizeCleanup?.()
@@ -4199,6 +4800,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     cancelAutoLoadSettle()
     if (activeKey) selectionCache.set(activeKey, untrack(() => captureSelection()))
     repositoriesRequest.dispose()
+    silentRepositoriesRequest.dispose()
     graphRequest.dispose()
     filesRequest.dispose()
     diffRequest.dispose()
@@ -4502,6 +5104,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
             ref={(element) => attachScroller(element)}
             onScroll={(event) => {
               const element = event.currentTarget
+              captureScrollAnchor(element)
               setScrollTop(element.scrollTop)
               // Keep the virtual window honest even when ResizeObserver is
               // frozen in a background host tab.
@@ -4563,7 +5166,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                     view={view}
                     laneSpacing={laneSpacing()}
                     graphWidth={graphWidth()}
-                    rowHeight={ROW_HEIGHT}
+                    rowHeight={rowLayout().rowHeightAt(view.index)}
                     top={rowLayout().rowTop(view.index)}
                     selected={selectedCommit()?.hash === view.commit.hash}
                     expanded={
@@ -4574,12 +5177,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
                     searchState={searchState(view.commit.hash)}
                     showDate={resolvedColumns().visibility.date}
                     showAuthor={resolvedColumns().visibility.author}
-                    maxRefs={maxRefs()}
-                    refs={refs()}
+                    badges={badgeMap().get(view.commit.hash) ?? []}
                     compareBase={comparisonBase()?.hash === view.commit.hash}
                     onSelect={(event) => activateRow(view.commit, event)}
                     onRefMenu={(badge, event) => openRefMenu(badge, event)}
-                    onOverflowMenu={(badges, event) => openOverflowMenu(badges, event)}
+                    onRowMount={attachRowElement}
+                    onRowUnmount={detachRowElement}
                     onContextMenu={(event) => openCommitMenu(view.commit, event)}
                     onKeyDown={(event) => handleRowKeyDown(view.commit, event)}
                   />
@@ -4935,18 +5538,6 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
           if (state) handleRefMenuAction(state.ref, id)
         }}
         onClose={() => setRefMenu(undefined)}
-      />
-
-      <ContextMenu
-        open={overflowMenu() !== undefined}
-        x={overflowMenu()?.x ?? 0}
-        y={overflowMenu()?.y ?? 0}
-        title="Refs on this commit"
-        items={overflowMenuItems()}
-        testId="ref-overflow-menu"
-        ariaLabel="Refs on this commit"
-        onSelect={(id) => handleOverflowMenuAction(id)}
-        onClose={() => setOverflowMenu(undefined)}
       />
 
       <ContextMenu
