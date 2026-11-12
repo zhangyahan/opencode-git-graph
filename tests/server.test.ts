@@ -82,6 +82,40 @@ const diffFixture: FileDiff = {
   binary: false,
 }
 
+/**
+ * The host serialises the whole RPC envelope as JSON, so an explicit
+ * `undefined` property is not encodable even though zod accepts optional
+ * fields with that value. Walk the value the same way the host encoder does.
+ */
+function assertJsonValue(value: unknown, path = "output"): void {
+  if (value === null) return
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return
+    case "number":
+      if (!Number.isFinite(value)) throw new Error(`Non-finite number at ${path}`)
+      return
+    case "object": {
+      if (Array.isArray(value)) {
+        value.forEach((entry, index) => assertJsonValue(entry, `${path}[${index}]`))
+        return
+      }
+      const prototype = Object.getPrototypeOf(value)
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new Error(`Non-plain object at ${path}`)
+      }
+      for (const [key, entry] of Object.entries(value)) {
+        if (entry === undefined) throw new Error(`undefined at ${path}.${key}`)
+        assertJsonValue(entry, `${path}.${key}`)
+      }
+      return
+    }
+    default:
+      throw new Error(`Non-JSON ${typeof value} at ${path}`)
+  }
+}
+
 function fakeManager(overrides: Partial<GitGraphManager> = {}): GitGraphManager {
   return {
     listRepositories: vi.fn(async () => []),
@@ -205,6 +239,83 @@ describe("git-graph RPC handlers", () => {
       root.cleanup()
     }
   })
+
+  it("returns JSON-safe untracked, empty and binary diffs through the production handler", async () => {
+    const root = mkTmpDir()
+    try {
+      const repo = join(root.dir, "repo")
+      initRepo(repo)
+      commit(repo, { "a.txt": "one\n" }, "first")
+      writeFileSync(join(repo, "untracked.txt"), "one\ntwo\n")
+      writeFileSync(join(repo, "empty.txt"), "")
+      writeFileSync(join(repo, "binary.bin"), Buffer.from([0, 1, 2, 3]))
+
+      const manager = new RepositoryManager(root.dir, { ttlMs: 60_000 })
+      try {
+        const handlers = createGitGraphHandlers(manager)
+        const { context } = makeContext()
+        const listed = ListRepositoriesOutputSchema.parse(
+          await handlers.listRepositories({}, context as never),
+        )
+        const repositoryId = listed.repositories[0].id
+
+        for (const path of ["untracked.txt", "empty.txt", "binary.bin"] as const) {
+          const raw = await handlers.getDiff(
+            { repositoryId, target: { type: "working-tree" }, path },
+            context as never,
+          )
+          expect(() => assertJsonValue(raw, "output")).not.toThrow()
+          const diff = GetDiffOutputSchema.parse(raw)
+          expect(diff.status).toBe("untracked")
+          expect(diff).not.toHaveProperty("truncated")
+          expect(JSON.parse(JSON.stringify(raw))).toEqual(raw)
+        }
+
+        const text = GetDiffOutputSchema.parse(
+          await handlers.getDiff(
+            { repositoryId, target: { type: "working-tree" }, path: "untracked.txt" },
+            context as never,
+          ),
+        )
+        expect(text.text).toContain("new file mode 100644")
+        expect(text.text).toContain("+one")
+        expect(text.text).toContain("+two")
+
+        const empty = GetDiffOutputSchema.parse(
+          await handlers.getDiff(
+            { repositoryId, target: { type: "working-tree" }, path: "empty.txt" },
+            context as never,
+          ),
+        )
+        expect(empty.text).toContain("diff --git a/empty.txt b/empty.txt")
+        expect(empty.text).not.toContain("@@")
+
+        writeFileSync(join(repo, "large.txt"), "x".repeat(1024 * 1024 + 32))
+        const largeRaw = await handlers.getDiff(
+          { repositoryId, target: { type: "working-tree" }, path: "large.txt" },
+          context as never,
+        )
+        expect(() => assertJsonValue(largeRaw, "output")).not.toThrow()
+        const large = GetDiffOutputSchema.parse(largeRaw)
+        expect(large.status).toBe("untracked")
+        expect(large.truncated).toBe(true)
+        expect(large.text.length).toBeGreaterThan(1024 * 1024)
+        expect(large.text.length).toBeLessThan(1024 * 1024 + 1024)
+
+        writeFileSync(join(repo, "a.txt"), "two\n")
+        const modified = await handlers.getDiff(
+          { repositoryId, target: { type: "working-tree" }, path: "a.txt" },
+          context as never,
+        )
+        expect(() => assertJsonValue(modified, "output")).not.toThrow()
+        expect(GetDiffOutputSchema.parse(modified).status).toBe("modified")
+      } finally {
+        manager.dispose()
+      }
+    } finally {
+      root.cleanup()
+    }
+  }, 15_000)
 
   it("serves comparison and confirmed mutation methods through the real manager", async () => {
     const root = mkTmpDir()

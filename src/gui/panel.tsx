@@ -56,6 +56,11 @@ import {
   SLOT_HEADER_HEIGHT,
 } from "./slot-size.js"
 import {
+  clampDetailsHeight,
+  defaultDetailsHeight,
+  detailsHeightBounds,
+} from "./details-size.js"
+import {
   readColumnPreferences,
   resizeColumnPreferences,
   resolveColumnLayout,
@@ -1436,6 +1441,14 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   const [uncommittedExpanded, setUncommittedExpanded] = createSignal(false)
   const [slotHeightOverrides, setSlotHeightOverrides] =
     createSignal<Readonly<Record<string, number>>>({})
+  /** Remembered bottom diff details height; null follows the CSS 42% share. */
+  const [detailsHeight, setDetailsHeight] = createSignal<number | null>(null)
+  /**
+   * Stable space shared by history + details: panel height minus the other
+   * in-flow siblings. It does not change while the details pane is dragged.
+   */
+  const [detailsSpace, setDetailsSpace] = createSignal(0)
+  const [panelHeight, setPanelHeight] = createSignal(0)
   /** Session-only share of the inline slot body used by the info pane. */
   const [inlineInfoRatio, setInlineInfoRatio] = createSignal(
     DEFAULT_INLINE_INFO_RATIO,
@@ -1472,6 +1485,10 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   let inlineSplitCleanup: (() => void) | undefined
   let slotResizeCleanup: (() => void) | undefined
   let slotResizeFrame: { readonly id: number; readonly timeout: boolean } | undefined
+  let detailsResizeCleanup: (() => void) | undefined
+  let detailsResizeFrame: { readonly id: number; readonly timeout: boolean } | undefined
+  let detailsMeasureFrame: { readonly id: number; readonly timeout: boolean } | undefined
+  let panelElement: HTMLDivElement | undefined
   let fetchRequestVersion = 0
   let loadMoreInFlight = false
   let historyVersion = 0
@@ -1554,6 +1571,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       collapsedGroups: [...collapsedGroups()],
       inlineView: inlineView(),
       slotHeightOverrides: { ...slotHeightOverrides() },
+      detailsHeight: detailsHeight(),
       inlineInfoRatio: inlineInfoRatio(),
       scrollTop: scrollTop(),
       searchQuery: searchQuery(),
@@ -1640,6 +1658,7 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     setCollapsedGroups(new Set(entry.collapsedGroups))
     setInlineView(entry.inlineView)
     setSlotHeightOverrides(entry.slotHeightOverrides)
+    setDetailsHeight(entry.detailsHeight ?? null)
     setInlineInfoRatio(entry.inlineInfoRatio)
     setSearchQuery(entry.searchQuery)
     setScrollTop(entry.scrollTop)
@@ -3042,6 +3061,9 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     captureScrollAnchor()
     setPanelWidth(width)
     scheduleWidthRestore()
+    // A width change can wrap the toolbar and change the shared vertical
+    // space without changing the panel height.
+    scheduleDetailsMeasure()
   }
 
   function measureRow(element: HTMLElement): void {
@@ -3100,15 +3122,175 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
   }
 
   function attachPanel(element: HTMLDivElement): void {
+    panelElement = element
     panelObserver?.disconnect()
     panelObserver = undefined
     if (element.clientWidth > 0) changePanelWidth(element.clientWidth)
+    if (element.clientHeight > 0) setPanelHeight(element.clientHeight)
     if (typeof ResizeObserver === "undefined") return
     panelObserver = new ResizeObserver((entries) => {
-      const width = entries[0]?.contentRect.width
-      if (typeof width === "number" && width > 0) changePanelWidth(width)
+      const rect = entries[0]?.contentRect
+      if (!rect) return
+      if (typeof rect.width === "number" && rect.width > 0) {
+        changePanelWidth(rect.width)
+      }
+      if (typeof rect.height === "number" && rect.height > 0) {
+        setPanelHeight(rect.height)
+        scheduleDetailsMeasure()
+      }
     })
     panelObserver.observe(element)
+  }
+
+  /**
+   * Stable vertical space available to history + details. It is the panel
+   * content height minus every other in-flow sibling (toolbar, notices, …),
+   * so the value does not depend on where the current split sits. Measuring
+   * history/details outer edges directly would race the flex relayout when the
+   * viewport shrinks and could capture a transient combined height.
+   */
+  function measureDetailsSpace(): number {
+    if (!panelElement) return 0
+    const history = panelElement.querySelector<HTMLElement>(".gg-history")
+    const details = panelElement.querySelector<HTMLElement>(".gg-details")
+    if (!history || !details) return 0
+    let fixedHeight = 0
+    for (const child of panelElement.children) {
+      if (!(child instanceof HTMLElement)) continue
+      if (child === history || child === details) continue
+      const style = getComputedStyle(child)
+      if (style.display === "none" || style.position === "absolute") continue
+      const height = child.getBoundingClientRect().height
+      if (Number.isFinite(height) && height > 0) fixedHeight += height
+    }
+    const space = panelElement.getBoundingClientRect().height - fixedHeight
+    return Number.isFinite(space) && space > 0 ? space : 0
+  }
+
+  function syncDetailsSpace(): void {
+    const space = measureDetailsSpace()
+    if (space <= 0) return
+    if (Math.abs(space - detailsSpace()) > 0.5) setDetailsSpace(space)
+  }
+
+  function scheduleDetailsMeasure(): void {
+    if (detailsMeasureFrame !== undefined) return
+    detailsMeasureFrame = postFrame(() => {
+      detailsMeasureFrame = undefined
+      syncDetailsSpace()
+    })
+  }
+
+  const resolvedDetailsHeight = createMemo(() => {
+    const stored = detailsHeight()
+    if (stored === null) return undefined
+    const space = detailsSpace()
+    if (!(space > 0)) return undefined
+    return clampDetailsHeight(stored, space)
+  })
+
+  const detailsPanelStyle = createMemo(() => {
+    const height = resolvedDetailsHeight()
+    if (height === undefined) return undefined
+    // Override the flex-basis 42% / max-height 56% defaults while the user's
+    // remembered pixel height is active; the helper owns the safe bounds.
+    return `height:${height}px;flex:0 0 auto;min-height:0;max-height:none;`
+  })
+
+  const detailsHandleAria = createMemo(() => {
+    const height = resolvedDetailsHeight()
+    if (height === undefined || !(detailsSpace() > 0)) return {}
+    const bounds = detailsHeightBounds(detailsSpace())
+    return {
+      "aria-valuemin": Math.round(bounds.min),
+      "aria-valuemax": Math.round(bounds.max),
+      "aria-valuenow": height,
+    }
+  })
+
+  function currentDetailsHeight(): number {
+    const resolved = resolvedDetailsHeight()
+    if (resolved !== undefined) return resolved
+    const details = panelElement?.querySelector<HTMLElement>(".gg-details")
+    const height = details?.getBoundingClientRect().height ?? 0
+    return Number.isFinite(height) && height > 0 ? height : 0
+  }
+
+  function startDetailsResize(event: PointerEvent): void {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.button !== 0) return
+    const details = panelElement?.querySelector<HTMLElement>(".gg-details")
+    if (!details) return
+    const startHeight = details.getBoundingClientRect().height
+    if (!(startHeight > 0)) return
+    const space = measureDetailsSpace() || detailsSpace()
+    if (!(space > 0)) return
+    const startY = event.clientY
+    let latestY = startY
+
+    const apply = (): void => {
+      detailsResizeFrame = undefined
+      const next = clampDetailsHeight(startHeight + (startY - latestY), space)
+      setDetailsHeight((previous) => (previous === next ? previous : next))
+    }
+    const schedule = (): void => {
+      if (detailsResizeFrame !== undefined) return
+      detailsResizeFrame = postFrame(apply)
+    }
+    const move = (moveEvent: PointerEvent): void => {
+      latestY = moveEvent.clientY
+      schedule()
+    }
+    const cleanup = (): void => {
+      window.removeEventListener("pointermove", move)
+      window.removeEventListener("pointerup", stop)
+      window.removeEventListener("pointercancel", cancel)
+      window.removeEventListener("blur", stop)
+      detailsResizeCleanup = undefined
+    }
+    const stop = (): void => {
+      cleanup()
+      cancelFrame(detailsResizeFrame)
+      detailsResizeFrame = undefined
+      apply()
+    }
+    const cancel = (): void => {
+      cleanup()
+      cancelFrame(detailsResizeFrame)
+      detailsResizeFrame = undefined
+    }
+    detailsResizeCleanup?.()
+    detailsResizeCleanup = cleanup
+    window.addEventListener("pointermove", move)
+    window.addEventListener("pointerup", stop)
+    window.addEventListener("pointercancel", cancel)
+    window.addEventListener("blur", stop)
+  }
+
+  function resetDetailsHeight(): void {
+    detailsResizeCleanup?.()
+    cancelFrame(detailsResizeFrame)
+    detailsResizeFrame = undefined
+    const space = measureDetailsSpace() || detailsSpace()
+    setDetailsHeight(space > 0 ? defaultDetailsHeight(space) : null)
+  }
+
+  function nudgeDetailsHeight(event: KeyboardEvent): void {
+    const step = event.shiftKey ? 48 : 16
+    const space = measureDetailsSpace() || detailsSpace()
+    if (!(space > 0)) return
+    const current = currentDetailsHeight()
+    if (!(current > 0)) return
+    let next: number | undefined
+    if (event.key === "ArrowUp") next = current + step
+    else if (event.key === "ArrowDown") next = current - step
+    else if (event.key === "Home") next = detailsHeightBounds(space).min
+    else if (event.key === "End") next = detailsHeightBounds(space).max
+    if (next === undefined) return
+    event.preventDefault()
+    event.stopPropagation()
+    setDetailsHeight(clampDetailsHeight(next, space))
   }
 
   function startColumnResize(
@@ -3468,6 +3650,16 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     if (commitDiffOpen() || activeComparison()) return false
     const file = selectedFile()
     return file !== undefined && file.source !== "commit"
+  })
+
+  /** Keep the remembered height clamped when the available space changes. */
+  createEffect(() => {
+    if (!detailsVisible()) return
+    // Track the panel height and layout orientation so toolbar wrapping or a
+    // host resize re-measures the stable shared space.
+    panelHeight()
+    detailsOrientation()
+    scheduleDetailsMeasure()
   })
   const commitDiffSelection = createMemo(() => {
     if (!commitDiffOpen() || activeComparison()) return undefined
@@ -4795,6 +4987,12 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
     slotResizeCleanup?.()
     cancelFrame(slotResizeFrame)
     slotResizeFrame = undefined
+    detailsResizeCleanup?.()
+    cancelFrame(detailsResizeFrame)
+    detailsResizeFrame = undefined
+    cancelFrame(detailsMeasureFrame)
+    detailsMeasureFrame = undefined
+    panelElement = undefined
     fetchRequestVersion += 1
     cancelRestoreFrame()
     cancelAutoLoadSettle()
@@ -5313,7 +5511,25 @@ export function GitGraphPanel(props: { readonly panel: PanelProps }) {
       </Show>
 
       <Show when={detailsVisible()}>
-        <section class="gg-details" data-testid="commit-details" aria-label="Commit details">
+        <section
+          class="gg-details"
+          data-testid="commit-details"
+          aria-label="Commit details"
+          style={detailsPanelStyle()}
+        >
+          <div
+            class="gg-details-resize"
+            data-testid="details-resize-handle"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize diff panel"
+            title="Drag to resize; double-click to reset"
+            tabIndex={0}
+            {...detailsHandleAria()}
+            onPointerDown={(event) => startDetailsResize(event)}
+            onKeyDown={(event) => nudgeDetailsHeight(event)}
+            onDblClick={() => resetDetailsHeight()}
+          />
           <div class="gg-details-head">
             <div class="gg-details-title">
               <span class="gg-details-subject" title={selectedFile()?.path}>

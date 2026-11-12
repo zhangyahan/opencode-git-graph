@@ -349,15 +349,19 @@ async function buildSyntheticDiff(
     }
 
     const { data, truncated } = await readFileLimited(resolved.absolutePath)
+    // Omit `truncated` entirely unless it is true. The RPC host encodes the
+    // response as JSON and rejects a property whose value is `undefined`, even
+    // though the schema marks it optional.
+    const truncatedField = truncated ? { truncated: true as const } : {}
     if (data.subarray(0, BINARY_SNIFF_BYTES).includes(0)) {
-      return { path: filePath, status, text: "", binary: true, truncated: truncated || undefined }
+      return { path: filePath, status, text: "", binary: true, ...truncatedField }
     }
     return {
       path: filePath,
       status,
       text: buildNewFileDiff(filePath, data.toString("utf8")),
       binary: false,
-      truncated: truncated || undefined,
+      ...truncatedField,
     }
   }
 

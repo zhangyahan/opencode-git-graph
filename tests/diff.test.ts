@@ -312,7 +312,9 @@ describe("getDiff", () => {
       expect(diff.text).toContain("@@ -0,0 +1,2 @@")
       expect(diff.text).toContain("+one")
       expect(diff.text).toContain("+two")
-      expect(diff.truncated).toBeUndefined()
+      // Omitted, not present with an explicit `undefined` value: the host JSON
+      // encoder rejects undefined properties over RPC.
+      expect(Object.hasOwn(diff, "truncated")).toBe(false)
     } finally {
       repo.cleanup()
     }

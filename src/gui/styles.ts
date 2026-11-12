@@ -953,13 +953,32 @@ export const GG_STYLES = `
 
 /* ---------- commit details ---------- */
 .gg-details {
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 0 1 42%;
-  min-height: 160px;
+  min-height: 0;
   max-height: 56%;
+  overflow: hidden;
   border-top: 1px solid var(--color-border, #3a3a3a);
   background: var(--color-surface, rgba(128, 128, 128, 0.035));
+}
+/* The top edge itself is the resize affordance: a transparent full-width hit
+   strip with no grip decoration. */
+.gg-details-resize {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  background: transparent;
+  cursor: row-resize;
+  touch-action: none;
+  z-index: 3;
+}
+.gg-details-resize:focus-visible {
+  outline: 1px solid rgba(122, 162, 247, 0.75);
+  outline-offset: -2px;
 }
 .gg-details-head {
   display: flex;

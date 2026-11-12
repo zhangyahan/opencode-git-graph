@@ -31,6 +31,7 @@ function snapshot(overrides: Partial<PanelCacheSnapshot> = {}): PanelCacheSnapsh
     collapsedGroups: [],
     inlineView: "tree",
     slotHeightOverrides: {},
+    detailsHeight: null,
     inlineInfoRatio: 0.32,
     scrollTop: 0,
     searchQuery: "",
@@ -123,6 +124,7 @@ describe("panel cache serialization", () => {
       collapsedGroups: ["staged"],
       inlineView: "list",
       slotHeightOverrides: { uncommitted: 240 },
+      detailsHeight: 280,
       inlineInfoRatio: 0.4,
       scrollTop: 123,
       searchQuery: "fix",
@@ -135,6 +137,7 @@ describe("panel cache serialization", () => {
     // slot and its dragged height for the session.
     expect(restored?.uncommittedExpanded).toBe(true)
     expect(restored?.slotHeightOverrides).toEqual({ uncommitted: 240 })
+    expect(restored?.detailsHeight).toBe(280)
   })
 
   it("ignores malformed and incomplete data", () => {
@@ -147,5 +150,18 @@ describe("panel cache serialization", () => {
         JSON.stringify({ ...snapshot(), inlineView: "grid" }),
       ),
     ).toBeUndefined()
+    expect(
+      deserializePanelCache(
+        JSON.stringify({ ...snapshot(), detailsHeight: "tall" }),
+      ),
+    ).toBeUndefined()
+  })
+
+  it("accepts older snapshots that predate detailsHeight", () => {
+    const legacy = snapshot()
+    delete (legacy as { detailsHeight?: number | null }).detailsHeight
+    const restored = deserializePanelCache(JSON.stringify(legacy))
+    expect(restored).toBeDefined()
+    expect(restored?.detailsHeight).toBeUndefined()
   })
 })

@@ -36,6 +36,11 @@ export interface PanelCacheSnapshot {
   readonly collapsedGroups: readonly string[]
   readonly inlineView: "list" | "tree"
   readonly slotHeightOverrides: Readonly<Record<string, number>>
+  /**
+   * Remembered bottom details height; null keeps the CSS/default share.
+   * Optional so serialized snapshots written before this field still decode.
+   */
+  readonly detailsHeight?: number | null
   readonly inlineInfoRatio: number
   readonly scrollTop: number
   readonly searchQuery: string
@@ -140,6 +145,9 @@ function isPanelCacheSnapshot(value: unknown): value is PanelCacheSnapshot {
     (value.inlineView === "list" || value.inlineView === "tree") &&
     isRecord(value.slotHeightOverrides) &&
     Object.values(value.slotHeightOverrides).every((height) => typeof height === "number") &&
+    (value.detailsHeight === undefined ||
+      value.detailsHeight === null ||
+      typeof value.detailsHeight === "number") &&
     typeof value.inlineInfoRatio === "number" &&
     typeof value.scrollTop === "number" &&
     typeof value.searchQuery === "string"
